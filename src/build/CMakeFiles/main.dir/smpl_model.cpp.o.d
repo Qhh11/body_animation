@@ -1,7 +1,7 @@
 CMakeFiles/main.dir/smpl_model.cpp.o: \
  /config/workspace/Exercises/Project-SMPL/smpl_model.cpp \
  /usr/include/stdc-predef.h \
- /config/workspace/Exercises/Project-SMPL/smpl_model.h \
+ /config/workspace/Exercises/Project-SMPL/include/smpl_model.h \
  /usr/include/c++/9/string \
  /usr/include/x86_64-linux-gnu/c++/9/bits/c++config.h \
  /usr/include/x86_64-linux-gnu/c++/9/bits/os_defines.h \

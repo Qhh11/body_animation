@@ -1,0 +1,27 @@
+{
+    "name": "SMPL Ceres Pipeline",
+    "dockerComposeFile": "../docker-compose.yml",
+    "service": "dev",
+    "workspaceFolder": "/workspace",
+
+    // VSCode extensions to install in container
+    "customizations": {
+        "vscode": {
+            "extensions": [
+                "ms-vscode.cpptools",
+                "ms-vscode.cmake-tools",
+                "twxs.cmake"
+            ],
+            "settings": {
+                "cmake.configureOnOpen": true,
+                "C_Cpp.default.configurationProvider": "ms-vscode.cmake-tools"
+            }
+        }
+    },
+
+    // Run commands after container is created
+    "postCreateCommand": "echo 'Dev container ready!'",
+
+    // Keep container running
+    "overrideCommand": true
+}

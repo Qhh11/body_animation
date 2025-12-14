@@ -1,0 +1,7 @@
+# CMake build
+build/
+CMakeFiles/
+Makefile
+
+# macOS junk
+.DS_Store

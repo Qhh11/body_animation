@@ -2,6 +2,7 @@
 #include <fstream> // Required for file writing
 #include "smpl_model.h"
 #include "smpl_math.h" 
+#include "render_obj.h"
 #include <ceres/ceres.h>
 
 
@@ -61,6 +62,13 @@ int main() {
     // 4. Save Result for Visualization
     // Save to the build folder (or any accessible path)
     SaveOBJ("output_tpose.obj", out_verts, model.faces);
+
+    // convert .obj to .png
+    if (!RenderObjToPng("output.tpose.obj", "out.png", 900, 900, 2.5f)) {
+        std::cerr << "Rendering failed.\n";
+        return 1;
+    }
+    std::cout << "Saved out.png\n";
 
     return 0;
 }

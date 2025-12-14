@@ -1,3 +1,0 @@
-/config/workspace/body_animation/src/build/CMakeFiles/main.dir
-/config/workspace/body_animation/src/build/CMakeFiles/edit_cache.dir
-/config/workspace/body_animation/src/build/CMakeFiles/rebuild_cache.dir

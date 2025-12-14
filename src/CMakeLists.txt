@@ -36,6 +36,7 @@ find_package(ZLIB REQUIRED)
 add_executable(main
     main.cpp
     smpl_model.cpp
+    optimizer.cpp
     ../Libs/cnpy/cnpy.cpp 
 )
 

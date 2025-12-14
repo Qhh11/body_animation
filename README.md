@@ -26,4 +26,57 @@ The project is organized as follows:
     │   └── smpl_math.h     # (Optional) Math & FK/LBS implementations
     ├── CMakeLists.txt      # CMake build configuration
     ├── main.cpp            # Entry point and pipeline logic
-    └── smpl_model.cpp      # Model loading and logic
+    ├── smpl_model.cpp      # Model loading and logic
+    ├── optimizer.cpp       # Ceres-based SMPL parameter optimization
+    ├── include/
+    │   ├── cost_functions.h  # Ceres cost functions (reprojection, regularization)
+    │   └── optimizer.h       # Optimizer interface
+    └── visualize_optimization.py  # Python visualization script
+```
+
+## 🚀 Quick Start
+
+### Build and Run
+```bash
+cd src/build
+cmake ..
+make
+./main
+```
+
+This will:
+1. Load the SMPL/STAR model from `Data/star_1_1/neutral/model.npz`
+2. Run a synthetic optimization demo (test with artificial data)
+3. Generate output files in `src/build/` directory
+
+### Visualize Results
+After running the optimizer, visualize the results:
+
+```bash
+# Install Python dependencies (if needed)
+pip3 install numpy matplotlib
+
+# Run visualization script
+cd src/build
+python3 ../../visualize_optimization.py
+```
+
+This generates:
+- `landmarks_2d.png` - 2D landmark comparison (GT vs optimized)
+- `reprojection_errors.png` - Per-joint reprojection error chart
+- `mesh_comparison_3d.png` - 3D mesh comparison (before/after/GT)
+- `vertex_errors.png` - Per-vertex error analysis
+
+You can also view the `.obj` files in MeshLab, Blender, or any 3D viewer.
+
+
+
+## ✨ Features
+
+- ✅ SMPL/STAR forward kinematics and linear blend skinning
+- ✅ Ceres Solver integration for parameter optimization
+- ✅ 2D landmark reprojection cost function
+- ✅ Shape and pose regularization
+- ✅ Synthetic test data generation for validation
+- ✅ Python visualization scripts
+- 🔄 Real dataset support (AMASS/OpenPose)

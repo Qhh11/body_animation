@@ -1,19 +1,30 @@
-#include <cnpy.h>
+#include <iostream>
+#include "smpl_model.h"
+#include <ceres/ceres.h>
 
-using namespace std;
-using namespace cnpy;
-int main(int argc, char** argv) {
-    string npz_path = "../../Data/star_1_1/neutral/model.npz";
-    string out_png  = "out.png";
-    npz_t npz = cnpy::npz_load(npz_path);
-    for (auto& kv : npz) {
-        const std::string& key = kv.first;
-        const cnpy::NpyArray& arr = kv.second;
-        std::cout << "  " << key << "  shape=(";
-        for (size_t i = 0; i < arr.shape.size(); ++i) {
-            std::cout << arr.shape[i];
-            if (i + 1 < arr.shape.size()) std::cout << ",";
-        }
-        std::cout << ")  bytes=" << arr.word_size << "\n";
+int main() {
+    // 1. Initialize Google Logging (Required by Ceres)
+    google::InitGoogleLogging("SMPL_Optimizer");
+
+    std::cout << ">>> Start SMPL Project..." << std::endl;
+
+    // 2. Load Model
+    SmplModel model;
+    
+    // Updated path based on your environment
+    std::string npz_path = "../../Data/star_1_1/neutral/model.npz"; 
+    
+    if (!model.LoadFromNPZ(npz_path)) {
+        std::cerr << "Failed to load model! Please check the path: " << npz_path << std::endl;
+        return -1;
     }
+
+    // 3. Simple test for Eigen (Verify if Eigen is working)
+    std::cout << "Test Eigen: v_template mean = " << model.v_template.mean() << std::endl;
+
+    // 4. Verify Ceres linking
+    ceres::Problem problem;
+    std::cout << "Ceres Solver initialized successfully." << std::endl;
+
+    return 0;
 }

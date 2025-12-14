@@ -1,26 +1,29 @@
-# body_animation
+# SMPL/STAR Body Model Optimization Pipeline
 
+This project implements a C++ pipeline for 3D human body reconstruction using the SMPL/STAR model. It features a complete Forward Kinematics (FK) and Linear Blend Skinning (LBS) engine implemented from scratch, integrated with the Ceres Solver for optimization tasks.
 
+## 📂 Project Structure
 
-## Getting started
-location: This folder should be put under 3dsmc-env/files/body_animation
+The project is organized as follows:
 
-### Check your folder structure
-it should looks like this
-
+```text
 /workspace/Exercises/
-├── Libs/
-│   ├── cnpy/             <-- 为这个项目新下载的
+├── Libs/                   # External Libraries
+│   ├── cnpy/               # Library for reading/writing .npz files
 │   │   ├── cnpy.cpp
 │   │   ├── cnpy.h
 │   │   └── CMakeLists.txt 
-│   ├── Eigen/            <-- 作业自带的
+│   ├── Eigen/              # Linear algebra library (Standard in environment)
 │   └── ...
-├── Data/    
-    ├── star_1_1/         <-- 放 smpl_model.npz
-└── src/                  <-- 你的工作区 (改成其他名字也行)
-    ├── build/
-    ├── CMakeLists.txt    
-    ├── main.cpp          <-- 入口
-    ├── smpl_model.h     
-    └── smpl_model.cpp    
+├── Data/                   # Model Data
+│   └── star_1_1/           # STAR/SMPL model files
+│       └── neutral/
+│           └── model.npz   # The body model parameters
+└── src/                    # Source Code (Working Directory)
+    ├── build/              # Build artifacts
+    ├── include/            # Header files
+    │   ├── smpl_model.h    # Model data structure definition
+    │   └── smpl_math.h     # (Optional) Math & FK/LBS implementations
+    ├── CMakeLists.txt      # CMake build configuration
+    ├── main.cpp            # Entry point and pipeline logic
+    └── smpl_model.cpp      # Model loading and logic

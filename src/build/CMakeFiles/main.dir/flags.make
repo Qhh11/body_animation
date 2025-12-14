@@ -4,7 +4,7 @@
 # compile CXX with /usr/bin/c++
 CXX_DEFINES = -DEIGEN_NO_DEBUG -DGFLAGS_IS_A_DLL=0 -DGLOG_CUSTOM_PREFIX_SUPPORT
 
-CXX_INCLUDES = -I/config/workspace/Exercises/Project-SMPL/../Libs/cnpy -I/config/workspace/Exercises/Project-SMPL/../Libs -I/config/workspace/Exercises/Project-SMPL/../Libs/Eigen -isystem /usr/include/eigen3
+CXX_INCLUDES = -I/config/workspace/Exercises/Project-SMPL/include -I/config/workspace/Exercises/Project-SMPL/../Libs/cnpy -I/config/workspace/Exercises/Project-SMPL/../Libs -I/config/workspace/Exercises/Project-SMPL/../Libs/Eigen -isystem /usr/include/eigen3
 
 CXX_FLAGS = -std=gnu++17
 

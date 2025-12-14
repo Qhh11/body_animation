@@ -5,11 +5,16 @@
 template <typename T>
 Eigen::Matrix<double, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor> 
 NpArrayToEigen(cnpy::NpyArray& arr, int rows, int cols) {
-    // Get data pointer
     T* data_ptr = arr.data<T>();
-    
-    // Map to Eigen Matrix
     return Eigen::Map<Eigen::Matrix<T, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>>(data_ptr, rows, cols).template cast<double>();
+}
+
+// [NEW] Helper function for Integer matrices (for Faces)
+template <typename T>
+Eigen::Matrix<int, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor> 
+NpArrayToEigenInt(cnpy::NpyArray& arr, int rows, int cols) {
+    T* data_ptr = arr.data<T>();
+    return Eigen::Map<Eigen::Matrix<T, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>>(data_ptr, rows, cols).template cast<int>();
 }
 
 bool SmplModel::LoadFromNPZ(const std::string& path) {
@@ -17,44 +22,47 @@ bool SmplModel::LoadFromNPZ(const std::string& path) {
         std::cout << "[SMPL] Loading model from: " << path << std::endl;
         cnpy::npz_t npz = cnpy::npz_load(path);
 
-        // 1. 读取 v_template (N x 3)
+        // ... [Keep previous loading code for v_template, J_regressor, weights, etc.] ...
+        // (For brevity, I assume you kept the previous code here)
+        // Re-paste your previous loading logic here
+        
         cnpy::NpyArray arr_v = npz["v_template"];
         this->N = arr_v.shape[0];
         this->v_template = NpArrayToEigen<double>(arr_v, N, 3);
-        
-        // 2. 读取 J_regressor (J x N)
-        // 注意：npz 里可能是 sparse matrix 的 dense 格式，或者是普通 array
+
         cnpy::NpyArray arr_J = npz["J_regressor"];
         this->J = arr_J.shape[0];
         this->J_regressor = NpArrayToEigen<double>(arr_J, J, N);
 
-        // 3. 读取 weights (N x J)
         cnpy::NpyArray arr_w = npz["weights"];
         this->weights = NpArrayToEigen<double>(arr_w, N, J);
 
-        // 4. 读取 kintree_table (2 x J)
         cnpy::NpyArray arr_k = npz["kintree_table"];
         long* k_data = arr_k.data<long>(); 
         this->kintree_table.resize(2, J);
         for(int i=0; i<2*J; ++i) this->kintree_table.data()[i] = (int)k_data[i];
         
-        // 5. 读取 shapedirs
-        // 原始形状: (N, 3, 10) -> 我们把它读成 (N*3, 10)
         cnpy::NpyArray arr_s = npz["shapedirs"];
-        int n_betas = arr_s.shape[2]; 
-        this->shapedirs = NpArrayToEigen<double>(arr_s, N * 3, n_betas);
+        this->shapedirs = NpArrayToEigen<double>(arr_s, N * 3, arr_s.shape[2]);
 
-        // 6. 读取 posedirs
-        // 原始形状: (N, 3, 207) -> 我们把它读成 (N*3, 207)
         cnpy::NpyArray arr_p = npz["posedirs"];
-        int n_pose_basis = arr_p.shape[2]; 
-        this->posedirs = NpArrayToEigen<double>(arr_p, N * 3, n_pose_basis);
+        this->posedirs = NpArrayToEigen<double>(arr_p, N * 3, arr_p.shape[2]);
+
+        // Load Faces
+        if (npz.count("f")) {
+            cnpy::NpyArray arr_f = npz["f"];
+            // Faces are usually stored as int32 or int64 (N_faces x 3)
+            if (arr_f.word_size == 4) {
+                 this->faces = NpArrayToEigenInt<int>(arr_f, arr_f.shape[0], 3);
+            } else if (arr_f.word_size == 8) {
+                 this->faces = NpArrayToEigenInt<long>(arr_f, arr_f.shape[0], 3); // cnpy usually reads long for int64
+            }
+            std::cout << "  - Faces: " << this->faces.rows() << std::endl;
+        } else {
+            std::cerr << "[Warning] No 'f' or 'faces' found in NPZ. Output will be point cloud only." << std::endl;
+        }
 
         std::cout << "[SMPL] Load Success!" << std::endl;
-        std::cout << "  - Vertices: " << N << std::endl;
-        std::cout << "  - Joints: " << J << std::endl;
-        std::cout << "  - Shape Basis: " << n_betas << std::endl;
-        
         return true;
 
     } catch (const std::exception& e) {

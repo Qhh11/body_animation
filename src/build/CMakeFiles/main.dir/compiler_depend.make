@@ -624,6 +624,8 @@ CMakeFiles/main.dir/main.cpp.o: /config/workspace/Exercises/Project-SMPL/main.cp
   /config/workspace/Exercises/Libs/Eigen/Eigen/src/misc/Image.h \
   /config/workspace/Exercises/Libs/Eigen/Eigen/src/misc/Kernel.h \
   /config/workspace/Exercises/Libs/cnpy/cnpy.h \
+  /config/workspace/Exercises/Project-SMPL/include/smpl_math.h \
+  /config/workspace/Exercises/Project-SMPL/include/smpl_model.h \
   /config/workspace/Exercises/Project-SMPL/smpl_model.h \
   /usr/include/alloca.h \
   /usr/include/asm-generic/errno-base.h \
@@ -645,6 +647,7 @@ CMakeFiles/main.dir/main.cpp.o: /config/workspace/Exercises/Project-SMPL/main.cp
   /usr/include/c++/9/bits/basic_string.h \
   /usr/include/c++/9/bits/basic_string.tcc \
   /usr/include/c++/9/bits/char_traits.h \
+  /usr/include/c++/9/bits/codecvt.h \
   /usr/include/c++/9/bits/concept_check.h \
   /usr/include/c++/9/bits/cpp_type_traits.h \
   /usr/include/c++/9/bits/cxxabi_forced.h \
@@ -654,6 +657,7 @@ CMakeFiles/main.dir/main.cpp.o: /config/workspace/Exercises/Project-SMPL/main.cp
   /usr/include/c++/9/bits/exception.h \
   /usr/include/c++/9/bits/exception_defines.h \
   /usr/include/c++/9/bits/exception_ptr.h \
+  /usr/include/c++/9/bits/fstream.tcc \
   /usr/include/c++/9/bits/functexcept.h \
   /usr/include/c++/9/bits/functional_hash.h \
   /usr/include/c++/9/bits/hash_bytes.h \
@@ -746,6 +750,7 @@ CMakeFiles/main.dir/main.cpp.o: /config/workspace/Exercises/Project-SMPL/main.cp
   /usr/include/c++/9/ext/numeric_traits.h \
   /usr/include/c++/9/ext/string_conversions.h \
   /usr/include/c++/9/ext/type_traits.h \
+  /usr/include/c++/9/fstream \
   /usr/include/c++/9/functional \
   /usr/include/c++/9/initializer_list \
   /usr/include/c++/9/ios \
@@ -819,6 +824,7 @@ CMakeFiles/main.dir/main.cpp.o: /config/workspace/Exercises/Project-SMPL/main.cp
   /usr/include/ceres/internal/config.h \
   /usr/include/ceres/internal/disable_warnings.h \
   /usr/include/ceres/internal/eigen.h \
+  /usr/include/ceres/internal/euler_angles.h \
   /usr/include/ceres/internal/export.h \
   /usr/include/ceres/internal/fixed_array.h \
   /usr/include/ceres/internal/householder_vector.h \
@@ -843,6 +849,7 @@ CMakeFiles/main.dir/main.cpp.o: /config/workspace/Exercises/Project-SMPL/main.cp
   /usr/include/ceres/ordered_groups.h \
   /usr/include/ceres/problem.h \
   /usr/include/ceres/product_manifold.h \
+  /usr/include/ceres/rotation.h \
   /usr/include/ceres/sized_cost_function.h \
   /usr/include/ceres/solver.h \
   /usr/include/ceres/sphere_manifold.h \
@@ -963,8 +970,10 @@ CMakeFiles/main.dir/main.cpp.o: /config/workspace/Exercises/Project-SMPL/main.cp
   /usr/include/x86_64-linux-gnu/bits/wordsize.h \
   /usr/include/x86_64-linux-gnu/bits/xopen_lim.h \
   /usr/include/x86_64-linux-gnu/c++/9/bits/atomic_word.h \
+  /usr/include/x86_64-linux-gnu/c++/9/bits/basic_file.h \
   /usr/include/x86_64-linux-gnu/c++/9/bits/c++allocator.h \
   /usr/include/x86_64-linux-gnu/c++/9/bits/c++config.h \
+  /usr/include/x86_64-linux-gnu/c++/9/bits/c++io.h \
   /usr/include/x86_64-linux-gnu/c++/9/bits/c++locale.h \
   /usr/include/x86_64-linux-gnu/c++/9/bits/cpu_defines.h \
   /usr/include/x86_64-linux-gnu/c++/9/bits/ctype_base.h \
@@ -1582,6 +1591,8 @@ CMakeFiles/main.dir/smpl_model.cpp.o: /config/workspace/Exercises/Project-SMPL/s
 
 /config/workspace/Exercises/Project-SMPL/smpl_model.cpp:
 
+/usr/include/x86_64-linux-gnu/c++/9/bits/basic_file.h:
+
 /usr/include/inttypes.h:
 
 /usr/include/glog/export.h:
@@ -1932,6 +1943,8 @@ CMakeFiles/main.dir/smpl_model.cpp.o: /config/workspace/Exercises/Project-SMPL/s
 
 /usr/include/x86_64-linux-gnu/bits/types/struct_timespec.h:
 
+/usr/include/ceres/rotation.h:
+
 /usr/include/unistd.h:
 
 /usr/include/c++/9/iostream:
@@ -2003,6 +2016,8 @@ CMakeFiles/main.dir/smpl_model.cpp.o: /config/workspace/Exercises/Project-SMPL/s
 /config/workspace/Exercises/Libs/Eigen/Eigen/src/IterativeLinearSolvers/BiCGSTAB.h:
 
 /usr/include/c++/9/bits/ptr_traits.h:
+
+/usr/include/x86_64-linux-gnu/c++/9/bits/c++io.h:
 
 /usr/include/x86_64-linux-gnu/bits/types/__FILE.h:
 
@@ -2149,6 +2164,8 @@ CMakeFiles/main.dir/smpl_model.cpp.o: /config/workspace/Exercises/Project-SMPL/s
 /usr/include/c++/9/string_view:
 
 /usr/include/c++/9/bits/regex.tcc:
+
+/usr/include/ceres/internal/euler_angles.h:
 
 /usr/include/linux/close_range.h:
 
@@ -2398,6 +2415,8 @@ CMakeFiles/main.dir/smpl_model.cpp.o: /config/workspace/Exercises/Project-SMPL/s
 
 /config/workspace/Exercises/Libs/cnpy/cnpy.cpp:
 
+/config/workspace/Exercises/Project-SMPL/include/smpl_math.h:
+
 /usr/include/c++/9/bits/stl_uninitialized.h:
 
 /config/workspace/Exercises/Libs/Eigen/Eigen/src/Core/EigenBase.h:
@@ -2511,6 +2530,8 @@ CMakeFiles/main.dir/smpl_model.cpp.o: /config/workspace/Exercises/Project-SMPL/s
 /config/workspace/Exercises/Libs/Eigen/Eigen/src/LU/PartialPivLU.h:
 
 /usr/include/x86_64-linux-gnu/bits/uio_lim.h:
+
+/usr/include/c++/9/fstream:
 
 /config/workspace/Exercises/Libs/Eigen/Eigen/src/Geometry/OrthoMethods.h:
 
@@ -2659,6 +2680,8 @@ CMakeFiles/main.dir/smpl_model.cpp.o: /config/workspace/Exercises/Project-SMPL/s
 /config/workspace/Exercises/Libs/Eigen/Eigen/src/Core/util/ConfigureVectorization.h:
 
 /config/workspace/Exercises/Libs/Eigen/Eigen/src/Core/InternalHeaderCheck.h:
+
+/config/workspace/Exercises/Project-SMPL/include/smpl_model.h:
 
 /config/workspace/Exercises/Libs/Eigen/Eigen/src/Core/ArithmeticSequence.h:
 
@@ -2833,6 +2856,8 @@ CMakeFiles/main.dir/smpl_model.cpp.o: /config/workspace/Exercises/Project-SMPL/s
 /usr/include/c++/9/tr1/riemann_zeta.tcc:
 
 /config/workspace/Exercises/Libs/Eigen/Eigen/src/Core/arch/SSE/Reductions.h:
+
+/usr/include/c++/9/bits/fstream.tcc:
 
 /config/workspace/Exercises/Libs/Eigen/Eigen/src/Core/functors/AssignmentFunctors.h:
 

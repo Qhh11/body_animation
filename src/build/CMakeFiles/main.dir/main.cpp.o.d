@@ -141,8 +141,12 @@ CMakeFiles/main.dir/main.cpp.o: \
  /usr/include/c++/9/bits/locale_facets.tcc \
  /usr/include/c++/9/bits/basic_ios.tcc \
  /usr/include/c++/9/bits/ostream.tcc /usr/include/c++/9/istream \
- /usr/include/c++/9/bits/istream.tcc \
- /config/workspace/Exercises/Project-SMPL/smpl_model.h \
+ /usr/include/c++/9/bits/istream.tcc /usr/include/c++/9/fstream \
+ /usr/include/c++/9/bits/codecvt.h \
+ /usr/include/x86_64-linux-gnu/c++/9/bits/basic_file.h \
+ /usr/include/x86_64-linux-gnu/c++/9/bits/c++io.h \
+ /usr/include/c++/9/bits/fstream.tcc \
+ /config/workspace/Exercises/Project-SMPL/include/smpl_model.h \
  /usr/include/c++/9/vector /usr/include/c++/9/bits/stl_construct.h \
  /usr/include/c++/9/bits/stl_uninitialized.h /usr/include/c++/9/utility \
  /usr/include/c++/9/bits/stl_relops.h \
@@ -524,8 +528,9 @@ CMakeFiles/main.dir/main.cpp.o: \
  /usr/include/x86_64-linux-gnu/bits/getopt_posix.h \
  /usr/include/x86_64-linux-gnu/bits/getopt_core.h \
  /usr/include/x86_64-linux-gnu/bits/unistd_ext.h \
- /usr/include/linux/close_range.h /usr/include/ceres/ceres.h \
- /usr/include/ceres/autodiff_cost_function.h \
+ /usr/include/linux/close_range.h \
+ /config/workspace/Exercises/Project-SMPL/include/smpl_math.h \
+ /usr/include/ceres/ceres.h /usr/include/ceres/autodiff_cost_function.h \
  /usr/include/ceres/internal/autodiff.h \
  /usr/include/ceres/internal/array_selector.h \
  /usr/include/ceres/internal/fixed_array.h \
@@ -584,4 +589,5 @@ CMakeFiles/main.dir/main.cpp.o: \
  /usr/include/ceres/problem.h /usr/include/ceres/product_manifold.h \
  /usr/include/ceres/solver.h /usr/include/c++/9/unordered_set \
  /usr/include/c++/9/bits/unordered_set.h \
- /usr/include/ceres/sphere_manifold.h /usr/include/ceres/version.h
+ /usr/include/ceres/sphere_manifold.h /usr/include/ceres/version.h \
+ /usr/include/ceres/rotation.h /usr/include/ceres/internal/euler_angles.h

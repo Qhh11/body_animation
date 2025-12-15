@@ -13,106 +13,130 @@ bool OptimizeSMPL(
     double* trans,
     const OptimizerConfig& config
 ) {
-    std::cout << "\n========================================" << std::endl;
-    std::cout << "Starting SMPL Optimization..." << std::endl;
-    std::cout << "========================================" << std::endl;
-    std::cout << "Total landmarks: " << observed_keypoints.size() << std::endl;
+    std::cout << "[Optimizer] Starting Multi-Stage Optimization Strategy..." << std::endl;
 
-    // Step 1: Create Ceres Problem
-    ceres::Problem problem;
+    // ====================================================================
+    // STAGE 1: Camera Translation & Global Orientation Only
+    // ====================================================================
+    {
+        std::cout << ">>> Stage 1: Global Translation & Orientation..." << std::endl;
+        ceres::Problem problem;
 
-    // Step 2: Add 2D Reprojection Residuals
-    int num_valid_landmarks = 0;
+        for (const auto& lm : observed_keypoints) {
+            if (lm.confidence < config.min_confidence) continue;
+            int smpl_id = OPENPOSE_TO_SMPL[lm.joint_id];
+            if (smpl_id < 0) continue;
 
-    for (const auto& landmark : observed_keypoints) {
-        // Skip low-confidence detections
-        if (landmark.confidence < config.min_confidence) {
-            continue;
+            ceres::CostFunction* cost = new ceres::AutoDiffCostFunction<ReprojectionResidual, 2, 10, 72, 3>(
+                new ReprojectionResidual(lm, smpl_id, camera, model)
+            );
+            
+            // 使用 HuberLoss 增加鲁棒性
+            problem.AddResidualBlock(cost, new ceres::HuberLoss(5.0), beta, theta, trans);
         }
 
-        // Check if this OpenPose joint has a valid SMPL mapping
-        if (landmark.joint_id < 0 || landmark.joint_id >= 25) {
-            std::cerr << "[Warning] Invalid joint_id: " << landmark.joint_id << std::endl;
-            continue;
+        // 核心技巧：设置 Constant (锁死变量)
+        problem.SetParameterBlockConstant(beta); 
+        
+        // 添加强力正则化，迫使身体保持静止 (naive approach)
+        for(int i=3; i<72; ++i) { 
+             ceres::CostFunction* rigid_body = new ceres::AutoDiffCostFunction<PoseRegularizer, 1, 72>(
+                new PoseRegularizer(i, 1000.0) // 巨大的权重，锁死身体
+             );
+             problem.AddResidualBlock(rigid_body, nullptr, theta);
         }
 
-        int smpl_joint_id = OPENPOSE_TO_SMPL[landmark.joint_id];
-        if (smpl_joint_id < 0) {
-            // This joint (e.g., eyes, ears, toes) has no SMPL equivalent
-            continue;
+        ceres::Solver::Options options;
+        options.linear_solver_type = ceres::DENSE_QR;
+        options.max_num_iterations = 20; 
+        ceres::Solver::Summary summary;
+        ceres::Solve(options, &problem, &summary);
+        // std::cout << summary.BriefReport() << std::endl;
+    }
+
+    // ====================================================================
+    // STAGE 2: Pose Alignment (Body Joints)
+    // ====================================================================
+    {
+        std::cout << ">>> Stage 2: Articulated Pose Fitting..." << std::endl;
+        ceres::Problem problem;
+
+        // 1. Data Term (Reprojection)
+        for (const auto& lm : observed_keypoints) {
+            if (lm.confidence < config.min_confidence) continue;
+            int smpl_id = OPENPOSE_TO_SMPL[lm.joint_id];
+            if (smpl_id < 0) continue;
+
+            ceres::CostFunction* cost = new ceres::AutoDiffCostFunction<ReprojectionResidual, 2, 10, 72, 3>(
+                new ReprojectionResidual(lm, smpl_id, camera, model)
+            );
+            problem.AddResidualBlock(cost, new ceres::HuberLoss(1.0), beta, theta, trans);
         }
 
-        // Create cost function
-        ceres::CostFunction* cost_function =
-            new ceres::AutoDiffCostFunction<ReprojectionResidual, 2, 10, 72, 3>(
-                new ReprojectionResidual(landmark, smpl_joint_id, camera, model)
+        // 2. Regularization 
+        problem.SetParameterBlockConstant(beta);
+
+        double pose_reg_weight = 5.0; 
+        for (int i = 0; i < 72; ++i) {
+            ceres::CostFunction* pose_cost = new ceres::AutoDiffCostFunction<PoseRegularizer, 1, 72>(
+                new PoseRegularizer(i, pose_reg_weight)
             );
+            problem.AddResidualBlock(pose_cost, nullptr, theta);
+        }
 
-        // Add residual block (no loss function = L2 norm)
-        problem.AddResidualBlock(cost_function, nullptr, beta, theta, trans);
-        num_valid_landmarks++;
+        ceres::Solver::Options options;
+        options.linear_solver_type = ceres::DENSE_QR;
+        options.max_num_iterations = 50;
+        options.minimizer_progress_to_stdout = config.verbose;
+        ceres::Solver::Summary summary;
+        ceres::Solve(options, &problem, &summary);
+        std::cout << summary.BriefReport() << std::endl;
     }
 
-    std::cout << "Valid landmarks used: " << num_valid_landmarks << std::endl;
+    // ====================================================================
+    // STAGE 3: Shape Refinement (Optional)
+    // ====================================================================
+    {
+        std::cout << ">>> Stage 3: Shape Refinement..." << std::endl;
+        ceres::Problem problem;
 
-    if (num_valid_landmarks == 0) {
-        std::cerr << "[Error] No valid landmarks to optimize!" << std::endl;
-        return false;
-    }
-
-    // Step 3: Add Shape Regularization (for each beta parameter)
-    for (int i = 0; i < 10; ++i) {
-        ceres::CostFunction* shape_cost =
-            new ceres::AutoDiffCostFunction<ShapeRegularizer, 1, 10>(
-                new ShapeRegularizer(i, config.lambda_shape)
+        // Data Term
+        for (const auto& lm : observed_keypoints) {
+            if (lm.confidence < config.min_confidence) continue;
+            int smpl_id = OPENPOSE_TO_SMPL[lm.joint_id];
+            if (smpl_id < 0) continue;
+            ceres::CostFunction* cost = new ceres::AutoDiffCostFunction<ReprojectionResidual, 2, 10, 72, 3>(
+                new ReprojectionResidual(lm, smpl_id, camera, model)
             );
-        problem.AddResidualBlock(shape_cost, nullptr, beta);
-    }
+            problem.AddResidualBlock(cost, new ceres::HuberLoss(1.0), beta, theta, trans);
+        }
 
-    // Step 4: Add Pose Regularization (for each theta parameter)
-    for (int i = 0; i < 72; ++i) {
-        ceres::CostFunction* pose_cost =
-            new ceres::AutoDiffCostFunction<PoseRegularizer, 1, 72>(
-                new PoseRegularizer(i, config.lambda_pose)
+        // Regularization
+        // 1. Pose Regularizer (Keep consistent)
+        for (int i = 0; i < 72; ++i) {
+            ceres::CostFunction* pose_cost = new ceres::AutoDiffCostFunction<PoseRegularizer, 1, 72>(
+                new PoseRegularizer(i, 1.0)
             );
-        problem.AddResidualBlock(pose_cost, nullptr, theta);
+            problem.AddResidualBlock(pose_cost, nullptr, theta);
+        }
+
+        // 2. Shape Regularizer (Very Strong!)
+        double shape_reg_weight = 100.0; 
+        for (int i = 0; i < 10; ++i) {
+            ceres::CostFunction* shape_cost = new ceres::AutoDiffCostFunction<ShapeRegularizer, 1, 10>(
+                new ShapeRegularizer(i, shape_reg_weight)
+            );
+            problem.AddResidualBlock(shape_cost, nullptr, beta);
+        }
+
+        ceres::Solver::Options options;
+        options.linear_solver_type = ceres::DENSE_QR;
+        options.max_num_iterations = 30;
+        ceres::Solver::Summary summary;
+        ceres::Solve(options, &problem, &summary);
     }
 
-    // Step 5: (Disabled) Depth prior used to constrain global Z translation.
-    // if (config.lambda_depth > 0) {
-    //     ceres::CostFunction* depth_cost =
-    //         new ceres::AutoDiffCostFunction<DepthPrior, 1, 3>(
-    //             new DepthPrior(config.expected_depth, 0.5)  // sigma = 0.5m
-    //         );
-    //     problem.AddResidualBlock(depth_cost, nullptr, trans);
-    // }
-
-    // Step 6: Configure Solver Options
-    ceres::Solver::Options options;
-    options.linear_solver_type = ceres::DENSE_QR;
-    options.minimizer_progress_to_stdout = config.verbose;
-    options.max_num_iterations = config.max_iterations;
-    options.function_tolerance = config.function_tolerance;
-    options.gradient_tolerance = config.gradient_tolerance;
-    options.parameter_tolerance = config.parameter_tolerance;
-
-    // Step 7: Solve
-    ceres::Solver::Summary summary;
-    ceres::Solve(options, &problem, &summary);
-
-    // Step 8: Report Results
-    std::cout << "\n========================================" << std::endl;
-    std::cout << summary.BriefReport() << std::endl;
-    std::cout << "========================================\n" << std::endl;
-
-    if (config.verbose) {
-        std::cout << "Optimized Parameters:" << std::endl;
-        std::cout << "  Beta[0:3]: [" << beta[0] << ", " << beta[1] << ", " << beta[2] << "]" << std::endl;
-        std::cout << "  Theta[0:3]: [" << theta[0] << ", " << theta[1] << ", " << theta[2] << "]" << std::endl;
-        std::cout << "  Trans: [" << trans[0] << ", " << trans[1] << ", " << trans[2] << "]" << std::endl;
-    }
-
-    return summary.IsSolutionUsable();
+    return true;
 }
 
 

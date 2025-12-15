@@ -5,6 +5,7 @@
 #include "smpl_model.h"
 #include "smpl_math.h"
 #include "optimizer.h"
+#include "amass_loader.h" 
 #include <ceres/ceres.h>
 
 // Forward declaration
@@ -14,6 +15,7 @@ void SaveOBJ(const std::string& filename,
 
 namespace {
 
+// Compute 3D joint position from vertices
 Eigen::Vector3d ComputeSmplJointPosition(
     const SmplModel& model,
     const Eigen::Matrix<double, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>& vertices,
@@ -30,13 +32,14 @@ Eigen::Vector3d ComputeSmplJointPosition(
     return joint;
 }
 
-// [ONLY FOR TEST] 从GT参数生成带噪声的假2D关键点
+// Generate synthetic 2D landmarks from 3D model parameters
 std::vector<Landmark2D> GenerateSyntheticLandmarks(
     const SmplModel& model,
     const CameraIntrinsics& camera,
     const double* beta,
     const double* theta,
     const double* trans) {
+    
     std::vector<Landmark2D> landmarks;
     Eigen::Matrix<double, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor> vertices;
     SMPLForward<double>(beta, theta, trans, model, vertices);
@@ -48,13 +51,20 @@ std::vector<Landmark2D> GenerateSyntheticLandmarks(
         }
 
         Eigen::Vector3d joint = ComputeSmplJointPosition(model, vertices, smpl_joint_id);
-        double Z = std::max(joint.z(), 1e-6);
+        
+        // Safety check: ensure point is in front of camera
+        double Z = joint.z();
+        if (Z <= 0.1) continue; // Skip points behind camera
+
         float projected_x = static_cast<float>(camera.fx * (joint.x() / Z) + camera.cx);
         float projected_y = static_cast<float>(camera.fy * (joint.y() / Z) + camera.cy);
 
-        // Add deterministic pixel offsets to mimic detector noise
-        float noise_u = (joint_id % 2 == 0) ? 1.5f : -1.5f;
-        float noise_v = (joint_id % 3 == 0) ? -1.0f : 1.0f;
+        // Check if point is roughly within image bounds (optional)
+        // if (projected_x < 0 || projected_x > camera.width || projected_y < 0 || projected_y > camera.height) continue;
+
+        // Add small deterministic noise to simulate real detection error
+        float noise_u = (joint_id % 2 == 0) ? 0.5f : -0.5f;
+        float noise_v = (joint_id % 3 == 0) ? -0.5f : 0.5f;
 
         landmarks.emplace_back(projected_x + noise_u, projected_y + noise_v, 0.95f, joint_id);
     }
@@ -63,169 +73,147 @@ std::vector<Landmark2D> GenerateSyntheticLandmarks(
 
 void SaveLandmarksToFile(const std::string& filename, const std::vector<Landmark2D>& landmarks) {
     std::ofstream outfile(filename);
-    if (!outfile.is_open()) {
-        std::cerr << "Error: Could not open file " << filename << " for writing." << std::endl;
-        return;
-    }
-
+    if (!outfile.is_open()) return;
     for (const auto& lm : landmarks) {
         outfile << lm.joint_id << " " << lm.x << " " << lm.y << " " << lm.confidence << "\n";
     }
     outfile.close();
-    std::cout << "Saved landmarks to " << filename << std::endl;
 }
 
-// [ONLY FOR TEST] 合成测试Demo：验证优化器能否从假数据恢复GT参数
-void RunSyntheticOptimizationDemo(const SmplModel& model) {
-    std::cout << "\n=== Synthetic optimization demo ===" << std::endl;
+// [NEW] Helper to copy Eigen vector to C-array
+void EigenToArray(const Eigen::VectorXd& src, double* dst, int size) {
+    for(int i=0; i<size; ++i) dst[i] = src[i];
+}
 
-    CameraIntrinsics camera = CreateDefaultCamera(640, 480);
+void EigenToArray3(const Eigen::Vector3d& src, double* dst) {
+    dst[0] = src[0]; dst[1] = src[1]; dst[2] = src[2];
+}
 
-    // [ONLY FOR TEST] 人工设定Ground Truth参数用于生成假数据
-    double beta_gt[10] = {0.0};
-    beta_gt[1] = 0.2;
-    beta_gt[4] = -0.1;
+// [NEW] Run Optimization using AMASS data as Ground Truth
+void RunAMASSValidation(const SmplModel& model) {
+    std::cout << "\n=== Running AMASS Validation Pipeline ===" << std::endl;
 
-    double theta_gt[72] = {0.0};
-    theta_gt[0] = 0.15;
-    theta_gt[1] = -0.2;
-    theta_gt[20] = 0.3;
-
-    double trans_gt[3] = {0.05, -0.03, 3.0};
-
-    // [ONLY FOR TEST] 从GT参数生成带噪声的假2D关键点
-    // 真实数据时替换为: LoadLandmarksFromJSON() 或 LoadLandmarksFromAMASS()
-    auto synthetic_landmarks = GenerateSyntheticLandmarks(model, camera, beta_gt, theta_gt, trans_gt);
-    SaveLandmarksToFile("landmarks_gt.txt", synthetic_landmarks);
-
-    // 初始化优化参数
-    double beta_init[10] = {0.0};
-    double theta_init[72] = {0.0};
-    double trans_init[3] = {0.0, 0.0, 2.2};
-
-    // 保存优化前的mesh（可选）
-    Eigen::Matrix<double, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor> verts_before;
-    SMPLForward<double>(beta_init, theta_init, trans_init, model, verts_before);
-    SaveOBJ("mesh_before_opt.obj", verts_before, model.faces);
-
-    // 配置优化器
-    OptimizerConfig config;
-    // config.lambda_depth = 0.05;     // 真实数据时建议启用depth prior
-    // config.expected_depth = 2.5;
-    config.max_iterations = 20;
-    config.verbose = true;
-
-    // 运行Ceres优化
-    bool success = OptimizeSMPL(synthetic_landmarks, camera, model, beta_init, theta_init, trans_init, config);
-
-    if (!success) {
-        std::cerr << "[Demo] Optimization failed." << std::endl;
+    // 1. Load AMASS Data
+    // Update this path to your actual downloaded AMASS .npz file
+    std::string amass_path = "../../Data/CMU/01/01_01_poses_formatted.txt";
+    std::vector<AmassFrame> amass_frames;
+    
+    if (!AmassLoader::Load(amass_path, amass_frames)) {
+        std::cerr << "[Error] Failed to load AMASS file. Skipping demo." << std::endl;
         return;
     }
 
-    // [ONLY FOR TEST] 打印优化结果与GT的对比
-    auto print_vec = [](const std::string& name, const double* est, const double* gt, int length) {
-        std::cout << name << ": ";
-        for (int i = 0; i < length; ++i) {
-            std::cout << "[" << est[i] << " | " << gt[i] << "] ";
-        }
-        std::cout << std::endl;
-    };
+    if (amass_frames.empty()) return;
 
-    print_vec("Beta[0:3]  (est | gt)", beta_init, beta_gt, 3);
-    print_vec("Theta[0:3] (est | gt)", theta_init, theta_gt, 3);
-    print_vec("Trans      (est | gt)", trans_init, trans_gt, 3);
+    // 2. Pick a frame (e.g., frame 0)
+    const AmassFrame& frame_gt = amass_frames[0];
 
-    // 保存优化后的mesh
-    Eigen::Matrix<double, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor> verts_after;
-    SMPLForward<double>(beta_init, theta_init, trans_init, model, verts_after);
-    SaveOBJ("mesh_after_opt.obj", verts_after, model.faces);
+    // 3. Convert GT data to arrays
+    double beta_gt[10];
+    double theta_gt[72];
+    double trans_gt[3];
 
-    // [ONLY FOR TEST] 保存GT mesh用于可视化对比
+    EigenToArray(frame_gt.beta, beta_gt, 10);
+    EigenToArray(frame_gt.theta, theta_gt, 72);
+    EigenToArray3(frame_gt.trans, trans_gt);
+
+    // [CRITICAL TRICK]
+    // AMASS data usually puts the person at (0,0,0) or on the ground.
+    // If our camera is at (0,0,0), the person might be invisible or behind the camera.
+    // We forcefully move the person 3 meters away so they are visible in our virtual camera.
+    trans_gt[0] = 0.0; // Center X
+    trans_gt[1] = 0.0; // Center Y
+    trans_gt[2] = 3.0; // Move to Z = 3.0m
+
+    std::cout << "[GT] Using AMASS Frame 0 (translated to Z=3.0m)" << std::endl;
+
+    // 4. Setup Virtual Camera
+    CameraIntrinsics camera = CreateDefaultCamera(800, 800);
+
+    // 5. Generate "Observed" 2D Landmarks from AMASS GT
+    auto observed_landmarks = GenerateSyntheticLandmarks(model, camera, beta_gt, theta_gt, trans_gt);
+    SaveLandmarksToFile("landmarks_gt.txt", observed_landmarks);
+
+    // 6. Save Ground Truth Mesh
     Eigen::Matrix<double, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor> verts_gt;
     SMPLForward<double>(beta_gt, theta_gt, trans_gt, model, verts_gt);
     SaveOBJ("mesh_ground_truth.obj", verts_gt, model.faces);
 
-    // 生成优化后的2D重投影，评估拟合质量
-    auto optimized_landmarks = GenerateSyntheticLandmarks(model, camera, beta_init, theta_init, trans_init);
-    SaveLandmarksToFile("landmarks_optimized.txt", optimized_landmarks);
+    // 7. Initialize Optimization (Reset to Zero/Mean Pose)
+    double beta_opt[10] = {0.0};
+    double theta_opt[72] = {0.0};
+    double trans_opt[3] = {0.0, 0.0, 2.5}; // Init guess: 2.5m depth
 
-    // 保存相机参数供可视化脚本使用
-    std::ofstream cam_file("camera_params.txt");
-    cam_file << camera.fx << " " << camera.fy << " " << camera.cx << " " << camera.cy << "\n";
-    cam_file << camera.width << " " << camera.height << "\n";
-    cam_file.close();
+    // Save Initial Mesh
+    Eigen::Matrix<double, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor> verts_init;
+    SMPLForward<double>(beta_opt, theta_opt, trans_opt, model, verts_init);
+    SaveOBJ("mesh_initial.obj", verts_init, model.faces);
 
-    std::cout << "\n=== Saved visualization files ===" << std::endl;
-    std::cout << "- landmarks_gt.txt (ground truth 2D landmarks)" << std::endl;
-    std::cout << "- landmarks_optimized.txt (optimized 2D landmarks)" << std::endl;
-    std::cout << "- mesh_before_opt.obj (initial mesh)" << std::endl;
-    std::cout << "- mesh_after_opt.obj (optimized mesh)" << std::endl;
-    std::cout << "- mesh_ground_truth.obj (ground truth mesh)" << std::endl;
-    std::cout << "- camera_params.txt (camera intrinsics)" << std::endl;
+    // 8. Run Optimization
+    OptimizerConfig config;
+    config.verbose = true;
+    config.max_iterations = 50;
+
+    bool success = OptimizeSMPL(observed_landmarks, camera, model, beta_opt, theta_opt, trans_opt, config);
+
+    if (success) {
+        std::cout << "[Success] Optimization converged!" << std::endl;
+        
+        // Save Optimized Mesh
+        Eigen::Matrix<double, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor> verts_opt;
+        SMPLForward<double>(beta_opt, theta_opt, trans_opt, model, verts_opt);
+        SaveOBJ("mesh_optimized.obj", verts_opt, model.faces);
+        
+        // Generate projected 2D points for visualization
+        auto final_landmarks = GenerateSyntheticLandmarks(model, camera, beta_opt, theta_opt, trans_opt);
+        SaveLandmarksToFile("landmarks_optimized.txt", final_landmarks);
+        
+        // Save Camera Params
+        std::ofstream cam_file("camera_params.txt");
+        cam_file << camera.fx << " " << camera.fy << " " << camera.cx << " " << camera.cy << "\n";
+        cam_file << camera.width << " " << camera.height << "\n";
+        cam_file.close();
+    } else {
+        std::cerr << "[Failure] Optimization did not converge." << std::endl;
+    }
 }
 
-}  // namespace
+} // namespace
 
 void SaveOBJ(const std::string& filename, 
              const Eigen::Matrix<double, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>& vertices, 
              const Eigen::MatrixXi& faces) {
-    
     std::ofstream outfile(filename);
     if (!outfile.is_open()) {
-        std::cerr << "Error: Could not open file " << filename << " for writing." << std::endl;
+        std::cerr << "Error: Could not open " << filename << std::endl;
         return;
     }
-
     std::cout << "Saving OBJ to " << filename << "..." << std::endl;
-
-    // 1. Write Vertices
-    // OBJ format: "v x y z"
     for (int i = 0; i < vertices.rows(); ++i) {
         outfile << "v " << vertices(i, 0) << " " << vertices(i, 1) << " " << vertices(i, 2) << "\n";
     }
-
-    // 2. Write Faces
-    // OBJ format: "f v1 v2 v3"
-    // Note: OBJ indices start at 1, but C++ arrays start at 0. So we add +1.
     for (int i = 0; i < faces.rows(); ++i) {
-        outfile << "f " 
-                << faces(i, 0) + 1 << " " 
-                << faces(i, 1) + 1 << " " 
-                << faces(i, 2) + 1 << "\n";
+        outfile << "f " << faces(i, 0) + 1 << " " << faces(i, 1) + 1 << " " << faces(i, 2) + 1 << "\n";
     }
-
     outfile.close();
-    std::cout << "Saved successfully!" << std::endl;
 }
 
 int main() {
     google::InitGoogleLogging("SMPL_Optimizer");
     std::cout << ">>> Start SMPL Project..." << std::endl;
 
-    // 1. Load Model
+    // 1. Load SMPL Model
     SmplModel model;
+    // Ensure this path matches your docker setup
     std::string npz_path = "../../Data/star_1_1/neutral/model.npz"; 
     
     if (!model.LoadFromNPZ(npz_path)) {
         return -1;
     }
 
-    // 2. Prepare Inputs (T-Pose)
-    double beta[10] = {0}; 
-    double theta[72] = {0};
-    double trans[3] = {0, 0, 0};
-
-    // 3. Run Forward Pass
-    Eigen::Matrix<double, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor> out_verts;
-    SMPLForward<double>(beta, theta, trans, model, out_verts);
-
-    // 4. Save Result for Visualization
-    // Save to the build folder (or any accessible path)
-    SaveOBJ("output_tpose.obj", out_verts, model.faces);
-
-    // 5. Run a synthetic fitting demo to verify the optimizer end-to-end
-    RunSyntheticOptimizationDemo(model);
+    // 2. Run AMASS Validation Pipeline
+    // This replaces the old RunSyntheticOptimizationDemo
+    RunAMASSValidation(model);
 
     return 0;
 }

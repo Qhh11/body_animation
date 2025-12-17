@@ -95,7 +95,9 @@ void RunSyntheticOptimizationDemo(const SmplModel& model) {
 
     // [ONLY FOR TEST] 从GT参数生成带噪声的假2D关键点
     // 真实数据时替换为: LoadLandmarksFromJSON() 或 LoadLandmarksFromAMASS()
-    auto synthetic_landmarks = GenerateSyntheticLandmarks(model, camera, beta_gt, theta_gt, trans_gt);
+    // auto synthetic_landmarks = GenerateSyntheticLandmarks(model, camera, beta_gt, theta_gt, trans_gt);
+    auto synthetic_landmarks = std::vector<Landmark2D>();
+    LoadLandmarksFromJSON("../../Data/OpenPose/output_jsons/video_000000000000_keypoints.json", synthetic_landmarks);
     SaveLandmarksToFile("landmarks_gt.txt", synthetic_landmarks);
 
     // 初始化优化参数

@@ -2,6 +2,8 @@
 #include <iostream>
 #include <fstream>
 #include <ceres/ceres.h>
+#include <nlohmann/json.hpp>
+using json = nlohmann::json;
 
 // Main Optimization Function
 bool OptimizeSMPL(
@@ -155,6 +157,64 @@ bool LoadLandmarksFromJSON(
     std::vector<Landmark2D>& landmarks
 ) {
     // TODO: Implement JSON parsing using a library like nlohmann/json or RapidJSON
+    landmarks.clear();
+
+    // 1. 打开 JSON 文件
+    std::ifstream infile(json_path);
+    if (!infile.is_open()) {
+        std::cerr << "[Error] Cannot open OpenPose JSON file: "
+                  << json_path << std::endl;
+        return false;
+    }
+
+    // 2. 解析 JSON
+    json j;
+    try {
+        infile >> j;
+    } catch (const std::exception& e) {
+        std::cerr << "[Error] Failed to parse JSON: " << e.what() << std::endl;
+        return false;
+    }
+
+    // 3. 检查是否有人
+    if (!j.contains("people") || j["people"].empty()) {
+        std::cerr << "[Warning] No people detected in JSON: "
+                  << json_path << std::endl;
+        return false;
+    }
+
+    // 👉 简化假设：只取第一个人
+    const json& person = j["people"][0];
+
+    // 4. 检查 BODY_25 关键点
+    if (!person.contains("pose_keypoints_2d")) {
+        std::cerr << "[Error] JSON does not contain pose_keypoints_2d"
+                  << std::endl;
+        return false;
+    }
+
+    const auto& keypoints = person["pose_keypoints_2d"];
+
+    if (!keypoints.is_array() || keypoints.size() != 25 * 3) {
+        std::cerr << "[Error] pose_keypoints_2d has invalid size: "
+                  << keypoints.size() << std::endl;
+        return false;
+    }
+
+    // 5. 读取 25 个关键点
+    for (int joint_id = 0; joint_id < 25; ++joint_id) {
+        float x = keypoints[3 * joint_id + 0].get<float>();
+        float y = keypoints[3 * joint_id + 1].get<float>();
+        float c = keypoints[3 * joint_id + 2].get<float>();
+
+        landmarks.emplace_back(x, y, c, joint_id);
+    }
+
+    std::cout << "[Info] Loaded " << landmarks.size()
+              << " OpenPose BODY_25 landmarks from "
+              << json_path << std::endl;
+
+    return true;
     // For now, this is a placeholder
     std::cerr << "[Warning] LoadLandmarksFromJSON not yet implemented!" << std::endl;
     std::cerr << "Please manually create Landmark2D vectors for now." << std::endl;

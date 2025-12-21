@@ -95,9 +95,7 @@ void RunSyntheticOptimizationDemo(const SmplModel& model) {
 
     // [ONLY FOR TEST] 从GT参数生成带噪声的假2D关键点
     // 真实数据时替换为: LoadLandmarksFromJSON() 或 LoadLandmarksFromAMASS()
-    // auto synthetic_landmarks = GenerateSyntheticLandmarks(model, camera, beta_gt, theta_gt, trans_gt);
-    auto synthetic_landmarks = std::vector<Landmark2D>();
-    LoadLandmarksFromJSON("../../Data/OpenPose/output_jsons/video_000000000000_keypoints.json", synthetic_landmarks);
+    auto synthetic_landmarks = GenerateSyntheticLandmarks(model, camera, beta_gt, theta_gt, trans_gt);
     SaveLandmarksToFile("landmarks_gt.txt", synthetic_landmarks);
 
     // 初始化优化参数
@@ -201,6 +199,198 @@ void SaveOBJ(const std::string& filename,
     std::cout << "Saved successfully!" << std::endl;
 }
 
+
+void RunSyntheticOptimizationWithJSON(const SmplModel& model) {
+    std::cout << "\n=== Running Optimization on Real Data ===" << std::endl;
+
+    // 1. 设置相机参数（需与 OpenPose 处理视频时的相机参数一致）
+    CameraIntrinsics camera = CreateDefaultCamera(640, 480);
+
+    // 2. 使用 LoadLandmarksFromJSON 加载真实数据
+    std::vector<Landmark2D> real_landmarks;
+    std::string json_path = "../../Data/OpenPose/output_jsons/video_000000000000_keypoints.json";
+    
+    if (!LoadLandmarksFromJSON(json_path, real_landmarks)) {
+        std::cerr << "Error: Failed to load landmarks from JSON!" << std::endl;
+        return;
+    }
+    SaveLandmarksToFile("landmarks_gt.txt", real_landmarks);
+    std::cout << "Successfully loaded " << real_landmarks.size() << " landmarks." << std::endl;
+
+    // 3. 初始化优化参数（从平均体型和标准姿态开始）
+    double beta_init[10] = {0.0};
+    double theta_init[72] = {0.0};
+    // 初始位置：建议将 Z 设在 2.5 米左右，防止重投影畸变
+    double trans_init[3] = {0.0, 0.0, 2.5}; 
+
+    Eigen::Matrix<double, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor> verts_before;
+    SMPLForward<double>(beta_init, theta_init, trans_init, model, verts_before);
+    SaveOBJ("mesh_before_opt.obj", verts_before, model.faces);
+
+    // 4. 配置优化器参数
+    OptimizerConfig config;
+    config.max_iterations = 20; // 真实数据通常需要更多迭代次数
+    config.verbose = true;
+    // 真实数据建议启用正则化项（如果您的 optimizer.h 支持）
+    config.lambda_shape = 0.1; 
+    config.lambda_pose = 0.1;
+
+    // 5. 运行 Ceres 优化
+    bool success = OptimizeSMPL(real_landmarks, camera, model, beta_init, theta_init, trans_init, config);
+
+    if (success) {
+        std::cout << "Optimization converged successfully!" << std::endl;
+
+        // 6. 保存结果
+        Eigen::Matrix<double, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor> verts_after;
+        SMPLForward<double>(beta_init, theta_init, trans_init, model, verts_after);
+        SaveOBJ("mesh_after_opt.obj", verts_after, model.faces);
+
+        // 可选：保存优化后的参数以便后续分析
+        std::cout << "Final Translation: [" << trans_init[0] << ", " << trans_init[1] << ", " << trans_init[2] << "]" << std::endl;
+    } else {
+        std::cerr << "Optimization failed to converge." << std::endl;
+    }
+}
+
+bool LoadAMASSMotionFromNPY(
+    const std::string& folder,
+    const std::vector<std::vector<Landmark2D>>& sequence,
+    const CameraIntrinsics& camera
+) {
+    std::cout << "[AMASS] Loading motion from NPY folder: " << folder << std::endl;
+    
+    struct AMASSMotion {
+        std::vector<std::array<double, 72>> poses;   // θ_t
+        std::array<double, 10> betas;                 // β
+        std::vector<std::array<double, 3>> trans;    // t_t
+        double fps;
+    };
+
+    AMASSMotion motion;
+    // ---------- poses ----------
+    cnpy::NpyArray poses_np = cnpy::npy_load(folder + "/poses.npy");
+
+    if (poses_np.shape.size() != 2) {
+        std::cerr << "[AMASS][Error] poses.npy must be 2D array!" << std::endl;
+        return false;
+    }
+
+    size_t T = poses_np.shape[0];
+    size_t D = poses_np.shape[1];
+
+    std::cout << "[AMASS] poses.npy shape = (" << T << ", " << D << ")" << std::endl;
+
+    double* poses_data = poses_np.data<double>();
+    motion.poses.resize(T);
+
+    if (D == 72) {
+        // ---- Case 1: already SMPL pose ----
+        for (size_t t = 0; t < T; ++t)
+            for (int i = 0; i < 72; ++i)
+                motion.poses[t][i] = poses_data[t * 72 + i];
+    }
+    else if (D >= 66) {
+        // ---- Case 2: SMPL-X / extended pose ----
+        // SMPL: 3 (root) + 63 (body) + 6 (hands = 0)
+        for (size_t t = 0; t < T; ++t) {
+            // root orient
+            for (int i = 0; i < 3; ++i)
+                motion.poses[t][i] = poses_data[t * D + i];
+
+            // body pose
+            for (int i = 0; i < 63; ++i)
+                motion.poses[t][3 + i] = poses_data[t * D + 3 + i];
+
+            // hand pose (not supported in SMPL)
+            for (int i = 66; i < 72; ++i)
+                motion.poses[t][i] = 0.0;
+        }
+    }
+    else {
+        std::cerr << "[AMASS][Error] poses.npy has unsupported dimension: "
+                  << D << std::endl;
+        return false;
+    }
+
+    // ---------- betas ----------
+    cnpy::NpyArray betas_np = cnpy::npy_load(folder + "/betas.npy");
+    double* betas_data = betas_np.data<double>();
+    for (int i = 0; i < 10; ++i)
+        motion.betas[i] = betas_data[i];
+
+    // ---------- trans ----------
+    cnpy::NpyArray trans_np = cnpy::npy_load(folder + "/trans.npy");
+    double* trans_data = trans_np.data<double>();
+    motion.trans.resize(T);
+    for (size_t t = 0; t < T; ++t)
+        for (int i = 0; i < 3; ++i)
+            motion.trans[t][i] = trans_data[t * 3 + i];
+
+    motion.fps = 30.0;
+
+    std::cout << "[AMASS] Loaded " << T << " frames (SMPL pose)" << std::endl;
+    
+    // turn motion into Landmark2D sequence
+    for (size_t t = 0; t < motion.poses.size(); ++t) {
+        auto landmarks = GenerateSyntheticLandmarks(
+            model,
+            camera,
+            motion.betas.data(),
+            motion.poses[t].data(),
+            motion.trans[t].data()
+        );
+        sequence.push_back(std::move(landmarks));
+    }
+    return true;
+}
+
+void SaveMeshSequenceAsOBJ(
+    const std::vector<std::vector<Landmark2D>>& sequence,
+    SmplModel& model,
+    CameraIntrinsics& camera
+) {
+    double beta[10] = {0.0};
+    double theta[72] = {0.0};
+    double trans[3] = {0.0, 0.0, 2.5};
+
+    OptimizerConfig config;
+    config.max_iterations = 15;
+    config.verbose = false;
+
+    for (size_t t = 0; t < sequence.size(); ++t) {
+        const auto& landmarks = sequence[t];
+        if (landmarks.empty()) continue;
+
+        // 用上一帧结果作为初值（很重要）
+        OptimizeSMPL(landmarks, camera, model,
+                     beta, theta, trans, config);
+
+        Eigen::Matrix<double, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor> verts;
+        SMPLForward<double>(beta, theta, trans, model, verts);
+
+        char filename[256];
+        std::snprintf(filename, sizeof(filename),
+                      "meshes/frame_%04zu.obj", t);
+
+        SaveOBJ(filename, verts, model.faces);
+        std::cout << "Saved " << filename << std::endl;
+    }
+}
+
+int main() {
+    SmplModel model;
+    model.LoadFromNPZ("../../Data/star_1_1/neutral/model.npz");
+
+    CameraIntrinsics camera = CreateDefaultCamera(640, 480);
+    std::vector<std::vector<Landmark2D>> sequence;
+    LoadAMASSMotionFromNPY("../../Data/amass/A1-Stand_npy", sequence, camera);
+  
+    SaveMeshSequenceAsOBJ(sequence, model, camera);
+    
+}
+
+/*
 int main() {
     google::InitGoogleLogging("SMPL_Optimizer");
     std::cout << ">>> Start SMPL Project..." << std::endl;
@@ -228,6 +418,8 @@ int main() {
 
     // 5. Run a synthetic fitting demo to verify the optimizer end-to-end
     RunSyntheticOptimizationDemo(model);
+    // RunSyntheticOptimizationWithJSON(model);
 
     return 0;
 }
+*/

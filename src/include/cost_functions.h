@@ -26,35 +26,7 @@ struct CameraIntrinsics {
         : fx(fx_), fy(fy_), cx(cx_), cy(cy_), width(w), height(h) {}
 };
 
-// OpenPose BODY_25 to SMPL 24 Joint Mapping
-// -1 means no corresponding SMPL joint exists
-const int OPENPOSE_TO_SMPL[25] = {
-    15,  // 0: Nose -> SMPL Head (approximate)
-    12,  // 1: Neck -> SMPL Neck
-    17,  // 2: RShoulder -> SMPL Right Shoulder
-    19,  // 3: RElbow -> SMPL Right Elbow
-    21,  // 4: RWrist -> SMPL Right Wrist
-    16,  // 5: LShoulder -> SMPL Left Shoulder
-    18,  // 6: LElbow -> SMPL Left Elbow
-    20,  // 7: LWrist -> SMPL Left Wrist
-    0,   // 8: MidHip -> SMPL Pelvis
-    2,   // 9: RHip -> SMPL Right Hip
-    5,   // 10: RKnee -> SMPL Right Knee
-    8,   // 11: RAnkle -> SMPL Right Ankle
-    1,   // 12: LHip -> SMPL Left Hip
-    4,   // 13: LKnee -> SMPL Left Knee
-    7,   // 14: LAnkle -> SMPL Left Ankle
-    -1,  // 15: REye (not used)
-    -1,  // 16: LEye (not used)
-    -1,  // 17: REar (not used)
-    -1,  // 18: LEar (not used)
-    -1,  // 19: LBigToe (not used)
-    -1,  // 20: LSmallToe (not used)
-    -1,  // 21: LHeel (not used)
-    -1,  // 22: RBigToe (not used)
-    -1,  // 23: RSmallToe (not used)
-    -1   // 24: RHeel (not used)
-};
+
 
 // Cost Function 1: 2D Reprojection Error
 struct ReprojectionResidual {
@@ -76,7 +48,7 @@ struct ReprojectionResidual {
         T* residual      // [2] 
     ) const {
         
-        Eigen::Matrix<T, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor> vertices;
+        Eigen::Matrix<T, Eigen::Dynamic, 3, Eigen::RowMajor> vertices;
         SMPLForward<T>(beta, theta, trans, model_, vertices);
         
         // Step 2: 计算3D关节位置 (J_regressor × vertices)
@@ -167,6 +139,34 @@ struct DepthPrior {
     }
     
 private:
-    double expected_depth_;  // 期望深度 (例如2.5米)
-    double sigma_;           // 标准差
+    double expected_depth_;  
+    double sigma_;          
+};
+
+
+struct AnatomicalLimitResidual {
+    AnatomicalLimitResidual(int joint_idx, int axis, double min_angle, double max_angle, double weight)
+        : joint_idx_(joint_idx), axis_(axis), min_a_(min_angle), max_a_(max_angle), weight_(weight) {}
+
+    template <typename T>
+    bool operator()(const T* const theta, T* residual) const {
+        // theta is 72-dim. Joint i starts at 3*i.
+        // We focus on the specific axis (0=x, 1=y, 2=z).
+        const T& angle = theta[joint_idx_ * 3 + axis_]; 
+
+        residual[0] = T(0.0);
+
+        // Barrier Function
+        if (angle < T(min_a_)) {
+            residual[0] = T(weight_) * (T(min_a_) - angle);
+        } else if (angle > T(max_a_)) {
+            residual[0] = T(weight_) * (angle - T(max_a_));
+        }
+        return true;
+    }
+
+private:
+    int joint_idx_;
+    int axis_;    
+    double min_a_, max_a_, weight_;
 };

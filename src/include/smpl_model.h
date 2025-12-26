@@ -1,25 +1,30 @@
+// smpl_model.h
 #pragma once
-
+#include <Eigen/Dense>
 #include <string>
 #include <vector>
-#include <Eigen/Dense>
-#include "cnpy.h" 
+#include <utility>
 
 struct SmplModel {
-    int N; // Number of vertices
-    int J; // Number of joints
+    int N = 0;
+    int J = 0;
 
-    Eigen::MatrixXd v_template; 
-    Eigen::MatrixXd shapedirs; 
-    Eigen::MatrixXd posedirs; 
-    Eigen::MatrixXd J_regressor; 
-    Eigen::MatrixXd weights; 
-    Eigen::MatrixXi kintree_table; 
+    Eigen::Matrix<double, Eigen::Dynamic, 3, Eigen::RowMajor> v_template;
+    Eigen::Matrix<double, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor> shapedirs;
+    Eigen::Matrix<double, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor> posedirs;
+    Eigen::Matrix<double, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor> weights;
+    Eigen::Matrix<double, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor> J_regressor;
+    Eigen::Matrix<int, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor> kintree_table;
+    Eigen::MatrixXi faces;
 
-    // [NEW] Added faces matrix to store triangle indices (N_faces x 3)
-    Eigen::MatrixXi faces; 
+    std::vector<std::vector<std::pair<int,double>>> J_regressor_nz;
 
-    SmplModel() : N(0), J(0) {}
+    Eigen::Matrix<double, Eigen::Dynamic, 3, Eigen::RowMajor> J_template_3d;   // J x 3
+    Eigen::Matrix<double, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor> J_shapedirs_3d; // (J*3) x 10
 
-    bool LoadFromNPZ(const std::string& path);
+    bool LoadFromNPZ(const std::string& npz_path);
+
+private:
+    void BuildRegressorCache();
+    void BuildJointShapeCache(int num_beta = 10); 
 };

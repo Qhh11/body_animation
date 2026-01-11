@@ -1,45 +1,40 @@
 #include "optimizer.h"
 #include <thread>
-#include <ceres/rotation.h>
 #include <ceres/ceres.h>
 #include <ceres/manifold.h>
 
-
-// OpenPose BODY_25 to SMPL 24 Joint Mapping
-// -1 means no corresponding SMPL joint exists
+// OpenPose BODY_25 to SMPL mapping (define ONCE here)
 const int OPENPOSE_TO_SMPL[25] = {
-    15,  // 0: Nose -> SMPL Head (approximate)
-    12,  // 1: Neck -> SMPL Neck
-    17,  // 2: RShoulder -> SMPL Right Shoulder
-    19,  // 3: RElbow -> SMPL Right Elbow
-    21,  // 4: RWrist -> SMPL Right Wrist
-    16,  // 5: LShoulder -> SMPL Left Shoulder
-    18,  // 6: LElbow -> SMPL Left Elbow
-    20,  // 7: LWrist -> SMPL Left Wrist
-    0,   // 8: MidHip -> SMPL Pelvis
-    2,   // 9: RHip -> SMPL Right Hip
-    5,   // 10: RKnee -> SMPL Right Knee
-    8,   // 11: RAnkle -> SMPL Right Ankle
-    1,   // 12: LHip -> SMPL Left Hip
-    4,   // 13: LKnee -> SMPL Left Knee
-    7,   // 14: LAnkle -> SMPL Left Ankle
-    -1,  // 15: REye (not used)
-    -1,  // 16: LEye (not used)
-    -1,  // 17: REar (not used)
-    -1,  // 18: LEar (not used)
-    -1,  // 19: LBigToe (not used)
-    -1,  // 20: LSmallToe (not used)
-    -1,  // 21: LHeel (not used)
-    -1,  // 22: RBigToe (not used)
-    -1,  // 23: RSmallToe (not used)
-    -1   // 24: RHeel (not used)
+    15,  // 0: Nose -> Head (rough)
+    12,  // 1: Neck -> Neck
+    17,  // 2: RShoulder
+    19,  // 3: RElbow
+    21,  // 4: RWrist
+    16,  // 5: LShoulder
+    18,  // 6: LElbow
+    20,  // 7: LWrist
+    0,   // 8: MidHip -> Pelvis
+    2,   // 9: RHip
+    5,   // 10: RKnee
+    8,   // 11: RAnkle
+    1,   // 12: LHip
+    4,   // 13: LKnee
+    7,   // 14: LAnkle
+    -1,  // 15: REye
+    -1,  // 16: LEye
+    -1,  // 17: REar
+    -1,  // 18: LEar
+    -1,  // 19: LBigToe
+    -1,  // 20: LSmallToe
+    -1,  // 21: LHeel
+    -1,  // 22: RBigToe
+    -1,  // 23: RSmallToe
+    -1   // 24: RHeel
 };
 
 static void SetupSolverOptions(ceres::Solver::Options& options, int max_iter) {
-    // For this problem size, DENSE_QR is often OK.
-    // If you later add many residuals / priors, try DENSE_SCHUR.
     options.linear_solver_type = ceres::DENSE_QR;
-    options.num_threads = 1;
+    options.num_threads = std::max(1u, std::thread::hardware_concurrency());
     options.minimizer_progress_to_stdout = true;
     options.max_num_iterations = max_iter;
 }
@@ -53,11 +48,17 @@ static void AddAllKeypointReprojBlock(
     double* theta,
     double* trans,
     bool use_pose_blendshapes,
-    float min_conf,
+    const OptimizerConfig& cfg,
     ceres::LossFunction* loss
 ) {
     auto* functor = new AllKeypointsReprojectionResidual(
-        observed, camera, model, use_pose_blendshapes, min_conf
+        observed,
+        camera,
+        model,
+        use_pose_blendshapes,
+        cfg.min_confidence,
+        cfg.use_stable_joints_only,
+        cfg.flip_y_in_projection
     );
 
     const int K = functor->NumUsedKeypoints();
@@ -76,8 +77,6 @@ static void AddAllKeypointReprojBlock(
     problem.AddResidualBlock(cost, loss, beta, theta, trans);
 }
 
-
-
 bool OptimizeSMPL(
     const std::vector<Landmark2D>& observed_keypoints,
     const CameraIntrinsics& camera,
@@ -87,77 +86,88 @@ bool OptimizeSMPL(
     double* trans,
     const OptimizerConfig& config
 ) {
+    std::cout << "[Optimizer] Starting 2D Optimization...\n";
 
-    std::cout << "[Optimizer] Starting Optimization...\n";
-
-    // ========================================================================
-    // STAGE 1: rigid alignment (ONLY trans + root rot), posedirs OFF
-    // ========================================================================
+    // ----------------------------
+    // Stage 1: ONLY trans + ONE root axis (avoid flip /倒立)
+    // ----------------------------
     {
-        std::cout << "\n>>> Stage 1: Global Translation & Root Orientation (FAST)...\n";
+        std::cout << "\n>>> Stage 1: trans + single-axis root (FAST & stable)\n";
         ceres::Problem problem;
 
         AddAllKeypointReprojBlock(
             problem, observed_keypoints, camera, model,
             beta, theta, trans,
             /*use_pose_blendshapes=*/false,
-            config.min_confidence,
+            config,
             new ceres::HuberLoss(20.0)
         );
 
-        // keep shape fixed in stage 1
+        // fix shape
         problem.SetParameterBlockConstant(beta);
 
-        // lock theta[3..71] using SubsetManifold
+        // lock all theta except one root axis
         std::vector<int> const_idx;
-        const_idx.reserve(72 - 3);
-        for (int i = 3; i < 72; ++i) const_idx.push_back(i);
+        const_idx.reserve(71);
+
+        // lock theta[0..71] except index = config.root_free_axis
+        for (int i = 0; i < 72; ++i) {
+            if (i == config.root_free_axis) continue; // free only one axis
+            const_idx.push_back(i);
+        }
         problem.SetManifold(theta, new ceres::SubsetManifold(72, const_idx));
 
         // bounds on depth
         problem.SetParameterLowerBound(trans, 2, 0.5);
-        problem.SetParameterUpperBound(trans, 2, 50.0);
+        problem.SetParameterUpperBound(trans, 2, 20.0);
 
         ceres::Solver::Options options;
         SetupSolverOptions(options, 30);
         ceres::Solver::Summary summary;
         ceres::Solve(options, &problem, &summary);
-
-        std::cout << "Stage 1 Time: " << summary.total_time_in_seconds << "s\n";
+        if (config.verbose) std::cout << summary.BriefReport() << "\n";
     }
 
-    // ========================================================================
-    // STAGE 2: articulated pose (posedirs ON)
-    // ========================================================================
+    // ----------------------------
+    // Stage 2: full pose (beta fixed)
+    // ----------------------------
     {
-        std::cout << "\n>>> Stage 2: Articulated Pose Fitting (posedirs ON)...\n";
+        std::cout << "\n>>> Stage 2: full pose (beta fixed)\n";
         ceres::Problem problem;
 
         AddAllKeypointReprojBlock(
             problem, observed_keypoints, camera, model,
             beta, theta, trans,
             /*use_pose_blendshapes=*/true,
-            config.min_confidence,
-            new ceres::HuberLoss(5.0)
+            config,
+            new ceres::HuberLoss(20.0)
         );
 
-        // keep shape fixed in stage 2
         problem.SetParameterBlockConstant(beta);
 
-        // light L2 pose reg (avoid exploding)
-        const double pose_reg_weight = 1.0;
+        // stronger pose reg for 2D 
+        const double pose_reg_weight = 5.0;
         for (int i = 3; i < 72; ++i) {
             problem.AddResidualBlock(
-                new ceres::AutoDiffCostFunction<PoseRegularizer, 1, 72>(new PoseRegularizer(i, pose_reg_weight)),
+                new ceres::AutoDiffCostFunction<PoseRegularizer, 1, 72>(
+                    new PoseRegularizer(i, pose_reg_weight)),
                 nullptr, theta
             );
         }
 
-        // hinge constraints
-        const double hinge_lock_weight = 1000.0;
-        const double limit_weight = 100.0;
+        // hinge constraints (keep)
+        const double hinge_lock_weight = 100.0;
+        const double limit_weight = 50.0;
 
-        // knees (SMPL joint indices: adjust if your indexing differs)
+        const double root_upright_w = 10.0; 
+        problem.AddResidualBlock(
+            new ceres::AutoDiffCostFunction<RootUprightResidual, 2, 72>(
+                new RootUprightResidual(root_upright_w)),
+            nullptr, theta
+        );
+
+
+        // knees indices (your SMPL indexing assumed)
         int knees[] = {4, 5};
         for (int k : knees) {
             problem.AddResidualBlock(new ceres::AutoDiffCostFunction<AnatomicalLimitResidual,1,72>(
@@ -180,79 +190,89 @@ bool OptimizeSMPL(
         }
 
         problem.SetParameterLowerBound(trans, 2, 0.5);
-        problem.SetParameterUpperBound(trans, 2, 50.0);
+        problem.SetParameterUpperBound(trans, 2, 20.0);
 
         ceres::Solver::Options options;
-        SetupSolverOptions(options, 50);
+        SetupSolverOptions(options, 40);
         ceres::Solver::Summary summary;
         ceres::Solve(options, &problem, &summary);
-
-        std::cout << "Stage 2 Time: " << summary.total_time_in_seconds << "s\n";
+        if (config.verbose) std::cout << summary.BriefReport() << "\n";
     }
 
-    // ========================================================================
-    // STAGE 3: shape refine (posedirs ON)
-    // ========================================================================
+    // ----------------------------
+    // Stage 3: allow beta refine (with strong shape prior)
+    // ----------------------------
     {
-        std::cout << "\n>>> Stage 3: Shape & Fine Tuning...\n";
+        std::cout << "\n>>> Stage 3: refine beta + pose + trans\n";
         ceres::Problem problem;
 
         AddAllKeypointReprojBlock(
             problem, observed_keypoints, camera, model,
             beta, theta, trans,
             /*use_pose_blendshapes=*/true,
-            config.min_confidence,
+            config,
             new ceres::HuberLoss(2.0)
         );
 
         // shape reg
-        const double shape_reg_weight = 50.0;
+        const double shape_reg_weight = 80.0;
         for (int i = 0; i < 10; ++i) {
             problem.AddResidualBlock(
-                new ceres::AutoDiffCostFunction<ShapeRegularizer,1,10>(new ShapeRegularizer(i, shape_reg_weight)),
+                new ceres::AutoDiffCostFunction<ShapeRegularizer, 1, 10>(
+                    new ShapeRegularizer(i, shape_reg_weight)),
                 nullptr, beta
             );
         }
 
-        // pose reg (slightly stronger)
+        const double root_upright_w = 10.0; 
+        problem.AddResidualBlock(
+            new ceres::AutoDiffCostFunction<RootUprightResidual, 2, 72>(
+                new RootUprightResidual(root_upright_w)),
+            nullptr, theta
+        );
+
+        // keep pose reg
         for (int i = 3; i < 72; ++i) {
             problem.AddResidualBlock(
-                new ceres::AutoDiffCostFunction<PoseRegularizer,1,72>(new PoseRegularizer(i, 2.0)),
+                new ceres::AutoDiffCostFunction<PoseRegularizer, 1, 72>(
+                    new PoseRegularizer(i, 5.0)),
                 nullptr, theta
             );
         }
 
         problem.SetParameterLowerBound(trans, 2, 0.5);
-        problem.SetParameterUpperBound(trans, 2, 50.0);
+        problem.SetParameterUpperBound(trans, 2, 20.0);
 
         ceres::Solver::Options options;
-        SetupSolverOptions(options, 30);
+        SetupSolverOptions(options, 40);
         ceres::Solver::Summary summary;
         ceres::Solve(options, &problem, &summary);
 
-        std::cout << "Stage 3 Time: " << summary.total_time_in_seconds << "s\n";
-        std::cout << "[Final] Cost: " << summary.final_cost << "\n";
+        std::cout << "[Final] " << summary.BriefReport() << "\n";
     }
 
     return true;
 }
 
-
-static void AddJoints3DBlock(ceres::Problem& problem,
-                             const MatX3dRM& J_obs,
-                             const SmplModel& model,
-                             bool use_pose_blendshapes,
-                             double* beta, double* theta, double* trans,
-                             double w,
-                             ceres::LossFunction* loss) {
-     auto* functor = new Joints3DResidual(J_obs, model, w, use_pose_blendshapes);
+// ------------------------------
+// 3D unit test
+// ------------------------------
+static void AddJoints3DBlock(
+    ceres::Problem& problem,
+    const MatX3dRM& J_obs,
+    const SmplModel& model,
+    bool use_pose_blendshapes,
+    double* beta, double* theta, double* trans,
+    double w,
+    ceres::LossFunction* loss
+) {
+    auto* functor = new Joints3DResidual(J_obs, model, w, use_pose_blendshapes);
     auto* cost = new ceres::AutoDiffCostFunction<Joints3DResidual, ceres::DYNAMIC, 10, 72, 3>(
         functor,
-        3 * static_cast<int>(J_obs.rows())  // residual dim = 72
+        3 * static_cast<int>(J_obs.rows())
     );
     problem.AddResidualBlock(cost, loss, beta, theta, trans);
 }
-
 
 bool OptimizeSMPL3D(const MatX3dRM& J_obs,
                     const SmplModel& model,
@@ -260,19 +280,13 @@ bool OptimizeSMPL3D(const MatX3dRM& J_obs,
                     double* theta,
                     double* trans,
                     const OptimizerConfig& config) {
-
-    // ---------------------------
-    // Stage 1: trans + root rot only
-    // ---------------------------
+    // Stage1: trans + root only
     {
         ceres::Problem problem;
-        AddJoints3DBlock(problem, J_obs, model, true, beta, theta, trans,
-                         config.w_3d, nullptr);
-
+        AddJoints3DBlock(problem, J_obs, model, true, beta, theta, trans, config.w_3d, nullptr);
         problem.SetParameterBlockConstant(beta);
 
         std::vector<int> const_idx;
-        const_idx.reserve(69);
         for (int i = 3; i < 72; ++i) const_idx.push_back(i);
         problem.SetManifold(theta, new ceres::SubsetManifold(72, const_idx));
 
@@ -280,18 +294,14 @@ bool OptimizeSMPL3D(const MatX3dRM& J_obs,
         SetupSolverOptions(options, 50);
         ceres::Solver::Summary summary;
         ceres::Solve(options, &problem, &summary);
-        if (config.verbose) std::cout << "[3D Stage1] " << summary.BriefReport() << "\n";
         if (!summary.IsSolutionUsable()) return false;
+        if (config.verbose) std::cout << "[3D Stage1] " << summary.BriefReport() << "\n";
     }
 
-    // ---------------------------
-    // Stage 2: full pose (beta fixed)
-    // ---------------------------
+    // Stage2: full pose
     {
         ceres::Problem problem;
-        AddJoints3DBlock(problem, J_obs, model,true, beta, theta, trans,
-                         config.w_3d, nullptr);
-
+        AddJoints3DBlock(problem, J_obs, model, true, beta, theta, trans, config.w_3d, nullptr);
         problem.SetParameterBlockConstant(beta);
 
         const double pose_reg_w = config.unit_test_exact ? 1e-2 : 1e-3;
@@ -299,49 +309,24 @@ bool OptimizeSMPL3D(const MatX3dRM& J_obs,
             problem.AddResidualBlock(
                 new ceres::AutoDiffCostFunction<PoseRegularizer, 1, 72>(
                     new PoseRegularizer(i, pose_reg_w)),
-                nullptr, theta);
+                nullptr, theta
+            );
         }
-
 
         ceres::Solver::Options options;
         SetupSolverOptions(options, 200);
         ceres::Solver::Summary summary;
         ceres::Solve(options, &problem, &summary);
+        if (!summary.IsSolutionUsable()) return false;
         if (config.verbose) std::cout << "[3D Stage2] " << summary.BriefReport() << "\n";
-        if (!summary.IsSolutionUsable()) return false;
-    }
-
-    // ---------------------------
-    // Stage 3: optional beta refine
-    // ---------------------------
-    if (!config.unit_test_exact) {
-        ceres::Problem problem;
-        AddJoints3DBlock(problem, J_obs, model, true, beta, theta, trans,
-                         config.w_3d, nullptr);
-
-        const double shape_reg_w = 1e-4;
-        for (int i = 0; i < 10; ++i) {
-            problem.AddResidualBlock(
-                new ceres::AutoDiffCostFunction<ShapeRegularizer, 1, 10>(
-                    new ShapeRegularizer(i, shape_reg_w)),
-                nullptr, beta);
-        }
-
-        ceres::Solver::Options options;
-        SetupSolverOptions(options, 100);
-        ceres::Solver::Summary summary;
-        ceres::Solve(options, &problem, &summary);
-        if (config.verbose) std::cout << "[3D Stage3] " << summary.BriefReport() << "\n";
-        if (!summary.IsSolutionUsable()) return false;
     }
 
     return true;
 }
 
-
 CameraIntrinsics CreateDefaultCamera(int image_width, int image_height) {
     float focal = image_width * 1.2f;
-    float cx = image_width / 2.0f;
-    float cy = image_height / 2.0f;
+    float cx = image_width * 0.5f;
+    float cy = image_height * 0.5f;
     return CameraIntrinsics(focal, focal, cx, cy, image_width, image_height);
 }

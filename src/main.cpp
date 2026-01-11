@@ -21,82 +21,125 @@ void SaveOBJ(const std::string& filename,
 
 namespace {
 
-// =========================================================
-// [HELPER] Estimate Initial Z from Bounding Box Height
-// =========================================================
-void EstimateGlobalTranslation(
+static void EstimateGlobalTranslationXY(
     const std::vector<Landmark2D>& landmarks,
     const CameraIntrinsics& camera,
+    double z_assumed,
     double* trans_init
 ) {
-    if (landmarks.empty()) return;
+    float min_y = 1e9f, max_y = -1e9f;
+    float min_x = 1e9f, max_x = -1e9f;
 
-    float min_y = 1e5, max_y = -1e5;
-    float min_x = 1e5, max_x = -1e5;
-    
     for (const auto& lm : landmarks) {
-        if (lm.confidence > 0) {
-            if (lm.y < min_y) min_y = lm.y;
-            if (lm.y > max_y) max_y = lm.y;
-            if (lm.x < min_x) min_x = lm.x;
-            if (lm.x > max_x) max_x = lm.x;
-        }
+        if (lm.confidence < 0.2f) continue;
+        min_x = std::min(min_x, lm.x);
+        max_x = std::max(max_x, lm.x);
+        min_y = std::min(min_y, lm.y);
+        max_y = std::max(max_y, lm.y);
     }
 
-    float pixel_height = max_y - min_y;
-    float center_x = (min_x + max_x) / 2.0f;
-    float center_y = (min_y + max_y) / 2.0f;
+    const float center_x = 0.5f * (min_x + max_x);
+    const float center_y = 0.5f * (min_y + max_y);
 
-    // Safety check for tiny boxes
-    if (pixel_height < 20.0f) {
-        std::cerr << "[Init] Warning: Box too small. Defaulting to 3.0m" << std::endl;
-        trans_init[2] = 3.0; 
-        return; 
-    }
+    // backproject center using assumed z
+    trans_init[0] = (center_x - camera.cx) * z_assumed / camera.fx;
 
-    // Assume average human height ~1.6m - 1.7m
-    float avg_human_height = 1.65f; 
-    float estimated_z = (camera.fy * avg_human_height) / pixel_height;
+    trans_init[1] = -(center_y - camera.cy) * z_assumed / camera.fy;
 
-    // Clamp Z to reasonable human interaction range (0.5m to 10m)
-    if (estimated_z < 0.5) estimated_z = 0.5;
-    if (estimated_z > 10.0) estimated_z = 10.0;
+    trans_init[2] = z_assumed;
 
-    // Back-project center
-    float estimated_x = (center_x - camera.cx) * estimated_z / camera.fx;
-    float estimated_y = (center_y - camera.cy) * estimated_z / camera.fy;
-
-    trans_init[0] = estimated_x;
-    trans_init[1] = estimated_y; 
-    trans_init[2] = estimated_z;
-
-    std::cout << "[Init] Auto-Estimated Translation: " 
-              << "Z=" << estimated_z << "m (based on pixel height " << pixel_height << ")" << std::endl;
+    std::cout << "[Init] trans init = (" << trans_init[0] << ", " << trans_init[1] << ", " << trans_init[2] << ")\n";
 }
 
-// [HELPER] Load Real OpenPose JSON
+
 bool LoadLandmarksFromJSON(
     const std::string& json_path,
     std::vector<Landmark2D>& landmarks
 ) {
     landmarks.clear();
+
     std::ifstream infile(json_path);
     if (!infile.is_open()) return false;
+
     json j;
     try { infile >> j; } catch(...) { return false; }
 
     if (!j.contains("people") || j["people"].empty()) return false;
-    const auto& keypoints = j["people"][0]["pose_keypoints_2d"];
-    if (keypoints.size() < 75) return false;
 
+    const auto& people = j["people"];
+
+    // ---- pick best person ----
+    int best_idx = -1;
+    double best_score = -1.0;
+
+    for (int i = 0; i < (int)people.size(); ++i) {
+        if (!people[i].contains("pose_keypoints_2d")) continue;
+        const auto& kp = people[i]["pose_keypoints_2d"];
+        if (kp.size() < 75) continue;
+
+        float min_x = 1e9f, max_x = -1e9f;
+        float min_y = 1e9f, max_y = -1e9f;
+        double sum_c = 0.0;
+        int cnt = 0;
+
+        // Use a slightly higher threshold for scoring robustness
+        const float conf_thr = 0.20f;
+
+        for (int jnt = 0; jnt < 25; ++jnt) {
+            float x = kp[3 * jnt + 0].get<float>();
+            float y = kp[3 * jnt + 1].get<float>();
+            float c = kp[3 * jnt + 2].get<float>();
+            if (c < conf_thr) continue;
+
+            min_x = std::min(min_x, x); max_x = std::max(max_x, x);
+            min_y = std::min(min_y, y); max_y = std::max(max_y, y);
+
+            sum_c += c;
+            cnt++;
+        }
+
+        if (cnt < 6) continue; // too few joints => likely noise / partial
+
+        const float w = std::max(1.0f, max_x - min_x);
+        const float h = std::max(1.0f, max_y - min_y);
+        const double area = (double)w * (double)h;
+        const double mean_c = sum_c / (double)cnt;
+
+        // score: prefer large bbox (full body), many joints, and high confidence
+        const double score = area * mean_c * (double)cnt;
+
+        if (score > best_score) {
+            best_score = score;
+            best_idx = i;
+        }
+    }
+
+    if (best_idx < 0) {
+        // fallback: use the first person if all scores failed
+        best_idx = 0;
+        if (!people[best_idx].contains("pose_keypoints_2d")) return false;
+        if (people[best_idx]["pose_keypoints_2d"].size() < 75) return false;
+    }
+
+    const auto& keypoints = people[best_idx]["pose_keypoints_2d"];
+
+    // ---- output landmarks (keep your original low threshold for optimization) ----
     for (int joint_id = 0; joint_id < 25; ++joint_id) {
         float x = keypoints[3 * joint_id + 0].get<float>();
         float y = keypoints[3 * joint_id + 1].get<float>();
         float c = keypoints[3 * joint_id + 2].get<float>();
+
+        // Keep as you had it (0.05) so optimizer can decide to ignore low conf by cfg.min_confidence
         if (c > 0.05f) landmarks.emplace_back(x, y, c, joint_id);
     }
-    return true;
+
+    std::cout << "[OpenPose] picked person index = " << best_idx
+              << " / " << people.size()
+              << " (score=" << best_score << ")\n";
+
+    return !landmarks.empty();
 }
+
 
 void FlipLandmarks(std::vector<Landmark2D>& landmarks, int width) {
         for (auto& lm : landmarks) {
@@ -260,61 +303,54 @@ void RunAMASSValidation(const SmplModel& model) {
 void RunOpenPoseInference(const SmplModel& model) {
     std::cout << "\n=== MODE 2: Running Real OpenPose Data (Fine-Tuned) ===" << std::endl;
 
-    std::string json_path = "../../Data/OpenPose/output_jsons/video_000000000000_keypoints.json";
-    
-    std::vector<Landmark2D> real_landmarks;
-    if (!LoadLandmarksFromJSON(json_path, real_landmarks)) {
-        std::cerr << "Failed to load JSON." << std::endl;
+    std::string json_path = "../../Data/OpenPose/my_openpose/output_jsons/dance_000000000120_keypoints.json";
+    std::vector<Landmark2D> lms;
+    if (!LoadLandmarksFromJSON(json_path, lms)) {
+        std::cerr << "Failed to load json.\n";
+        return;
+    }
+    SaveLandmarksToFile("landmarks_input.txt", lms);
+
+    // -------- Camera --------
+    const int img_w = 1280;
+    const int img_h = 720;
+    CameraIntrinsics camera = CreateDefaultCamera(img_w, img_h);
+
+    // -------- Init params --------
+    double beta[10]  = {0.0};
+    double theta[72] = {0.0};
+    double trans[3]  = {0.0, 0.0, 3.0};
+
+    // 轻微初值（可选）：让手臂不要完全T pose（你也可以先注释）
+    // theta[16*3 + 2] = -0.4;
+    // theta[17*3 + 2] =  0.4;
+
+    // init trans x/y with bbox center, keep z=3.0
+    EstimateGlobalTranslationXY(lms, camera, /*z_assumed=*/3.0, trans);
+
+    Eigen::Matrix<double, Eigen::Dynamic, 3, Eigen::RowMajor> V_init;
+    SMPLForward<double>(beta, theta, trans, model, V_init);
+    SaveOBJ("mesh_before_opt.obj", V_init, model.faces);
+
+    // -------- Optimize --------
+    OptimizerConfig cfg;
+    cfg.verbose = true;
+    cfg.min_confidence = 0.20f;
+    cfg.use_stable_joints_only = true;    
+    cfg.flip_y_in_projection = true;     
+    cfg.root_free_axis = 1;               
+
+    const bool ok = OptimizeSMPL(lms, camera, model, beta, theta, trans, cfg);
+    if (!ok) {
+        std::cerr << "OptimizeSMPL failed.\n";
         return;
     }
 
-    // 1. Setup Camera
-    int img_w = 1280;
-    int img_h = 720;
-    CameraIntrinsics camera = CreateDefaultCamera(img_w, img_h); 
+    Eigen::Matrix<double, Eigen::Dynamic, 3, Eigen::RowMajor> V_opt;
+    SMPLForward<double>(beta, theta, trans, model, V_opt);
+    SaveOBJ("mesh_after_opt.obj", V_opt, model.faces);
 
-    // [Step 1] Flip 设为 false 
-    bool FLIP_INPUT = false; 
-    if (FLIP_INPUT) {
-        FlipLandmarks(real_landmarks, img_w);
-    }
-    SaveLandmarksToFile("landmarks_gt.txt", real_landmarks); 
-
-    // 2. Initialization
-    double beta_opt[10] = {0.0};
-    double theta_opt[72] = {0.0}; // Default T-Pose
-    double trans_opt[3] = {0.0, 0.0, 3.0}; // [Step 2] Hardcode Start Z = 3.0m
-
-    // [Step 3] Smart Initialization
-    theta_opt[0] = 3.1415926; 
-    theta_opt[16*3 + 2] = -0.8; 
-    theta_opt[17*3 + 2] = 0.8;
-
-    // [Step 4] Run Auto-Estimator just to center X/Y, but FORCE Z back to 3.0
-    EstimateGlobalTranslation(real_landmarks, camera, trans_opt);
-    std::cout << "[FineTune] Overriding Z-Estimate. Forcing Start Z = 3.0m" << std::endl;
-    trans_opt[2] = 3.0; 
-
-    // Save Initial Mesh
-    Eigen::Matrix<double, Eigen::Dynamic, 3, Eigen::RowMajor> verts_init;
-    SMPLForward<double>(beta_opt, theta_opt, trans_opt, model, verts_init);
-    SaveOBJ("mesh_before_opt.obj", verts_init, model.faces);
-
-
-    // 3. Optimize
-    OptimizerConfig config;
-    config.verbose = true;
-    
-    if(OptimizeSMPL(real_landmarks, camera, model, beta_opt, theta_opt, trans_opt, config)) {
-        // Save Result
-        Eigen::Matrix<double, Eigen::Dynamic, 3, Eigen::RowMajor> verts_opt;
-        SMPLForward<double>(beta_opt, theta_opt, trans_opt, model, verts_opt);
-        SaveOBJ("mesh_after_opt.obj", verts_opt, model.faces);
-        SaveOBJ("mesh_ground_truth.obj", verts_opt, model.faces); 
-
-        auto final_landmarks = GenerateSyntheticLandmarks(model, camera, beta_opt, theta_opt, trans_opt, true);
-        SaveLandmarksToFile("landmarks_optimized.txt", final_landmarks);
-    }
+    std::cout << "[Done] saved mesh_after_opt.obj\n";
 }
 
 } // namespace

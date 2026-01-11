@@ -13,23 +13,37 @@ void SMPLJointsForward(
     Eigen::Matrix<T, Eigen::Dynamic, 3, Eigen::RowMajor>& out_joints_world
 ) {
     const int J = model.J;
+    const int N = model.N;
     out_joints_world.resize(J, 3);
 
-    // 1) shaped joints: Jx3 (no mesh!)
-    Eigen::Matrix<T, Eigen::Dynamic, 3, Eigen::RowMajor> joints_shaped(J, 3);
-    joints_shaped.setZero();
+    // 1) v_shaped
+    Eigen::Matrix<T, Eigen::Dynamic, 3, Eigen::RowMajor> v_shaped(N, 3);
+    for (int i = 0; i < N; ++i) {
+        v_shaped(i,0) = T(model.v_template(i,0));
+        v_shaped(i,1) = T(model.v_template(i,1));
+        v_shaped(i,2) = T(model.v_template(i,2));
+    }
+    for (int i = 0; i < N; ++i) for (int c = 0; c < 3; ++c) {
+        T off = T(0);
+        for (int k = 0; k < 10; ++k) off += T(model.shapedirs(i*3+c, k)) * beta[k];
+        v_shaped(i,c) += off;
+    }
 
+    // 2) joints = J_regressor * v_shaped
+    Eigen::Matrix<T, Eigen::Dynamic, 3, Eigen::RowMajor> joints(J, 3);
+    joints.setZero();
     for (int j = 0; j < J; ++j) {
-        for (int c = 0; c < 3; ++c) {
-            T val = T(model.J_template_3d(j, c));
-            for (int k = 0; k < 10; ++k) {
-                val += T(model.J_shapedirs_3d(j*3 + c, k)) * beta[k];
-            }
-            joints_shaped(j, c) = val;
+        const auto& nz = model.J_regressor_nz[j];
+        for (const auto& it : nz) {
+            int v = it.first;
+            T w = T(it.second);
+            joints(j,0) += w * v_shaped(v,0);
+            joints(j,1) += w * v_shaped(v,1);
+            joints(j,2) += w * v_shaped(v,2);
         }
     }
 
-    // 2) parent array
+    // 3) parents
     std::vector<int> parents(J, -1);
     parents[0] = -1;
     for (int i = 1; i < J; ++i) {
@@ -37,7 +51,7 @@ void SMPLJointsForward(
         parents[i] = (p >= 0 && p < J) ? p : -1;
     }
 
-    // 3) FK global transforms (only translation is needed)
+    // 4) FK global transforms
     std::vector<Eigen::Matrix<T,4,4>> global_T(J);
     for (int i = 0; i < J; ++i) {
         T aa[3] = { theta[i*3+0], theta[i*3+1], theta[i*3+2] };
@@ -52,25 +66,26 @@ void SMPLJointsForward(
 
         int p = parents[i];
         if (p == -1) {
-            local(0,3) = joints_shaped(i,0);
-            local(1,3) = joints_shaped(i,1);
-            local(2,3) = joints_shaped(i,2);
+            local(0,3)=joints(i,0);
+            local(1,3)=joints(i,1);
+            local(2,3)=joints(i,2);
             global_T[i] = local;
         } else {
-            local(0,3) = joints_shaped(i,0) - joints_shaped(p,0);
-            local(1,3) = joints_shaped(i,1) - joints_shaped(p,1);
-            local(2,3) = joints_shaped(i,2) - joints_shaped(p,2);
+            local(0,3)=joints(i,0)-joints(p,0);
+            local(1,3)=joints(i,1)-joints(p,1);
+            local(2,3)=joints(i,2)-joints(p,2);
             global_T[i] = global_T[p] * local;
         }
     }
 
-    // 4) output + global translation
+    // 5) output + trans
     for (int i = 0; i < J; ++i) {
         out_joints_world(i,0) = global_T[i](0,3) + trans[0];
         out_joints_world(i,1) = global_T[i](1,3) + trans[1];
         out_joints_world(i,2) = global_T[i](2,3) + trans[2];
     }
 }
+
 
 template <typename T>
 void SMPLForward(

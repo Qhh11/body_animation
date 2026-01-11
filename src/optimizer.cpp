@@ -39,7 +39,7 @@ static void SetupSolverOptions(ceres::Solver::Options& options, int max_iter) {
     // For this problem size, DENSE_QR is often OK.
     // If you later add many residuals / priors, try DENSE_SCHUR.
     options.linear_solver_type = ceres::DENSE_QR;
-    options.num_threads = std::max(1u, std::thread::hardware_concurrency());
+    options.num_threads = 1;
     options.minimizer_progress_to_stdout = true;
     options.max_num_iterations = max_iter;
 }
@@ -87,32 +87,6 @@ bool OptimizeSMPL(
     double* trans,
     const OptimizerConfig& config
 ) {
-
-    if (config.amass_unit_test) {
-        ceres::Problem problem;
-
-        AddAllKeypointReprojBlock(
-            problem, observed_keypoints, camera, model,
-            beta, theta, trans,
-            /*use_pose_blendshapes=*/true,
-            config.min_confidence,
-            nullptr
-        );
-
-        problem.SetParameterBlockConstant(beta);
-
-        // z bound
-        problem.SetParameterLowerBound(trans, 2, 0.5);
-        problem.SetParameterUpperBound(trans, 2, 50.0);
-
-        ceres::Solver::Options options;
-        SetupSolverOptions(options, 80);
-        ceres::Solver::Summary summary;
-        ceres::Solve(options, &problem, &summary);
-
-        if (config.verbose) std::cout << summary.FullReport() << "\n";
-        return summary.IsSolutionUsable();
-    }
 
     std::cout << "[Optimizer] Starting Optimization...\n";
 
@@ -267,10 +241,11 @@ bool OptimizeSMPL(
 static void AddJoints3DBlock(ceres::Problem& problem,
                              const MatX3dRM& J_obs,
                              const SmplModel& model,
+                             bool use_pose_blendshapes,
                              double* beta, double* theta, double* trans,
                              double w,
                              ceres::LossFunction* loss) {
-    auto* functor = new Joints3DResidual(J_obs, model, w);
+     auto* functor = new Joints3DResidual(J_obs, model, w, use_pose_blendshapes);
     auto* cost = new ceres::AutoDiffCostFunction<Joints3DResidual, ceres::DYNAMIC, 10, 72, 3>(
         functor,
         3 * static_cast<int>(J_obs.rows())  // residual dim = 72
@@ -291,7 +266,7 @@ bool OptimizeSMPL3D(const MatX3dRM& J_obs,
     // ---------------------------
     {
         ceres::Problem problem;
-        AddJoints3DBlock(problem, J_obs, model, beta, theta, trans,
+        AddJoints3DBlock(problem, J_obs, model, true, beta, theta, trans,
                          config.w_3d, nullptr);
 
         problem.SetParameterBlockConstant(beta);
@@ -314,20 +289,19 @@ bool OptimizeSMPL3D(const MatX3dRM& J_obs,
     // ---------------------------
     {
         ceres::Problem problem;
-        AddJoints3DBlock(problem, J_obs, model, beta, theta, trans,
+        AddJoints3DBlock(problem, J_obs, model,true, beta, theta, trans,
                          config.w_3d, nullptr);
 
         problem.SetParameterBlockConstant(beta);
 
-        if (!config.unit_test_exact) {
-            const double pose_reg_w = 1e-4;
-            for (int i = 3; i < 72; ++i) {
-                problem.AddResidualBlock(
-                    new ceres::AutoDiffCostFunction<PoseRegularizer, 1, 72>(
-                        new PoseRegularizer(i, pose_reg_w)),
-                    nullptr, theta);
-            }
+        const double pose_reg_w = config.unit_test_exact ? 1e-2 : 1e-3;
+        for (int i = 3; i < 72; ++i) {
+            problem.AddResidualBlock(
+                new ceres::AutoDiffCostFunction<PoseRegularizer, 1, 72>(
+                    new PoseRegularizer(i, pose_reg_w)),
+                nullptr, theta);
         }
+
 
         ceres::Solver::Options options;
         SetupSolverOptions(options, 200);
@@ -342,7 +316,7 @@ bool OptimizeSMPL3D(const MatX3dRM& J_obs,
     // ---------------------------
     if (!config.unit_test_exact) {
         ceres::Problem problem;
-        AddJoints3DBlock(problem, J_obs, model, beta, theta, trans,
+        AddJoints3DBlock(problem, J_obs, model, true, beta, theta, trans,
                          config.w_3d, nullptr);
 
         const double shape_reg_w = 1e-4;

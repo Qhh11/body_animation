@@ -119,40 +119,37 @@ void SaveLandmarksToFile(const std::string& filename, const std::vector<Landmark
     std::cout << "Saved landmarks to " << filename << std::endl;
 }
 
-// Helper: Synthetic Landmarks
 static std::vector<Landmark2D> GenerateSyntheticLandmarks(
     const SmplModel& model,
     const CameraIntrinsics& camera,
     const double* beta,
     const double* theta,
-    const double* trans
+    const double* trans,
+    bool use_pose_blendshapes
 ) {
     std::vector<Landmark2D> landmarks;
     landmarks.reserve(25);
 
-    // 1) joints-only forward (same as residual)
     Eigen::Matrix<double, Eigen::Dynamic, 3, Eigen::RowMajor> Jw;
-    SMPLJointsForward<double>(beta, theta, trans, model, Jw);
+    SMPLJointsFromMeshForward<double>(beta, theta, trans, model, Jw, use_pose_blendshapes);
 
-    // 2) project OpenPose 25 joints
     for (int joint_id = 0; joint_id < 25; ++joint_id) {
         int smpl_joint_id = OPENPOSE_TO_SMPL[joint_id];
         if (smpl_joint_id < 0 || smpl_joint_id >= model.J) continue;
 
         const double X = Jw(smpl_joint_id, 0);
         const double Y = Jw(smpl_joint_id, 1);
-        const double Z = Jw(smpl_joint_id, 2);
+        double Zc = Jw(smpl_joint_id, 2);
+        if (Zc < 1e-6) Zc = 1e-6;
 
-        // behind camera 
-       double Zc = Z;
-        if (Zc < 1e-6) Zc = 1e-6;  
-        float px = static_cast<float>(camera.fx * (X / Zc) + camera.cx);
-        float py = static_cast<float>(camera.fy * (Y / Zc) + camera.cy);
+        float px = float(camera.fx * (X / Zc) + camera.cx);
+        float py = float(camera.fy * (Y / Zc) + camera.cy);
+
         landmarks.emplace_back(px, py, 1.0f, joint_id);
     }
-
     return landmarks;
 }
+
 
 
 
@@ -194,13 +191,13 @@ void RunAMASSValidation(const SmplModel& model) {
     std::cout << "[GT] Using AMASS Frame " << frame_idx << " as Ground Truth.\n";
 
     Eigen::Matrix<double, Eigen::Dynamic, 3, Eigen::RowMajor> J_gt;
-    SMPLJointsForward<double>(beta_gt, theta_gt, trans_gt, model, J_gt);
+    SMPLJointsFromMeshForward<double>(beta_gt, theta_gt, trans_gt, model, J_gt, /*use_pose_blendshapes=*/true);
     std::cout << "[GT] J_gt = " << J_gt.rows() << "x" << J_gt.cols() << "\n";
 
     // Camera + synthetic observations
     CameraIntrinsics camera = CreateDefaultCamera(800, 800);
 
-    auto observed_landmarks = GenerateSyntheticLandmarks(model, camera, beta_gt, theta_gt, trans_gt);
+    auto observed_landmarks = GenerateSyntheticLandmarks(model, camera, beta_gt, theta_gt, trans_gt , true);
     if (observed_landmarks.empty()) {
         std::cerr << "[Error] No landmarks generated (likely behind camera / bad forward).\n";
         return;
@@ -236,16 +233,13 @@ void RunAMASSValidation(const SmplModel& model) {
     }
 
     // after
-    Eigen::Matrix<double, Eigen::Dynamic, 3, Eigen::RowMajor> V1;
-    SMPLForward<double>(beta_opt, theta_opt, trans_opt, model, V1);
-    SaveOBJ("mesh_after_opt.obj", V1, model.faces);
-
     Eigen::Matrix<double, Eigen::Dynamic, 3, Eigen::RowMajor> J_fit;
-    SMPLJointsForward<double>(beta_opt, theta_opt, trans_opt, model, J_fit);
+    SMPLJointsFromMeshForward<double>(beta_opt, theta_opt, trans_opt, model, J_fit,/*use_pose_blendshapes=*/true);
+
     std::cout << "[AMASS] mean joint L2 error = "
             << (J_fit - J_gt).rowwise().norm().mean() << " m\n";
 
-    auto final_landmarks = GenerateSyntheticLandmarks(model, camera, beta_opt, theta_opt, trans_opt);
+    auto final_landmarks = GenerateSyntheticLandmarks(model, camera, beta_opt, theta_opt, trans_opt,true);
     SaveLandmarksToFile("landmarks_optimized.txt", final_landmarks);
 
     Eigen::Matrix<double, Eigen::Dynamic, 3, Eigen::RowMajor> verts_opt;
@@ -291,7 +285,7 @@ void RunOpenPoseInference(const SmplModel& model) {
     double theta_opt[72] = {0.0}; // Default T-Pose
     double trans_opt[3] = {0.0, 0.0, 3.0}; // [Step 2] Hardcode Start Z = 3.0m
 
-    // [Step 3] 更好的姿态初始化 (Smart Initialization)
+    // [Step 3] Smart Initialization
     theta_opt[0] = 3.1415926; 
     theta_opt[16*3 + 2] = -0.8; 
     theta_opt[17*3 + 2] = 0.8;
@@ -318,7 +312,7 @@ void RunOpenPoseInference(const SmplModel& model) {
         SaveOBJ("mesh_after_opt.obj", verts_opt, model.faces);
         SaveOBJ("mesh_ground_truth.obj", verts_opt, model.faces); 
 
-        auto final_landmarks = GenerateSyntheticLandmarks(model, camera, beta_opt, theta_opt, trans_opt);
+        auto final_landmarks = GenerateSyntheticLandmarks(model, camera, beta_opt, theta_opt, trans_opt, true);
         SaveLandmarksToFile("landmarks_optimized.txt", final_landmarks);
     }
 }
@@ -347,10 +341,10 @@ int main() {
     model.LoadFromNPZ("../../Data/models/smpl_neutral.npz");
 
     // Mode 1: Validation (Check if algorithm works on AMASS)
-    RunAMASSValidation(model);
+    //RunAMASSValidation(model);
 
     // Mode 2: Real Data (Uncomment to run)
-    //RunOpenPoseInference(model);
+    RunOpenPoseInference(model);
 
     return 0;
 }

@@ -253,10 +253,11 @@ void RunSyntheticOptimizationWithJSON(const SmplModel& model) {
     }
 }
 
-bool LoadAMASSMotionFromNPY(
+bool GenerateLandmarksFromNPY(
     const std::string& folder,
-    const std::vector<std::vector<Landmark2D>>& sequence,
-    const CameraIntrinsics& camera
+    std::vector<std::vector<Landmark2D>>& sequence,
+    const CameraIntrinsics& camera,
+    SmplModel& model
 ) {
     std::cout << "[AMASS] Loading motion from NPY folder: " << folder << std::endl;
     
@@ -345,7 +346,7 @@ bool LoadAMASSMotionFromNPY(
     return true;
 }
 
-void SaveMeshSequenceAsOBJ(
+void OptimizeSequenceToOBJ(
     const std::vector<std::vector<Landmark2D>>& sequence,
     SmplModel& model,
     CameraIntrinsics& camera
@@ -377,28 +378,29 @@ void SaveMeshSequenceAsOBJ(
         std::cout << "Saved " << filename << std::endl;
     }
 }
-
+/*
 int main() {
     SmplModel model;
     model.LoadFromNPZ("../../Data/star_1_1/neutral/model.npz");
 
     CameraIntrinsics camera = CreateDefaultCamera(640, 480);
     std::vector<std::vector<Landmark2D>> sequence;
-    LoadAMASSMotionFromNPY("../../Data/amass/A1-Stand_npy", sequence, camera);
+    GenerateLandmarksFromNPY("../../Data/amass/A1-Stand_npy", sequence, camera, model);
   
     SaveMeshSequenceAsOBJ(sequence, model, camera);
     
 }
+*/
 
-/*
 int main() {
     google::InitGoogleLogging("SMPL_Optimizer");
     std::cout << ">>> Start SMPL Project..." << std::endl;
 
     // 1. Load Model
     SmplModel model;
-    std::string npz_path = "../../Data/star_1_1/neutral/model.npz"; 
-    
+    // std::string npz_path = "../../Data/star_1_1/neutral/model.npz"; 
+    std::string npz_path = "../../Data/smpl/basicModel_f_lbs_10_207_0_v1.0.0_converted.npz";
+
     if (!model.LoadFromNPZ(npz_path)) {
         return -1;
     }
@@ -417,9 +419,8 @@ int main() {
     SaveOBJ("output_tpose.obj", out_verts, model.faces);
 
     // 5. Run a synthetic fitting demo to verify the optimizer end-to-end
-    RunSyntheticOptimizationDemo(model);
-    // RunSyntheticOptimizationWithJSON(model);
+    // RunSyntheticOptimizationDemo(model);
+    RunSyntheticOptimizationWithJSON(model);
 
     return 0;
 }
-*/

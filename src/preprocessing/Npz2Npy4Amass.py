@@ -1,3 +1,4 @@
+# Convert the AMASS data from npz to npy format, to fit the GenerateLandmarksFromNPY function.
 import numpy as np
 import os
 

@@ -1,7 +1,9 @@
 #include "optimizer.h"
 #include <thread>
+#include <fstream>
 #include <ceres/ceres.h>
 #include <ceres/manifold.h>
+#include <nlohmann/json.hpp>
 
 // OpenPose BODY_25 to SMPL mapping (define ONCE here)
 const int OPENPOSE_TO_SMPL[25] = {
@@ -77,6 +79,43 @@ static void AddAllKeypointReprojBlock(
     problem.AddResidualBlock(cost, loss, beta, theta, trans);
 }
 
+// ------------------------------
+// Helper: Add depth ordering constraint
+// ------------------------------
+static void AddDepthOrderingBlock(
+    ceres::Problem& problem,
+    const std::vector<KeypointDepth>& depth_data,
+    const SmplModel& model,
+    double* beta,
+    double* theta,
+    double* trans,
+    const OptimizerConfig& cfg
+) {
+    if (!cfg.use_depth_ordering || depth_data.empty()) return;
+
+    auto* functor = new DepthOrderingResidual(
+        depth_data, model, cfg.depth_ordering_weight, cfg.higher_depth_is_closer
+    );
+
+    const int num_pairs = functor->NumPairs();
+    if (num_pairs <= 0) {
+        std::cerr << "[Warn] No valid depth pairs for ordering constraint.\n";
+        delete functor;
+        return;
+    }
+
+    std::cout << "[Depth] Adding " << num_pairs << " depth ordering constraints\n";
+
+    auto* cost = new ceres::DynamicAutoDiffCostFunction<DepthOrderingResidual>(functor);
+    cost->AddParameterBlock(10);   // beta
+    cost->AddParameterBlock(72);   // theta
+    cost->AddParameterBlock(3);    // trans
+    cost->SetNumResiduals(num_pairs);
+
+    problem.AddResidualBlock(cost, nullptr, beta, theta, trans);
+}
+
+// Original OptimizeSMPL (without depth) - calls depth version with empty vector
 bool OptimizeSMPL(
     const std::vector<Landmark2D>& observed_keypoints,
     const CameraIntrinsics& camera,
@@ -86,7 +125,25 @@ bool OptimizeSMPL(
     double* trans,
     const OptimizerConfig& config
 ) {
+    std::vector<KeypointDepth> empty_depth;
+    return OptimizeSMPL(observed_keypoints, empty_depth, camera, model, beta, theta, trans, config);
+}
+
+// OptimizeSMPL with depth constraints
+bool OptimizeSMPL(
+    const std::vector<Landmark2D>& observed_keypoints,
+    const std::vector<KeypointDepth>& depth_data,
+    const CameraIntrinsics& camera,
+    const SmplModel& model,
+    double* beta,
+    double* theta,
+    double* trans,
+    const OptimizerConfig& config
+) {
     std::cout << "[Optimizer] Starting 2D Optimization...\n";
+    if (!depth_data.empty() && config.use_depth_ordering) {
+        std::cout << "[Optimizer] Depth constraints enabled with " << depth_data.size() << " keypoints\n";
+    }
 
     // ----------------------------
     // Stage 1: ONLY trans + ONE root axis (avoid flip /倒立)
@@ -143,9 +200,12 @@ bool OptimizeSMPL(
             new ceres::HuberLoss(20.0)
         );
 
+        // NOTE: Depth constraints only in Stage 3 to avoid fighting with pose optimization
+        // AddDepthOrderingBlock(problem, depth_data, model, beta, theta, trans, config);
+
         problem.SetParameterBlockConstant(beta);
 
-        // stronger pose reg for 2D 
+        // stronger pose reg for 2D
         const double pose_reg_weight = 5.0;
         for (int i = 3; i < 72; ++i) {
             problem.AddResidualBlock(
@@ -204,6 +264,18 @@ bool OptimizeSMPL(
     // ----------------------------
     {
         std::cout << "\n>>> Stage 3: refine beta + pose + trans\n";
+
+        // Debug: print Z values before optimization
+        if (config.use_depth_ordering && !depth_data.empty()) {
+            Eigen::Matrix<double, Eigen::Dynamic, 3, Eigen::RowMajor> Jw_before;
+            SMPLJointsForward<double>(beta, theta, trans, model, Jw_before);
+            std::cout << "[Debug] Z values BEFORE Stage 3:\n";
+            std::cout << "  SMPL 4 (L_Knee)  Z = " << Jw_before(4, 2) << "\n";
+            std::cout << "  SMPL 5 (R_Knee)  Z = " << Jw_before(5, 2) << "\n";
+            std::cout << "  SMPL 7 (L_Ankle) Z = " << Jw_before(7, 2) << "\n";
+            std::cout << "  SMPL 8 (R_Ankle) Z = " << Jw_before(8, 2) << "\n";
+        }
+
         ceres::Problem problem;
 
         AddAllKeypointReprojBlock(
@@ -213,6 +285,9 @@ bool OptimizeSMPL(
             config,
             new ceres::HuberLoss(2.0)
         );
+
+        // Add depth ordering constraint (if enabled)
+        AddDepthOrderingBlock(problem, depth_data, model, beta, theta, trans, config);
 
         // shape reg
         const double shape_reg_weight = 80.0;
@@ -224,31 +299,52 @@ bool OptimizeSMPL(
             );
         }
 
-        const double root_upright_w = 10.0; 
+        const double root_upright_w = 10.0;
         problem.AddResidualBlock(
             new ceres::AutoDiffCostFunction<RootUprightResidual, 2, 72>(
                 new RootUprightResidual(root_upright_w)),
             nullptr, theta
         );
 
-        // keep pose reg
+        // Pose prior - keep it moderate to allow natural poses
+        const double pose_reg_weight = 5.0;  // Same as before, don't over-regularize
         for (int i = 3; i < 72; ++i) {
             problem.AddResidualBlock(
                 new ceres::AutoDiffCostFunction<PoseRegularizer, 1, 72>(
-                    new PoseRegularizer(i, 5.0)),
+                    new PoseRegularizer(i, pose_reg_weight)),
                 nullptr, theta
             );
         }
+
+        // Only add anatomical limits (not general pose prior) to prevent extreme poses
+        // This allows natural motion while preventing impossible joint angles
 
         problem.SetParameterLowerBound(trans, 2, 0.5);
         problem.SetParameterUpperBound(trans, 2, 20.0);
 
         ceres::Solver::Options options;
-        SetupSolverOptions(options, 40);
+        SetupSolverOptions(options, 50);  // More iterations for Stage 3
         ceres::Solver::Summary summary;
         ceres::Solve(options, &problem, &summary);
 
         std::cout << "[Final] " << summary.BriefReport() << "\n";
+
+        // Debug: print Z values after optimization
+        if (config.use_depth_ordering && !depth_data.empty()) {
+            Eigen::Matrix<double, Eigen::Dynamic, 3, Eigen::RowMajor> Jw_after;
+            SMPLJointsForward<double>(beta, theta, trans, model, Jw_after);
+            std::cout << "[Debug] Z values AFTER Stage 3:\n";
+            std::cout << "  SMPL 4 (L_Knee)  Z = " << Jw_after(4, 2) << "\n";
+            std::cout << "  SMPL 5 (R_Knee)  Z = " << Jw_after(5, 2) << "\n";
+            std::cout << "  SMPL 7 (L_Ankle) Z = " << Jw_after(7, 2) << "\n";
+            std::cout << "  SMPL 8 (R_Ankle) Z = " << Jw_after(8, 2) << "\n";
+
+            // Check if depth ordering is satisfied
+            bool l_knee_closer = Jw_after(4, 2) < Jw_after(5, 2);
+            bool l_ankle_closer = Jw_after(7, 2) < Jw_after(8, 2);
+            std::cout << "  L_Knee closer than R_Knee? " << (l_knee_closer ? "YES" : "NO") << "\n";
+            std::cout << "  L_Ankle closer than R_Ankle? " << (l_ankle_closer ? "YES" : "NO") << "\n";
+        }
     }
 
     return true;
@@ -330,3 +426,51 @@ CameraIntrinsics CreateDefaultCamera(int image_width, int image_height) {
     float cy = image_height * 0.5f;
     return CameraIntrinsics(focal, focal, cx, cy, image_width, image_height);
 }
+
+// ------------------------------
+// Load keypoint depths from JSON
+// Expected format:
+// {
+//   "keypoint_depths": [
+//     {"joint_id": 0, "depth": 0.85, "confidence": 0.95},
+//     ...
+//   ]
+// }
+// ------------------------------
+bool LoadKeypointDepthsFromJSON(const std::string& json_path,
+                                 std::vector<KeypointDepth>& depths) {
+    depths.clear();
+
+    std::ifstream infile(json_path);
+    if (!infile.is_open()) {
+        std::cerr << "[Error] Cannot open depth JSON: " << json_path << "\n";
+        return false;
+    }
+
+    nlohmann::json j;
+    try {
+        infile >> j;
+    } catch (const std::exception& e) {
+        std::cerr << "[Error] Failed to parse depth JSON: " << e.what() << "\n";
+        return false;
+    }
+
+    if (!j.contains("keypoint_depths")) {
+        std::cerr << "[Error] JSON missing 'keypoint_depths' field\n";
+        return false;
+    }
+
+    for (const auto& item : j["keypoint_depths"]) {
+        int joint_id = item.value("joint_id", -1);
+        float depth = item.value("depth", 0.0f);
+        float conf = item.value("confidence", 1.0f);
+
+        if (joint_id >= 0 && joint_id < 25) {
+            depths.emplace_back(joint_id, depth, conf);
+        }
+    }
+
+    std::cout << "[Depth] Loaded " << depths.size() << " keypoint depths from " << json_path << "\n";
+    return !depths.empty();
+}
+

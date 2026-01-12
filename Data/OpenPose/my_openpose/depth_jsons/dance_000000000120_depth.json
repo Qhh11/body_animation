@@ -1,0 +1,124 @@
+{
+  "keypoint_depths": [
+    {
+      "joint_id": 0,
+      "depth": 0.07889953255653381,
+      "confidence": 0.943847
+    },
+    {
+      "joint_id": 1,
+      "depth": 0.30553123354911804,
+      "confidence": 0.920004
+    },
+    {
+      "joint_id": 2,
+      "depth": 0.25891464948654175,
+      "confidence": 0.846807
+    },
+    {
+      "joint_id": 3,
+      "depth": 0.2634917199611664,
+      "confidence": 0.868143
+    },
+    {
+      "joint_id": 4,
+      "depth": 0.0809159129858017,
+      "confidence": 0.847195
+    },
+    {
+      "joint_id": 5,
+      "depth": 0.43745386600494385,
+      "confidence": 0.897998
+    },
+    {
+      "joint_id": 6,
+      "depth": 0.5948333144187927,
+      "confidence": 0.874374
+    },
+    {
+      "joint_id": 7,
+      "depth": 0.5599305629730225,
+      "confidence": 0.849644
+    },
+    {
+      "joint_id": 8,
+      "depth": 0.4126163721084595,
+      "confidence": 0.825145
+    },
+    {
+      "joint_id": 9,
+      "depth": 0.4173107445240021,
+      "confidence": 0.783702
+    },
+    {
+      "joint_id": 10,
+      "depth": 0.6082683801651001,
+      "confidence": 0.819021
+    },
+    {
+      "joint_id": 11,
+      "depth": 0.8047300577163696,
+      "confidence": 0.742811
+    },
+    {
+      "joint_id": 12,
+      "depth": 0.49151724576950073,
+      "confidence": 0.810988
+    },
+    {
+      "joint_id": 13,
+      "depth": 0.15659518539905548,
+      "confidence": 0.904188
+    },
+    {
+      "joint_id": 14,
+      "depth": 0.5536156296730042,
+      "confidence": 0.895163
+    },
+    {
+      "joint_id": 15,
+      "depth": 0.06110210716724396,
+      "confidence": 0.951562
+    },
+    {
+      "joint_id": 16,
+      "depth": 0.107535719871521,
+      "confidence": 0.930557
+    },
+    {
+      "joint_id": 17,
+      "depth": 0.16218411922454834,
+      "confidence": 0.893972
+    },
+    {
+      "joint_id": 19,
+      "depth": 0.6486639976501465,
+      "confidence": 0.842946
+    },
+    {
+      "joint_id": 20,
+      "depth": 0.762704074382782,
+      "confidence": 0.853381
+    },
+    {
+      "joint_id": 21,
+      "depth": 0.7449532747268677,
+      "confidence": 0.748508
+    },
+    {
+      "joint_id": 22,
+      "depth": 0.7607822418212891,
+      "confidence": 0.626589
+    },
+    {
+      "joint_id": 23,
+      "depth": 0.7736453413963318,
+      "confidence": 0.549911
+    },
+    {
+      "joint_id": 24,
+      "depth": 0.8388577699661255,
+      "confidence": 0.577958
+    }
+  ]
+}

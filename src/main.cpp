@@ -303,13 +303,20 @@ void RunAMASSValidation(const SmplModel& model) {
 void RunOpenPoseInference(const SmplModel& model) {
     std::cout << "\n=== MODE 2: Running Real OpenPose Data (Fine-Tuned) ===" << std::endl;
 
-    std::string json_path = "../../Data/OpenPose/my_openpose/output_jsons/dance_000000000120_keypoints.json";
+    std::string json_path = "../../Data/OpenPose/my_openpose/output_jsons/dance_000000000040_keypoints.json";
     std::vector<Landmark2D> lms;
     if (!LoadLandmarksFromJSON(json_path, lms)) {
         std::cerr << "Failed to load json.\n";
         return;
     }
     SaveLandmarksToFile("landmarks_input.txt", lms);
+
+    // -------- Load depth data --------
+    std::string depth_json_path = "../../Data/OpenPose/my_openpose/depth_jsons/dance_000000000040_depth.json";
+    std::vector<KeypointDepth> depth_data;
+    if (!LoadKeypointDepthsFromJSON(depth_json_path, depth_data)) {
+        std::cerr << "[Warn] Failed to load depth json, running without depth constraints.\n";
+    }
 
     // -------- Camera --------
     const int img_w = 1280;
@@ -336,11 +343,16 @@ void RunOpenPoseInference(const SmplModel& model) {
     OptimizerConfig cfg;
     cfg.verbose = true;
     cfg.min_confidence = 0.20f;
-    cfg.use_stable_joints_only = true;    
-    cfg.flip_y_in_projection = true;     
-    cfg.root_free_axis = 1;               
+    cfg.use_stable_joints_only = true;
+    cfg.flip_y_in_projection = true;
+    cfg.root_free_axis = 1;
 
-    const bool ok = OptimizeSMPL(lms, camera, model, beta, theta, trans, cfg);
+    // Enable depth ordering constraint
+    cfg.use_depth_ordering = false;  // DISABLED for comparison
+    cfg.depth_ordering_weight = 100.0;  // Increased from 10.0 for stronger effect
+    cfg.higher_depth_is_closer = false;  // Our NPY: smaller depth = closer to camera
+
+    const bool ok = OptimizeSMPL(lms, depth_data, camera, model, beta, theta, trans, cfg);
     if (!ok) {
         std::cerr << "OptimizeSMPL failed.\n";
         return;

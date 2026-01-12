@@ -1,5 +1,10 @@
 #pragma once
 
+// Increase Eigen stack allocation limit for Ceres autodiff with large Jet types
+#ifndef EIGEN_STACK_ALLOCATION_LIMIT
+#define EIGEN_STACK_ALLOCATION_LIMIT 1000000
+#endif
+
 #include <ceres/ceres.h>
 #include <Eigen/Dense>
 
@@ -7,6 +12,7 @@
 #include <array>
 #include <algorithm>
 #include <iostream>
+#include <map>
 
 #include "smpl_model.h"
 #include "smpl_math.h"
@@ -46,6 +52,11 @@ struct OptimizerConfig {
     bool use_stable_joints_only = true; // 只用躯干+四肢（更稳）
     bool flip_y_in_projection = true;   // v = fy * (-Y/Z) + cy
     int root_free_axis = 1;             // Stage1 只放开一个root轴：0/1/2试哪个最稳（默认1）
+
+    // ---------- Depth constraint ----------
+    bool use_depth_ordering = false;       // 是否使用深度排序约束
+    double depth_ordering_weight = 10.0;   // 深度约束权重
+    bool higher_depth_is_closer = false;  // 我们的NPY: 值越小越近
 
     // ---------- 3D unit test ----------
     bool amass_unit_test = false;
@@ -246,6 +257,156 @@ struct RootUprightResidual {
 };
 
 // ------------------------------
+// Depth data struct (from Sapiens depth map)
+// ------------------------------
+struct KeypointDepth {
+    int joint_id;        // OpenPose joint id (0-24)
+    float depth;         // relative depth value from Sapiens (higher = closer typically)
+    float confidence;    // confidence from OpenPose
+
+    KeypointDepth() : joint_id(-1), depth(0.f), confidence(0.f) {}
+    KeypointDepth(int id, float d, float c) : joint_id(id), depth(d), confidence(c) {}
+};
+
+// ------------------------------
+// Symmetric limb depth ordering residual
+// Only constrains left-right symmetric pairs (legs, arms)
+// Much more stable than full pairwise constraints
+// ------------------------------
+struct DepthOrderingResidual {
+    DepthOrderingResidual(
+        const std::vector<KeypointDepth>& depth_data,
+        const SmplModel& model,
+        double weight,
+        bool higher_depth_is_closer = false  // Our NPY: smaller depth = closer
+    )
+    : model_(model), weight_(weight), higher_is_closer_(higher_depth_is_closer)
+    {
+        // Build a map from OpenPose joint_id to depth/conf
+        std::map<int, std::pair<float, float>> depth_map;  // joint_id -> (depth, conf)
+        for (const auto& kd : depth_data) {
+            if (kd.joint_id >= 0 && kd.joint_id < 25 && kd.confidence > 0.3f) {
+                depth_map[kd.joint_id] = {kd.depth, kd.confidence};
+            }
+        }
+
+        // Define symmetric pairs: (left_openpose_id, right_openpose_id)
+        // OpenPose BODY_25:
+        //   9: RHip,  12: LHip
+        //   10: RKnee, 13: LKnee
+        //   11: RAnkle, 14: LAnkle
+        //   2: RShoulder, 5: LShoulder
+        //   3: RElbow, 6: LElbow
+        //   4: RWrist, 7: LWrist
+        const std::vector<std::pair<int, int>> symmetric_pairs = {
+            {9, 12},   // Hip
+            {10, 13},  // Knee
+            {11, 14},  // Ankle
+            {2, 5},    // Shoulder
+            {3, 6},    // Elbow
+            {4, 7},    // Wrist
+        };
+
+        for (const auto& [right_op, left_op] : symmetric_pairs) {
+            // Check both joints have valid depth
+            if (depth_map.find(right_op) == depth_map.end()) continue;
+            if (depth_map.find(left_op) == depth_map.end()) continue;
+
+            float depth_right = depth_map[right_op].first;
+            float depth_left = depth_map[left_op].first;
+            float conf = std::min(depth_map[right_op].second, depth_map[left_op].second);
+
+            // Skip if depths are too similar (no clear ordering)
+            float depth_diff = std::abs(depth_right - depth_left);
+            if (depth_diff < 0.05f) continue;  // Need at least 5% difference
+
+            int smpl_right = OPENPOSE_TO_SMPL[right_op];
+            int smpl_left = OPENPOSE_TO_SMPL[left_op];
+            if (smpl_right < 0 || smpl_left < 0) continue;
+
+            // Determine which should be closer based on depth values
+            int closer_smpl, farther_smpl;
+            if (higher_is_closer_) {
+                // higher depth = closer
+                if (depth_right > depth_left) {
+                    closer_smpl = smpl_right;
+                    farther_smpl = smpl_left;
+                } else {
+                    closer_smpl = smpl_left;
+                    farther_smpl = smpl_right;
+                }
+            } else {
+                // lower depth = closer (Sapiens convention)
+                if (depth_right < depth_left) {
+                    closer_smpl = smpl_right;
+                    farther_smpl = smpl_left;
+                } else {
+                    closer_smpl = smpl_left;
+                    farther_smpl = smpl_right;
+                }
+            }
+
+            pairs_.push_back({closer_smpl, farther_smpl, conf, depth_diff});
+
+            // Debug output
+            std::cout << "[Depth] Pair: OpenPose (" << right_op << " vs " << left_op << ") -> SMPL ("
+                      << closer_smpl << " closer, " << farther_smpl << " farther)"
+                      << ", depth_L=" << depth_left << ", depth_R=" << depth_right
+                      << ", diff=" << depth_diff << std::endl;
+        }
+    }
+
+    int NumPairs() const { return static_cast<int>(pairs_.size()); }
+
+    template <typename T>
+    bool operator()(T const* const* parameters, T* residuals) const {
+        const T* beta  = parameters[0];
+        const T* theta = parameters[1];
+        const T* trans = parameters[2];
+
+        Eigen::Matrix<T, Eigen::Dynamic, 3, Eigen::RowMajor> Jw;
+        SMPLJointsForward<T>(beta, theta, trans, model_, Jw);
+
+        // For each symmetric pair:
+        // penalize if closer joint has larger Z than farther joint
+        for (int p = 0; p < static_cast<int>(pairs_.size()); ++p) {
+            int smpl_closer = pairs_[p].closer_smpl;
+            int smpl_farther = pairs_[p].farther_smpl;
+
+            T z_closer = Jw(smpl_closer, 2);
+            T z_farther = Jw(smpl_farther, 2);
+
+            // Hinge loss: penalize only when ordering is violated
+            // If z_closer < z_farther, residual = 0 (good)
+            // If z_closer >= z_farther, residual > 0 (bad)
+            const T margin = T(0.05);  // 5cm margin - clearer signal
+            T violation = z_closer - z_farther + margin;
+
+            // Simple linear hinge loss (much more stable than softplus/exp)
+            // Use ceres::fmax for autodiff compatibility
+            T pair_weight = T(weight_) * T(pairs_[p].conf);
+            residuals[p] = pair_weight * ceres::fmax(T(0.0), violation);
+        }
+
+        return true;
+    }
+
+private:
+    struct DepthPair {
+        int closer_smpl;   // SMPL joint that should be closer (smaller Z)
+        int farther_smpl;  // SMPL joint that should be farther (larger Z)
+        float conf;        // confidence weight
+        float depth_diff;  // depth difference (larger = more confident)
+    };
+
+    std::vector<DepthPair> pairs_;
+
+    const SmplModel& model_;
+    double weight_;
+    bool higher_is_closer_;
+};
+
+// ------------------------------
 // 3D joints residual (used for AMASS unit test)
 // ------------------------------
 struct Joints3DResidual {
@@ -295,4 +456,18 @@ bool OptimizeSMPL(const std::vector<Landmark2D>& observed_keypoints,
                   double* trans,
                   const OptimizerConfig& config);
 
+// Overload with depth constraints
+bool OptimizeSMPL(const std::vector<Landmark2D>& observed_keypoints,
+                  const std::vector<KeypointDepth>& depth_data,
+                  const CameraIntrinsics& camera,
+                  const SmplModel& model,
+                  double* beta,
+                  double* theta,
+                  double* trans,
+                  const OptimizerConfig& config);
+
 CameraIntrinsics CreateDefaultCamera(int image_width, int image_height);
+
+// Load depth data from JSON file
+bool LoadKeypointDepthsFromJSON(const std::string& json_path,
+                                 std::vector<KeypointDepth>& depths);

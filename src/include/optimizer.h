@@ -62,6 +62,13 @@ struct OptimizerConfig {
     bool amass_unit_test = false;
     bool unit_test_exact = true;
     double w_3d = 1.0;
+
+    // ---------- Interpenetration (capsule collision) ----------
+    bool use_interpenetration = true;
+    double interpenetration_weight = 100.0;
+    double thigh_capsule_radius = 0.08;  // 大腿半径 (m)
+    double calf_capsule_radius = 0.06;   // 小腿半径 (m)
+    double foot_capsule_radius = 0.05;   // 脚部半径 (m)
 };
 
 // ------------------------------
@@ -368,7 +375,8 @@ struct DepthOrderingResidual {
         SMPLJointsForward<T>(beta, theta, trans, model_, Jw);
 
         // For each symmetric pair:
-        // penalize if closer joint has larger Z than farther joint
+        // Hinge loss: penalize if closer joint has smaller Z than farther joint
+        // (Model faces +Z, so closer to camera = larger Z)
         for (int p = 0; p < static_cast<int>(pairs_.size()); ++p) {
             int smpl_closer = pairs_[p].closer_smpl;
             int smpl_farther = pairs_[p].farther_smpl;
@@ -376,14 +384,13 @@ struct DepthOrderingResidual {
             T z_closer = Jw(smpl_closer, 2);
             T z_farther = Jw(smpl_farther, 2);
 
-            // Hinge loss: penalize only when ordering is violated
-            // If z_closer < z_farther, residual = 0 (good)
-            // If z_closer >= z_farther, residual > 0 (bad)
-            const T margin = T(0.05);  // 5cm margin - clearer signal
-            T violation = z_closer - z_farther + margin;
+            // Hinge loss with margin
+            // We want: z_closer > z_farther (closer to camera = larger Z)
+            // violation = z_farther - z_closer + margin
+            const T margin = T(0.10);  // 10cm margin
+            T violation = z_farther - z_closer + margin;
 
-            // Simple linear hinge loss (much more stable than softplus/exp)
-            // Use ceres::fmax for autodiff compatibility
+            // Only penalize when violated
             T pair_weight = T(weight_) * T(pairs_[p].conf);
             residuals[p] = pair_weight * ceres::fmax(T(0.0), violation);
         }
@@ -404,6 +411,115 @@ private:
     const SmplModel& model_;
     double weight_;
     bool higher_is_closer_;
+};
+
+// ------------------------------
+// Segment-to-segment distance (for capsule collision)
+// AutoDiff compatible template function
+// ------------------------------
+template <typename T>
+T DistSegmentToSegment(
+    const Eigen::Matrix<T, 1, 3>& P1, const Eigen::Matrix<T, 1, 3>& P2,
+    const Eigen::Matrix<T, 1, 3>& Q1, const Eigen::Matrix<T, 1, 3>& Q2)
+{
+    Eigen::Matrix<T, 1, 3> d1 = P2 - P1;  // 线段1方向向量
+    Eigen::Matrix<T, 1, 3> d2 = Q2 - Q1;  // 线段2方向向量
+    Eigen::Matrix<T, 1, 3> r = P1 - Q1;
+
+    T a = d1.dot(d1);  // 线段1长度平方
+    T e = d2.dot(d2);  // 线段2长度平方
+    T f = d2.dot(r);
+
+    const T eps = T(1e-8);
+    T s, t;
+
+    // 处理退化情况（点或平行）
+    if (a <= eps && e <= eps) {
+        // 两线段都退化为点
+        return (P1 - Q1).norm();
+    }
+    if (a <= eps) {
+        // 线段1退化为点
+        s = T(0.0);
+        t = ceres::fmax(T(0.0), ceres::fmin(f / e, T(1.0)));
+    } else {
+        T c = d1.dot(r);
+        if (e <= eps) {
+            // 线段2退化为点
+            t = T(0.0);
+            s = ceres::fmax(T(0.0), ceres::fmin(-c / a, T(1.0)));
+        } else {
+            T b = d1.dot(d2);
+            T denom = a * e - b * b;
+
+            if (denom > eps) {
+                s = ceres::fmax(T(0.0), ceres::fmin((b * f - c * e) / denom, T(1.0)));
+            } else {
+                s = T(0.0);  // 平行情况
+            }
+
+            t = (b * s + f) / e;
+
+            if (t < T(0.0)) {
+                t = T(0.0);
+                s = ceres::fmax(T(0.0), ceres::fmin(-c / a, T(1.0)));
+            } else if (t > T(1.0)) {
+                t = T(1.0);
+                s = ceres::fmax(T(0.0), ceres::fmin((b - c) / a, T(1.0)));
+            }
+        }
+    }
+
+    Eigen::Matrix<T, 1, 3> closestP = P1 + s * d1;
+    Eigen::Matrix<T, 1, 3> closestQ = Q1 + t * d2;
+
+    // 添加 eps 防止 sqrt(0) 的梯度问题
+    return ceres::sqrt((closestP - closestQ).squaredNorm() + eps);
+}
+
+// ------------------------------
+// Interpenetration Residual (capsule collision penalty)
+// Penalizes when two limb capsules overlap
+// ------------------------------
+struct InterpenetrationResidual {
+    // 构造函数：传入肢体两端关节索引和半径
+    InterpenetrationResidual(const SmplModel& model,
+                             int j1_start, int j1_end,
+                             int j2_start, int j2_end,
+                             double r1, double r2, double weight)
+        : model_(model), s1_(j1_start), e1_(j1_end),
+          s2_(j2_start), e2_(j2_end),
+          radius_sum_(r1 + r2), weight_(weight) {}
+
+    template <typename T>
+    bool operator()(T const* const* parameters, T* residual) const {
+        const T* beta  = parameters[0];
+        const T* theta = parameters[1];
+        const T* trans = parameters[2];
+
+        Eigen::Matrix<T, Eigen::Dynamic, 3, Eigen::RowMajor> Jw;
+        SMPLJointsForward<T>(beta, theta, trans, model_, Jw);
+
+        // 计算两线段（肢体骨骼）之间的最短距离
+        T dist = DistSegmentToSegment<T>(
+            Jw.row(s1_), Jw.row(e1_),
+            Jw.row(s2_), Jw.row(e2_));
+
+        // Hinge Loss: 仅在距离小于半径之和时产生惩罚
+        // penetration = radius_sum - dist
+        // residual = weight * max(0, penetration)
+        T penetration = T(radius_sum_) - dist;
+        residual[0] = T(weight_) * ceres::fmax(T(0.0), penetration);
+
+        return true;
+    }
+
+private:
+    const SmplModel& model_;
+    int s1_, e1_;  // 肢体1的起始/结束关节索引
+    int s2_, e2_;  // 肢体2的起始/结束关节索引
+    double radius_sum_;  // 两胶囊半径之和
+    double weight_;
 };
 
 // ------------------------------

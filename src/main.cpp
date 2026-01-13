@@ -303,7 +303,7 @@ void RunAMASSValidation(const SmplModel& model) {
 void RunOpenPoseInference(const SmplModel& model) {
     std::cout << "\n=== MODE 2: Running Real OpenPose Data (Fine-Tuned) ===" << std::endl;
 
-    std::string json_path = "../../Data/OpenPose/my_openpose/output_jsons/dance_000000000040_keypoints.json";
+    std::string json_path = "../../Data/OpenPose/my_openpose/output_jsons/dance_000000000120_keypoints.json";
     std::vector<Landmark2D> lms;
     if (!LoadLandmarksFromJSON(json_path, lms)) {
         std::cerr << "Failed to load json.\n";
@@ -312,7 +312,7 @@ void RunOpenPoseInference(const SmplModel& model) {
     SaveLandmarksToFile("landmarks_input.txt", lms);
 
     // -------- Load depth data --------
-    std::string depth_json_path = "../../Data/OpenPose/my_openpose/depth_jsons/dance_000000000040_depth.json";
+    std::string depth_json_path = "../../Data/OpenPose/my_openpose/depth_jsons/dance_000000000120_depth.json";
     std::vector<KeypointDepth> depth_data;
     if (!LoadKeypointDepthsFromJSON(depth_json_path, depth_data)) {
         std::cerr << "[Warn] Failed to load depth json, running without depth constraints.\n";
@@ -347,10 +347,17 @@ void RunOpenPoseInference(const SmplModel& model) {
     cfg.flip_y_in_projection = true;
     cfg.root_free_axis = 1;
 
-    // Enable depth ordering constraint
-    cfg.use_depth_ordering = false;  // DISABLED for comparison
-    cfg.depth_ordering_weight = 100.0;  // Increased from 10.0 for stronger effect
+    // Depth ordering constraint (Hinge Loss)
+    cfg.use_depth_ordering = true;
+    cfg.depth_ordering_weight = 100.0;  // 与碰撞约束相同权重
     cfg.higher_depth_is_closer = false;  // Our NPY: smaller depth = closer to camera
+
+    // Interpenetration (capsule collision) constraint
+    cfg.use_interpenetration = true;
+    cfg.interpenetration_weight = 100.0;
+    cfg.thigh_capsule_radius = 0.08;  // 大腿半径 8cm
+    cfg.calf_capsule_radius = 0.06;   // 小腿半径 6cm
+    cfg.foot_capsule_radius = 0.05;   // 脚部半径 5cm
 
     const bool ok = OptimizeSMPL(lms, depth_data, camera, model, beta, theta, trans, cfg);
     if (!ok) {

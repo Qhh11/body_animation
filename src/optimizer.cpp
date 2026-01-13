@@ -6,6 +6,7 @@
 #include <nlohmann/json.hpp>
 
 // OpenPose BODY_25 to SMPL mapping (define ONCE here)
+// SMPL joints: 0=Pelvis, 1=LHip, 2=RHip, 4=LKnee, 5=RKnee, 7=LAnkle, 8=RAnkle, 10=LFoot, 11=RFoot
 const int OPENPOSE_TO_SMPL[25] = {
     15,  // 0: Nose -> Head (rough)
     12,  // 1: Neck -> Neck
@@ -26,12 +27,12 @@ const int OPENPOSE_TO_SMPL[25] = {
     -1,  // 16: LEye
     -1,  // 17: REar
     -1,  // 18: LEar
-    -1,  // 19: LBigToe
-    -1,  // 20: LSmallToe
-    -1,  // 21: LHeel
-    -1,  // 22: RBigToe
-    -1,  // 23: RSmallToe
-    -1   // 24: RHeel
+    10,  // 19: LBigToe -> L_Foot
+    -1,  // 20: LSmallToe (skip - use BigToe only)
+    -1,  // 21: LHeel (skip - use BigToe only)
+    11,  // 22: RBigToe -> R_Foot
+    -1,  // 23: RSmallToe (skip - use BigToe only)
+    -1   // 24: RHeel (skip - use BigToe only)
 };
 
 static void SetupSolverOptions(ceres::Solver::Options& options, int max_iter) {
@@ -113,6 +114,67 @@ static void AddDepthOrderingBlock(
     cost->SetNumResiduals(num_pairs);
 
     problem.AddResidualBlock(cost, nullptr, beta, theta, trans);
+}
+
+// ------------------------------
+// Helper: Add interpenetration (capsule collision) constraint
+// SMPL joint indices:
+//   LHip=1, RHip=2, LKnee=4, RKnee=5, LAnkle=7, RAnkle=8
+// ------------------------------
+static void AddInterpenetrationBlock(
+    ceres::Problem& problem,
+    const SmplModel& model,
+    double* beta,
+    double* theta,
+    double* trans,
+    const OptimizerConfig& cfg
+) {
+    if (!cfg.use_interpenetration) return;
+
+    const double w = cfg.interpenetration_weight;
+    const double r_thigh = cfg.thigh_capsule_radius;
+    const double r_calf = cfg.calf_capsule_radius;
+    const double r_foot = cfg.foot_capsule_radius;
+
+    // 定义需要检查碰撞的肢体对（只检查可能穿插的非相邻肢体）
+    // SMPL joints: 1=LHip, 2=RHip, 4=LKnee, 5=RKnee, 7=LAnkle, 8=RAnkle, 10=LFoot, 11=RFoot
+    // 格式: {肢体1起点, 肢体1终点, 肢体2起点, 肢体2终点, 半径1, 半径2}
+    struct CollisionPair {
+        int s1, e1, s2, e2;
+        double r1, r2;
+        const char* name;
+    };
+
+    std::vector<CollisionPair> pairs = {
+        // 大腿
+        {1, 4, 2, 5, r_thigh, r_thigh, "L_Thigh vs R_Thigh"},   // 左大腿 vs 右大腿
+        {1, 4, 5, 8, r_thigh, r_calf,  "L_Thigh vs R_Calf"},    // 左大腿 vs 右小腿
+        {2, 5, 4, 7, r_thigh, r_calf,  "R_Thigh vs L_Calf"},    // 右大腿 vs 左小腿
+        // 小腿
+        {4, 7, 5, 8, r_calf,  r_calf,  "L_Calf vs R_Calf"},     // 左小腿 vs 右小腿
+        {4, 7, 8, 11, r_calf, r_foot,  "L_Calf vs R_Foot"},     // 左小腿 vs 右脚
+        {5, 8, 7, 10, r_calf, r_foot,  "R_Calf vs L_Foot"},     // 右小腿 vs 左脚
+        // 脚
+        {7, 10, 8, 11, r_foot, r_foot, "L_Foot vs R_Foot"},     // 左脚 vs 右脚
+    };
+
+    std::cout << "[Collision] Adding " << pairs.size() << " interpenetration constraints:\n";
+
+    for (const auto& p : pairs) {
+        std::cout << "  - " << p.name << " (r_sum=" << (p.r1 + p.r2) << "m)\n";
+
+        auto* functor = new InterpenetrationResidual(
+            model, p.s1, p.e1, p.s2, p.e2, p.r1, p.r2, w
+        );
+
+        auto* cost = new ceres::DynamicAutoDiffCostFunction<InterpenetrationResidual>(functor);
+        cost->AddParameterBlock(10);   // beta
+        cost->AddParameterBlock(72);   // theta
+        cost->AddParameterBlock(3);    // trans
+        cost->SetNumResiduals(1);
+
+        problem.AddResidualBlock(cost, nullptr, beta, theta, trans);
+    }
 }
 
 // Original OptimizeSMPL (without depth) - calls depth version with empty vector
@@ -289,6 +351,9 @@ bool OptimizeSMPL(
         // Add depth ordering constraint (if enabled)
         AddDepthOrderingBlock(problem, depth_data, model, beta, theta, trans, config);
 
+        // Add interpenetration (capsule collision) constraint (if enabled)
+        AddInterpenetrationBlock(problem, model, beta, theta, trans, config);
+
         // shape reg
         const double shape_reg_weight = 80.0;
         for (int i = 0; i < 10; ++i) {
@@ -316,8 +381,31 @@ bool OptimizeSMPL(
             );
         }
 
-        // Only add anatomical limits (not general pose prior) to prevent extreme poses
-        // This allows natural motion while preventing impossible joint angles
+        // Anatomical limits (same as Stage 2) to prevent extreme poses
+        const double hinge_lock_weight = 100.0;
+        const double limit_weight = 50.0;
+
+        // Knees: flex [0, 2.6], hinge lock [-0.1, 0.1]
+        int knees[] = {4, 5};
+        for (int k : knees) {
+            problem.AddResidualBlock(new ceres::AutoDiffCostFunction<AnatomicalLimitResidual,1,72>(
+                new AnatomicalLimitResidual(k,0,0.0,2.6,limit_weight)), nullptr, theta);
+            problem.AddResidualBlock(new ceres::AutoDiffCostFunction<AnatomicalLimitResidual,1,72>(
+                new AnatomicalLimitResidual(k,1,-0.1,0.1,hinge_lock_weight)), nullptr, theta);
+            problem.AddResidualBlock(new ceres::AutoDiffCostFunction<AnatomicalLimitResidual,1,72>(
+                new AnatomicalLimitResidual(k,2,-0.1,0.1,hinge_lock_weight)), nullptr, theta);
+        }
+
+        // Elbows: flex [-2.6, 0.1], hinge lock [-0.1, 0.1]
+        int elbows[] = {18, 19};
+        for (int e : elbows) {
+            problem.AddResidualBlock(new ceres::AutoDiffCostFunction<AnatomicalLimitResidual,1,72>(
+                new AnatomicalLimitResidual(e,0,-2.6,0.1,limit_weight)), nullptr, theta);
+            problem.AddResidualBlock(new ceres::AutoDiffCostFunction<AnatomicalLimitResidual,1,72>(
+                new AnatomicalLimitResidual(e,1,-0.1,0.1,hinge_lock_weight)), nullptr, theta);
+            problem.AddResidualBlock(new ceres::AutoDiffCostFunction<AnatomicalLimitResidual,1,72>(
+                new AnatomicalLimitResidual(e,2,-0.1,0.1,hinge_lock_weight)), nullptr, theta);
+        }
 
         problem.SetParameterLowerBound(trans, 2, 0.5);
         problem.SetParameterUpperBound(trans, 2, 20.0);

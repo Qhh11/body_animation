@@ -54,9 +54,9 @@ struct OptimizerConfig {
     int root_free_axis = 1;             // Stage1 只放开一个root轴：0/1/2试哪个最稳（默认1）
 
     // ---------- Depth constraint ----------
-    bool use_depth_ordering = false;       // 是否使用深度排序约束
-    double depth_ordering_weight = 10.0;   // 深度约束权重
-    bool higher_depth_is_closer = false;  // 我们的NPY: 值越小越近
+    bool use_depth_ordering = true;
+    double depth_ordering_weight = 100.0;
+    bool higher_depth_is_closer = false;  // Sapiens NPY: smaller depth = closer
 
     // ---------- 3D unit test ----------
     bool amass_unit_test = false;
@@ -263,12 +263,54 @@ struct RootUprightResidual {
     double w;
 };
 
+struct HingeAxisResidual {
+    HingeAxisResidual(int joint_idx,
+                      Eigen::Vector3d axis_unit,
+                      double w_perp,
+                      double w_range,
+                      double min_a,
+                      double max_a)
+        : j_(joint_idx),
+          u_(axis_unit.normalized()),
+          w_perp_(w_perp),
+          w_range_(w_range),
+          min_a_(min_a),
+          max_a_(max_a) {}
+
+    template <typename T>
+    bool operator()(const T* const theta, T* residual) const {
+        const int base = 3 * j_;
+        Eigen::Matrix<T,3,1> r(theta[base+0], theta[base+1], theta[base+2]);
+        Eigen::Matrix<T,3,1> u(T(u_.x()), T(u_.y()), T(u_.z()));
+
+        // parallel component (hinge DOF)
+        const T a = u.dot(r);
+        // perpendicular component (forbidden twist/swing)
+        Eigen::Matrix<T,3,1> perp = r - u * a;
+
+        // smooth norm to avoid nondiff at 0
+        const T perp_norm = ceres::sqrt(perp.squaredNorm() + T(1e-12));
+        residual[0] = T(w_perp_) * perp_norm;
+
+        // range clamp on a
+        T range_pen = T(0);
+        if (a < T(min_a_)) range_pen = T(min_a_) - a;
+        else if (a > T(max_a_)) range_pen = a - T(max_a_);
+        residual[1] = T(w_range_) * range_pen;
+        return true;
+    }
+
+    int j_;
+    Eigen::Vector3d u_;
+    double w_perp_, w_range_, min_a_, max_a_;
+};
+
 // ------------------------------
 // Depth data struct (from Sapiens depth map)
 // ------------------------------
 struct KeypointDepth {
     int joint_id;        // OpenPose joint id (0-24)
-    float depth;         // relative depth value from Sapiens (higher = closer typically)
+    float depth;         // relative depth value from Sapiens
     float confidence;    // confidence from OpenPose
 
     KeypointDepth() : joint_id(-1), depth(0.f), confidence(0.f) {}
@@ -277,8 +319,7 @@ struct KeypointDepth {
 
 // ------------------------------
 // Symmetric limb depth ordering residual
-// Only constrains left-right symmetric pairs (legs, arms)
-// Much more stable than full pairwise constraints
+// Constrains left-right symmetric pairs based on depth
 // ------------------------------
 struct DepthOrderingResidual {
     DepthOrderingResidual(
@@ -297,14 +338,7 @@ struct DepthOrderingResidual {
             }
         }
 
-        // Define symmetric pairs: (left_openpose_id, right_openpose_id)
-        // OpenPose BODY_25:
-        //   9: RHip,  12: LHip
-        //   10: RKnee, 13: LKnee
-        //   11: RAnkle, 14: LAnkle
-        //   2: RShoulder, 5: LShoulder
-        //   3: RElbow, 6: LElbow
-        //   4: RWrist, 7: LWrist
+        // Define symmetric pairs: (right_openpose_id, left_openpose_id)
         const std::vector<std::pair<int, int>> symmetric_pairs = {
             {9, 12},   // Hip
             {10, 13},  // Knee
@@ -315,7 +349,6 @@ struct DepthOrderingResidual {
         };
 
         for (const auto& [right_op, left_op] : symmetric_pairs) {
-            // Check both joints have valid depth
             if (depth_map.find(right_op) == depth_map.end()) continue;
             if (depth_map.find(left_op) == depth_map.end()) continue;
 
@@ -323,18 +356,15 @@ struct DepthOrderingResidual {
             float depth_left = depth_map[left_op].first;
             float conf = std::min(depth_map[right_op].second, depth_map[left_op].second);
 
-            // Skip if depths are too similar (no clear ordering)
             float depth_diff = std::abs(depth_right - depth_left);
-            if (depth_diff < 0.05f) continue;  // Need at least 5% difference
+            if (depth_diff < 0.05f) continue;
 
             int smpl_right = OPENPOSE_TO_SMPL[right_op];
             int smpl_left = OPENPOSE_TO_SMPL[left_op];
             if (smpl_right < 0 || smpl_left < 0) continue;
 
-            // Determine which should be closer based on depth values
             int closer_smpl, farther_smpl;
             if (higher_is_closer_) {
-                // higher depth = closer
                 if (depth_right > depth_left) {
                     closer_smpl = smpl_right;
                     farther_smpl = smpl_left;
@@ -343,7 +373,6 @@ struct DepthOrderingResidual {
                     farther_smpl = smpl_right;
                 }
             } else {
-                // lower depth = closer (Sapiens convention)
                 if (depth_right < depth_left) {
                     closer_smpl = smpl_right;
                     farther_smpl = smpl_left;
@@ -355,7 +384,6 @@ struct DepthOrderingResidual {
 
             pairs_.push_back({closer_smpl, farther_smpl, conf, depth_diff});
 
-            // Debug output
             std::cout << "[Depth] Pair: OpenPose (" << right_op << " vs " << left_op << ") -> SMPL ("
                       << closer_smpl << " closer, " << farther_smpl << " farther)"
                       << ", depth_L=" << depth_left << ", depth_R=" << depth_right
@@ -374,9 +402,6 @@ struct DepthOrderingResidual {
         Eigen::Matrix<T, Eigen::Dynamic, 3, Eigen::RowMajor> Jw;
         SMPLJointsForward<T>(beta, theta, trans, model_, Jw);
 
-        // For each symmetric pair:
-        // Hinge loss: penalize if closer joint has smaller Z than farther joint
-        // (Model faces +Z, so closer to camera = larger Z)
         for (int p = 0; p < static_cast<int>(pairs_.size()); ++p) {
             int smpl_closer = pairs_[p].closer_smpl;
             int smpl_farther = pairs_[p].farther_smpl;
@@ -384,13 +409,10 @@ struct DepthOrderingResidual {
             T z_closer = Jw(smpl_closer, 2);
             T z_farther = Jw(smpl_farther, 2);
 
-            // Hinge loss with margin
             // We want: z_closer > z_farther (closer to camera = larger Z)
-            // violation = z_farther - z_closer + margin
             const T margin = T(0.10);  // 10cm margin
             T violation = z_farther - z_closer + margin;
 
-            // Only penalize when violated
             T pair_weight = T(weight_) * T(pairs_[p].conf);
             residuals[p] = pair_weight * ceres::fmax(T(0.0), violation);
         }
@@ -400,14 +422,13 @@ struct DepthOrderingResidual {
 
 private:
     struct DepthPair {
-        int closer_smpl;   // SMPL joint that should be closer (smaller Z)
-        int farther_smpl;  // SMPL joint that should be farther (larger Z)
-        float conf;        // confidence weight
-        float depth_diff;  // depth difference (larger = more confident)
+        int closer_smpl;
+        int farther_smpl;
+        float conf;
+        float depth_diff;
     };
 
     std::vector<DepthPair> pairs_;
-
     const SmplModel& model_;
     double weight_;
     bool higher_is_closer_;

@@ -1,9 +1,7 @@
 #include "optimizer.h"
 #include <thread>
-#include <fstream>
 #include <ceres/ceres.h>
 #include <ceres/manifold.h>
-#include <nlohmann/json.hpp>
 
 // OpenPose BODY_25 to SMPL mapping (define ONCE here)
 // SMPL joints: 0=Pelvis, 1=LHip, 2=RHip, 4=LKnee, 5=RKnee, 7=LAnkle, 8=RAnkle, 10=LFoot, 11=RFoot
@@ -118,8 +116,6 @@ static void AddDepthOrderingBlock(
 
 // ------------------------------
 // Helper: Add interpenetration (capsule collision) constraint
-// SMPL joint indices:
-//   LHip=1, RHip=2, LKnee=4, RKnee=5, LAnkle=7, RAnkle=8
 // ------------------------------
 static void AddInterpenetrationBlock(
     ceres::Problem& problem,
@@ -136,9 +132,6 @@ static void AddInterpenetrationBlock(
     const double r_calf = cfg.calf_capsule_radius;
     const double r_foot = cfg.foot_capsule_radius;
 
-    // 定义需要检查碰撞的肢体对（只检查可能穿插的非相邻肢体）
-    // SMPL joints: 1=LHip, 2=RHip, 4=LKnee, 5=RKnee, 7=LAnkle, 8=RAnkle, 10=LFoot, 11=RFoot
-    // 格式: {肢体1起点, 肢体1终点, 肢体2起点, 肢体2终点, 半径1, 半径2}
     struct CollisionPair {
         int s1, e1, s2, e2;
         double r1, r2;
@@ -146,16 +139,13 @@ static void AddInterpenetrationBlock(
     };
 
     std::vector<CollisionPair> pairs = {
-        // 大腿
-        {1, 4, 2, 5, r_thigh, r_thigh, "L_Thigh vs R_Thigh"},   // 左大腿 vs 右大腿
-        {1, 4, 5, 8, r_thigh, r_calf,  "L_Thigh vs R_Calf"},    // 左大腿 vs 右小腿
-        {2, 5, 4, 7, r_thigh, r_calf,  "R_Thigh vs L_Calf"},    // 右大腿 vs 左小腿
-        // 小腿
-        {4, 7, 5, 8, r_calf,  r_calf,  "L_Calf vs R_Calf"},     // 左小腿 vs 右小腿
-        {4, 7, 8, 11, r_calf, r_foot,  "L_Calf vs R_Foot"},     // 左小腿 vs 右脚
-        {5, 8, 7, 10, r_calf, r_foot,  "R_Calf vs L_Foot"},     // 右小腿 vs 左脚
-        // 脚
-        {7, 10, 8, 11, r_foot, r_foot, "L_Foot vs R_Foot"},     // 左脚 vs 右脚
+        {1, 4, 2, 5, r_thigh, r_thigh, "L_Thigh vs R_Thigh"},
+        {1, 4, 5, 8, r_thigh, r_calf,  "L_Thigh vs R_Calf"},
+        {2, 5, 4, 7, r_thigh, r_calf,  "R_Thigh vs L_Calf"},
+        {4, 7, 5, 8, r_calf,  r_calf,  "L_Calf vs R_Calf"},
+        {4, 7, 8, 11, r_calf, r_foot,  "L_Calf vs R_Foot"},
+        {5, 8, 7, 10, r_calf, r_foot,  "R_Calf vs L_Foot"},
+        {7, 10, 8, 11, r_foot, r_foot, "L_Foot vs R_Foot"},
     };
 
     std::cout << "[Collision] Adding " << pairs.size() << " interpenetration constraints:\n";
@@ -168,16 +158,16 @@ static void AddInterpenetrationBlock(
         );
 
         auto* cost = new ceres::DynamicAutoDiffCostFunction<InterpenetrationResidual>(functor);
-        cost->AddParameterBlock(10);   // beta
-        cost->AddParameterBlock(72);   // theta
-        cost->AddParameterBlock(3);    // trans
+        cost->AddParameterBlock(10);
+        cost->AddParameterBlock(72);
+        cost->AddParameterBlock(3);
         cost->SetNumResiduals(1);
 
         problem.AddResidualBlock(cost, nullptr, beta, theta, trans);
     }
 }
 
-// Original OptimizeSMPL (without depth) - calls depth version with empty vector
+// OptimizeSMPL without depth (calls version with empty depth_data)
 bool OptimizeSMPL(
     const std::vector<Landmark2D>& observed_keypoints,
     const CameraIntrinsics& camera,
@@ -191,7 +181,7 @@ bool OptimizeSMPL(
     return OptimizeSMPL(observed_keypoints, empty_depth, camera, model, beta, theta, trans, config);
 }
 
-// OptimizeSMPL with depth constraints
+// OptimizeSMPL with depth data
 bool OptimizeSMPL(
     const std::vector<Landmark2D>& observed_keypoints,
     const std::vector<KeypointDepth>& depth_data,
@@ -203,9 +193,6 @@ bool OptimizeSMPL(
     const OptimizerConfig& config
 ) {
     std::cout << "[Optimizer] Starting 2D Optimization...\n";
-    if (!depth_data.empty() && config.use_depth_ordering) {
-        std::cout << "[Optimizer] Depth constraints enabled with " << depth_data.size() << " keypoints\n";
-    }
 
     // ----------------------------
     // Stage 1: ONLY trans + ONE root axis (avoid flip /倒立)
@@ -259,16 +246,13 @@ bool OptimizeSMPL(
             beta, theta, trans,
             /*use_pose_blendshapes=*/true,
             config,
-            new ceres::HuberLoss(20.0)
+            new ceres::HuberLoss(5.0)
         );
-
-        // NOTE: Depth constraints only in Stage 3 to avoid fighting with pose optimization
-        // AddDepthOrderingBlock(problem, depth_data, model, beta, theta, trans, config);
 
         problem.SetParameterBlockConstant(beta);
 
-        // stronger pose reg for 2D
-        const double pose_reg_weight = 5.0;
+        // stronger pose reg for 2D 
+        const double pose_reg_weight = 2.0;
         for (int i = 3; i < 72; ++i) {
             problem.AddResidualBlock(
                 new ceres::AutoDiffCostFunction<PoseRegularizer, 1, 72>(
@@ -278,7 +262,7 @@ bool OptimizeSMPL(
         }
 
         // hinge constraints (keep)
-        const double hinge_lock_weight = 100.0;
+        const double hinge_lock_weight = 100.0; 
         const double limit_weight = 50.0;
 
         const double root_upright_w = 10.0; 
@@ -288,28 +272,31 @@ bool OptimizeSMPL(
             nullptr, theta
         );
 
+        auto add_hinge = [&](int j, Eigen::Vector3d axis, double w_perp, double w_range, double min_a, double max_a) {
+            problem.AddResidualBlock(
+                new ceres::AutoDiffCostFunction<HingeAxisResidual, 2, 72>(
+                    new HingeAxisResidual(j, axis, w_perp, w_range, min_a, max_a)),
+                nullptr, theta
+            );
+        };
 
-        // knees indices (your SMPL indexing assumed)
-        int knees[] = {4, 5};
-        for (int k : knees) {
-            problem.AddResidualBlock(new ceres::AutoDiffCostFunction<AnatomicalLimitResidual,1,72>(
-                new AnatomicalLimitResidual(k,0,0.0,2.6,limit_weight)), nullptr, theta);
-            problem.AddResidualBlock(new ceres::AutoDiffCostFunction<AnatomicalLimitResidual,1,72>(
-                new AnatomicalLimitResidual(k,1,-0.1,0.1,hinge_lock_weight)), nullptr, theta);
-            problem.AddResidualBlock(new ceres::AutoDiffCostFunction<AnatomicalLimitResidual,1,72>(
-                new AnatomicalLimitResidual(k,2,-0.1,0.1,hinge_lock_weight)), nullptr, theta);
+        // 先假设 hinge 轴是 X（你得试 1~2 次确认哪个轴对应 flexion）
+        Eigen::Vector3d HINGE_X(1,0,0);
+        // knees (joint ids 4,5) 
+        for (int k : {4, 5}) {
+            add_hinge(k, HINGE_X,
+                    /*w_perp=*/120.0, /*w_range=*/60.0,
+                    /*min_a=*/0.0, /*max_a=*/2.6);
         }
 
-        // elbows
-        int elbows[] = {18, 19};
-        for (int e : elbows) {
-            problem.AddResidualBlock(new ceres::AutoDiffCostFunction<AnatomicalLimitResidual,1,72>(
-                new AnatomicalLimitResidual(e,0,-2.6,0.1,limit_weight)), nullptr, theta);
-            problem.AddResidualBlock(new ceres::AutoDiffCostFunction<AnatomicalLimitResidual,1,72>(
-                new AnatomicalLimitResidual(e,1,-0.1,0.1,hinge_lock_weight)), nullptr, theta);
-            problem.AddResidualBlock(new ceres::AutoDiffCostFunction<AnatomicalLimitResidual,1,72>(
-                new AnatomicalLimitResidual(e,2,-0.1,0.1,hinge_lock_weight)), nullptr, theta);
+        // elbows (joint ids 18,19) 
+        for (int e : {18, 19}) {
+            add_hinge(e, HINGE_X,
+                    /*w_perp=*/300.0, /*w_range=*/80.0,
+                    /*min_a=*/-2.6, /*max_a=*/0.1);
         }
+
+        
 
         problem.SetParameterLowerBound(trans, 2, 0.5);
         problem.SetParameterUpperBound(trans, 2, 20.0);
@@ -326,18 +313,6 @@ bool OptimizeSMPL(
     // ----------------------------
     {
         std::cout << "\n>>> Stage 3: refine beta + pose + trans\n";
-
-        // Debug: print Z values before optimization
-        if (config.use_depth_ordering && !depth_data.empty()) {
-            Eigen::Matrix<double, Eigen::Dynamic, 3, Eigen::RowMajor> Jw_before;
-            SMPLJointsForward<double>(beta, theta, trans, model, Jw_before);
-            std::cout << "[Debug] Z values BEFORE Stage 3:\n";
-            std::cout << "  SMPL 4 (L_Knee)  Z = " << Jw_before(4, 2) << "\n";
-            std::cout << "  SMPL 5 (R_Knee)  Z = " << Jw_before(5, 2) << "\n";
-            std::cout << "  SMPL 7 (L_Ankle) Z = " << Jw_before(7, 2) << "\n";
-            std::cout << "  SMPL 8 (R_Ankle) Z = " << Jw_before(8, 2) << "\n";
-        }
-
         ceres::Problem problem;
 
         AddAllKeypointReprojBlock(
@@ -364,75 +339,67 @@ bool OptimizeSMPL(
             );
         }
 
-        const double root_upright_w = 10.0;
+        const double root_upright_w = 10.0; 
         problem.AddResidualBlock(
             new ceres::AutoDiffCostFunction<RootUprightResidual, 2, 72>(
                 new RootUprightResidual(root_upright_w)),
             nullptr, theta
         );
 
-        // Pose prior - keep it moderate to allow natural poses
-        const double pose_reg_weight = 5.0;  // Same as before, don't over-regularize
+        // keep pose reg
         for (int i = 3; i < 72; ++i) {
             problem.AddResidualBlock(
                 new ceres::AutoDiffCostFunction<PoseRegularizer, 1, 72>(
-                    new PoseRegularizer(i, pose_reg_weight)),
+                    new PoseRegularizer(i, 5.0)),
                 nullptr, theta
             );
         }
 
-        // Anatomical limits (same as Stage 2) to prevent extreme poses
-        const double hinge_lock_weight = 100.0;
-        const double limit_weight = 50.0;
+        // Stage3: HingeAxisResidual
+        auto add_hinge = [&](int j, Eigen::Vector3d axis, double w_perp, double w_range, double min_a, double max_a) {
+            problem.AddResidualBlock(
+                new ceres::AutoDiffCostFunction<HingeAxisResidual, 2, 72>(
+                    new HingeAxisResidual(j, axis, w_perp, w_range, min_a, max_a)),
+                nullptr, theta
+            );
+        };
+        Eigen::Vector3d HINGE_X(1,0,0);
+        for (int k : {4,5}) add_hinge(k, HINGE_X, 60.0, 30.0, 0.0, 2.6);
+        for (int e : {18,19}) add_hinge(e, HINGE_X, 60.0, 30.0, -2.6, 0.1);
 
-        // Knees: flex [0, 2.6], hinge lock [-0.1, 0.1]
-        int knees[] = {4, 5};
-        for (int k : knees) {
-            problem.AddResidualBlock(new ceres::AutoDiffCostFunction<AnatomicalLimitResidual,1,72>(
-                new AnatomicalLimitResidual(k,0,0.0,2.6,limit_weight)), nullptr, theta);
-            problem.AddResidualBlock(new ceres::AutoDiffCostFunction<AnatomicalLimitResidual,1,72>(
-                new AnatomicalLimitResidual(k,1,-0.1,0.1,hinge_lock_weight)), nullptr, theta);
-            problem.AddResidualBlock(new ceres::AutoDiffCostFunction<AnatomicalLimitResidual,1,72>(
-                new AnatomicalLimitResidual(k,2,-0.1,0.1,hinge_lock_weight)), nullptr, theta);
-        }
-
-        // Elbows: flex [-2.6, 0.1], hinge lock [-0.1, 0.1]
-        int elbows[] = {18, 19};
-        for (int e : elbows) {
-            problem.AddResidualBlock(new ceres::AutoDiffCostFunction<AnatomicalLimitResidual,1,72>(
-                new AnatomicalLimitResidual(e,0,-2.6,0.1,limit_weight)), nullptr, theta);
-            problem.AddResidualBlock(new ceres::AutoDiffCostFunction<AnatomicalLimitResidual,1,72>(
-                new AnatomicalLimitResidual(e,1,-0.1,0.1,hinge_lock_weight)), nullptr, theta);
-            problem.AddResidualBlock(new ceres::AutoDiffCostFunction<AnatomicalLimitResidual,1,72>(
-                new AnatomicalLimitResidual(e,2,-0.1,0.1,hinge_lock_weight)), nullptr, theta);
-        }
+        // Stage3: AnatomicalLimitResidual (commented out)
+        // const double hinge_lock_weight = 100.0;
+        // const double limit_weight = 50.0;
+        // // Knees: flex [0, 2.6], hinge lock [-0.1, 0.1]
+        // int knees[] = {4, 5};
+        // for (int k : knees) {
+        //     problem.AddResidualBlock(new ceres::AutoDiffCostFunction<AnatomicalLimitResidual,1,72>(
+        //         new AnatomicalLimitResidual(k,0,0.0,2.6,limit_weight)), nullptr, theta);
+        //     problem.AddResidualBlock(new ceres::AutoDiffCostFunction<AnatomicalLimitResidual,1,72>(
+        //         new AnatomicalLimitResidual(k,1,-0.1,0.1,hinge_lock_weight)), nullptr, theta);
+        //     problem.AddResidualBlock(new ceres::AutoDiffCostFunction<AnatomicalLimitResidual,1,72>(
+        //         new AnatomicalLimitResidual(k,2,-0.1,0.1,hinge_lock_weight)), nullptr, theta);
+        // }
+        // // Elbows: flex [-2.6, 0.1], hinge lock [-0.1, 0.1]
+        // int elbows[] = {18, 19};
+        // for (int e : elbows) {
+        //     problem.AddResidualBlock(new ceres::AutoDiffCostFunction<AnatomicalLimitResidual,1,72>(
+        //         new AnatomicalLimitResidual(e,0,-2.6,0.1,limit_weight)), nullptr, theta);
+        //     problem.AddResidualBlock(new ceres::AutoDiffCostFunction<AnatomicalLimitResidual,1,72>(
+        //         new AnatomicalLimitResidual(e,1,-0.1,0.1,hinge_lock_weight)), nullptr, theta);
+        //     problem.AddResidualBlock(new ceres::AutoDiffCostFunction<AnatomicalLimitResidual,1,72>(
+        //         new AnatomicalLimitResidual(e,2,-0.1,0.1,hinge_lock_weight)), nullptr, theta);
+        // }
 
         problem.SetParameterLowerBound(trans, 2, 0.5);
         problem.SetParameterUpperBound(trans, 2, 20.0);
 
         ceres::Solver::Options options;
-        SetupSolverOptions(options, 50);  // More iterations for Stage 3
+        SetupSolverOptions(options, 40);
         ceres::Solver::Summary summary;
         ceres::Solve(options, &problem, &summary);
 
         std::cout << "[Final] " << summary.BriefReport() << "\n";
-
-        // Debug: print Z values after optimization
-        if (config.use_depth_ordering && !depth_data.empty()) {
-            Eigen::Matrix<double, Eigen::Dynamic, 3, Eigen::RowMajor> Jw_after;
-            SMPLJointsForward<double>(beta, theta, trans, model, Jw_after);
-            std::cout << "[Debug] Z values AFTER Stage 3:\n";
-            std::cout << "  SMPL 4 (L_Knee)  Z = " << Jw_after(4, 2) << "\n";
-            std::cout << "  SMPL 5 (R_Knee)  Z = " << Jw_after(5, 2) << "\n";
-            std::cout << "  SMPL 7 (L_Ankle) Z = " << Jw_after(7, 2) << "\n";
-            std::cout << "  SMPL 8 (R_Ankle) Z = " << Jw_after(8, 2) << "\n";
-
-            // Check if depth ordering is satisfied
-            bool l_knee_closer = Jw_after(4, 2) < Jw_after(5, 2);
-            bool l_ankle_closer = Jw_after(7, 2) < Jw_after(8, 2);
-            std::cout << "  L_Knee closer than R_Knee? " << (l_knee_closer ? "YES" : "NO") << "\n";
-            std::cout << "  L_Ankle closer than R_Ankle? " << (l_ankle_closer ? "YES" : "NO") << "\n";
-        }
     }
 
     return true;
@@ -516,22 +483,18 @@ CameraIntrinsics CreateDefaultCamera(int image_width, int image_height) {
 }
 
 // ------------------------------
-// Load keypoint depths from JSON
-// Expected format:
-// {
-//   "keypoint_depths": [
-//     {"joint_id": 0, "depth": 0.85, "confidence": 0.95},
-//     ...
-//   ]
-// }
+// Load depth data from JSON file
 // ------------------------------
+#include <fstream>
+#include <nlohmann/json.hpp>
+
 bool LoadKeypointDepthsFromJSON(const std::string& json_path,
                                  std::vector<KeypointDepth>& depths) {
     depths.clear();
 
     std::ifstream infile(json_path);
     if (!infile.is_open()) {
-        std::cerr << "[Error] Cannot open depth JSON: " << json_path << "\n";
+        std::cerr << "[Depth] Failed to open: " << json_path << "\n";
         return false;
     }
 
@@ -539,19 +502,19 @@ bool LoadKeypointDepthsFromJSON(const std::string& json_path,
     try {
         infile >> j;
     } catch (const std::exception& e) {
-        std::cerr << "[Error] Failed to parse depth JSON: " << e.what() << "\n";
+        std::cerr << "[Depth] JSON parse error: " << e.what() << "\n";
         return false;
     }
 
     if (!j.contains("keypoint_depths")) {
-        std::cerr << "[Error] JSON missing 'keypoint_depths' field\n";
+        std::cerr << "[Depth] Missing 'keypoint_depths' field\n";
         return false;
     }
 
-    for (const auto& item : j["keypoint_depths"]) {
-        int joint_id = item.value("joint_id", -1);
-        float depth = item.value("depth", 0.0f);
-        float conf = item.value("confidence", 1.0f);
+    for (const auto& kd : j["keypoint_depths"]) {
+        int joint_id = kd.value("joint_id", -1);
+        float depth = kd.value("depth", 0.0f);
+        float conf = kd.value("confidence", 0.0f);
 
         if (joint_id >= 0 && joint_id < 25) {
             depths.emplace_back(joint_id, depth, conf);
@@ -561,4 +524,3 @@ bool LoadKeypointDepthsFromJSON(const std::string& json_path,
     std::cout << "[Depth] Loaded " << depths.size() << " keypoint depths from " << json_path << "\n";
     return !depths.empty();
 }
-

@@ -140,13 +140,13 @@ bool OptimizeSMPL(
             beta, theta, trans,
             /*use_pose_blendshapes=*/true,
             config,
-            new ceres::HuberLoss(20.0)
+            new ceres::HuberLoss(5.0)
         );
 
         problem.SetParameterBlockConstant(beta);
 
         // stronger pose reg for 2D 
-        const double pose_reg_weight = 5.0;
+        const double pose_reg_weight = 2.0;
         for (int i = 3; i < 72; ++i) {
             problem.AddResidualBlock(
                 new ceres::AutoDiffCostFunction<PoseRegularizer, 1, 72>(
@@ -156,7 +156,7 @@ bool OptimizeSMPL(
         }
 
         // hinge constraints (keep)
-        const double hinge_lock_weight = 100.0;
+        const double hinge_lock_weight = 100.0; 
         const double limit_weight = 50.0;
 
         const double root_upright_w = 10.0; 
@@ -166,28 +166,31 @@ bool OptimizeSMPL(
             nullptr, theta
         );
 
+        auto add_hinge = [&](int j, Eigen::Vector3d axis, double w_perp, double w_range, double min_a, double max_a) {
+            problem.AddResidualBlock(
+                new ceres::AutoDiffCostFunction<HingeAxisResidual, 2, 72>(
+                    new HingeAxisResidual(j, axis, w_perp, w_range, min_a, max_a)),
+                nullptr, theta
+            );
+        };
 
-        // knees indices (your SMPL indexing assumed)
-        int knees[] = {4, 5};
-        for (int k : knees) {
-            problem.AddResidualBlock(new ceres::AutoDiffCostFunction<AnatomicalLimitResidual,1,72>(
-                new AnatomicalLimitResidual(k,0,0.0,2.6,limit_weight)), nullptr, theta);
-            problem.AddResidualBlock(new ceres::AutoDiffCostFunction<AnatomicalLimitResidual,1,72>(
-                new AnatomicalLimitResidual(k,1,-0.1,0.1,hinge_lock_weight)), nullptr, theta);
-            problem.AddResidualBlock(new ceres::AutoDiffCostFunction<AnatomicalLimitResidual,1,72>(
-                new AnatomicalLimitResidual(k,2,-0.1,0.1,hinge_lock_weight)), nullptr, theta);
+        // 先假设 hinge 轴是 X（你得试 1~2 次确认哪个轴对应 flexion）
+        Eigen::Vector3d HINGE_X(1,0,0);
+        // knees (joint ids 4,5) 
+        for (int k : {4, 5}) {
+            add_hinge(k, HINGE_X,
+                    /*w_perp=*/120.0, /*w_range=*/60.0,
+                    /*min_a=*/0.0, /*max_a=*/2.6);
         }
 
-        // elbows
-        int elbows[] = {18, 19};
-        for (int e : elbows) {
-            problem.AddResidualBlock(new ceres::AutoDiffCostFunction<AnatomicalLimitResidual,1,72>(
-                new AnatomicalLimitResidual(e,0,-2.6,0.1,limit_weight)), nullptr, theta);
-            problem.AddResidualBlock(new ceres::AutoDiffCostFunction<AnatomicalLimitResidual,1,72>(
-                new AnatomicalLimitResidual(e,1,-0.1,0.1,hinge_lock_weight)), nullptr, theta);
-            problem.AddResidualBlock(new ceres::AutoDiffCostFunction<AnatomicalLimitResidual,1,72>(
-                new AnatomicalLimitResidual(e,2,-0.1,0.1,hinge_lock_weight)), nullptr, theta);
+        // elbows (joint ids 18,19) 
+        for (int e : {18, 19}) {
+            add_hinge(e, HINGE_X,
+                    /*w_perp=*/300.0, /*w_range=*/80.0,
+                    /*min_a=*/-2.6, /*max_a=*/0.1);
         }
+
+        
 
         problem.SetParameterLowerBound(trans, 2, 0.5);
         problem.SetParameterUpperBound(trans, 2, 20.0);
@@ -239,6 +242,19 @@ bool OptimizeSMPL(
                 nullptr, theta
             );
         }
+
+        auto add_hinge = [&](int j, Eigen::Vector3d axis, double w_perp, double w_range, double min_a, double max_a) {
+            problem.AddResidualBlock(
+                new ceres::AutoDiffCostFunction<HingeAxisResidual, 2, 72>(
+                    new HingeAxisResidual(j, axis, w_perp, w_range, min_a, max_a)),
+                nullptr, theta
+            );
+        };
+
+        // Stage3: weaker hinge than stage2
+        Eigen::Vector3d HINGE_X(1,0,0);
+        for (int k : {4,5}) add_hinge(k, HINGE_X, 60.0, 30.0, 0.0, 2.6);
+        for (int e : {18,19}) add_hinge(e, HINGE_X, 60.0, 30.0, -2.6, 0.1);
 
         problem.SetParameterLowerBound(trans, 2, 0.5);
         problem.SetParameterUpperBound(trans, 2, 20.0);

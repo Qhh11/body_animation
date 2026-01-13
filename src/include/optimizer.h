@@ -245,6 +245,49 @@ struct RootUprightResidual {
     double w;
 };
 
+struct HingeAxisResidual {
+    HingeAxisResidual(int joint_idx,
+                      Eigen::Vector3d axis_unit,
+                      double w_perp,
+                      double w_range,
+                      double min_a,
+                      double max_a)
+        : j_(joint_idx),
+          u_(axis_unit.normalized()),
+          w_perp_(w_perp),
+          w_range_(w_range),
+          min_a_(min_a),
+          max_a_(max_a) {}
+
+    template <typename T>
+    bool operator()(const T* const theta, T* residual) const {
+        const int base = 3 * j_;
+        Eigen::Matrix<T,3,1> r(theta[base+0], theta[base+1], theta[base+2]);
+        Eigen::Matrix<T,3,1> u(T(u_.x()), T(u_.y()), T(u_.z()));
+
+        // parallel component (hinge DOF)
+        const T a = u.dot(r);
+        // perpendicular component (forbidden twist/swing)
+        Eigen::Matrix<T,3,1> perp = r - u * a;
+
+        // smooth norm to avoid nondiff at 0
+        const T perp_norm = ceres::sqrt(perp.squaredNorm() + T(1e-12));
+        residual[0] = T(w_perp_) * perp_norm;
+
+        // range clamp on a
+        T range_pen = T(0);
+        if (a < T(min_a_)) range_pen = T(min_a_) - a;
+        else if (a > T(max_a_)) range_pen = a - T(max_a_);
+        residual[1] = T(w_range_) * range_pen;
+        return true;
+    }
+
+    int j_;
+    Eigen::Vector3d u_;
+    double w_perp_, w_range_, min_a_, max_a_;
+};
+
+
 // ------------------------------
 // 3D joints residual (used for AMASS unit test)
 // ------------------------------

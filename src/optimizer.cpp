@@ -44,8 +44,7 @@ static int AutoThreads(int cfg_threads) {
 static void SetupSolverOptions(ceres::Solver::Options& options,
                                const OptimizerConfig& cfg,
                                int max_iter) {
-    // This problem is tiny dense => Normal Cholesky is typically fastest
-    options.linear_solver_type = ceres::DENSE_NORMAL_CHOLESKY;
+    options.linear_solver_type = ceres::DENSE_QR;
 
     options.num_threads = AutoThreads(cfg.threads);
     options.max_num_iterations = max_iter;
@@ -235,7 +234,7 @@ bool OptimizeSMPL(
         for (int j : {13,14,16,17}) add_pose_reg_joint(j, 5.0);
 
         // Root upright
-        const double root_upright_w = 10.0;
+        const double root_upright_w = 1.0;
         problem.AddResidualBlock(
             new ceres::AutoDiffCostFunction<RootUprightResidual, 2, 72>(
                 new RootUprightResidual(root_upright_w)),
@@ -299,13 +298,6 @@ bool OptimizeSMPL(
             );
         }
 
-        // Root upright
-        const double root_upright_w = 10.0;
-        problem.AddResidualBlock(
-            new ceres::AutoDiffCostFunction<RootUprightResidual, 2, 72>(
-                new RootUprightResidual(root_upright_w)),
-            nullptr, theta
-        );
 
         // Shoulder / collar soft limits
         const double w_shoulder_limit = 30.0;

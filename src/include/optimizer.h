@@ -65,9 +65,9 @@ struct OptimizerConfig {
     // ---------- speed / solver ----------
     int threads = -1;                 // -1: auto
     bool print_progress = false;      // IMPORTANT: printing is slow
-    int max_iter_stage1 = 40;
-    int max_iter_stage2 = 60;
-    int max_iter_stage3 = 60;
+    int max_iter_stage1 = 60;
+    int max_iter_stage2 = 200;
+    int max_iter_stage3 = 200;
 };
 
 // ------------------------------

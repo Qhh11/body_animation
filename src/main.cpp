@@ -206,7 +206,7 @@ void RunAMASSValidation(const SmplModel& model) {
     std::cout << "\n=== MODE 1: Running AMASS Validation (Real AMASS Data) ===\n";
 
 
-    std::string amass_path = "../../Data/CMU/02/02_09_poses_formatted.txt";
+    std::string amass_path = "../../Data/CMU/01/01_01_poses_formatted.txt";
     std::vector<AmassFrame> amass_frames;
     if (!AmassLoader::Load(amass_path, amass_frames)) return;
     if (amass_frames.empty()) return;
@@ -247,7 +247,7 @@ void RunAMASSValidation(const SmplModel& model) {
     // Camera + synthetic observations
     CameraIntrinsics camera = CreateDefaultCamera(800, 800);
 
-    auto observed_landmarks = GenerateSyntheticLandmarks(model, camera, beta_gt, theta_gt, trans_gt , true);
+    auto observed_landmarks = GenerateSyntheticLandmarks(model, camera, beta_gt, theta_gt, trans_gt , false);
     if (observed_landmarks.empty()) {
         std::cerr << "[Error] No landmarks generated (likely behind camera / bad forward).\n";
         return;
@@ -259,8 +259,7 @@ void RunAMASSValidation(const SmplModel& model) {
     SMPLForward<double>(beta_gt, theta_gt, trans_gt, model, verts_gt);
     SaveOBJ("mesh_ground_truth.obj", verts_gt, model.faces);
 
-    // init 
-    double beta_opt[10]  = {0};
+    double beta_opt[10] = {0};
     double theta_opt[72] = {0};
     double trans_opt[3]  = {0.0, 0.0, 2.5};
 
@@ -281,7 +280,7 @@ void RunAMASSValidation(const SmplModel& model) {
     cfg.w_depth = 50.0;
     cfg.depth_data = &depth_gt;
 
-    bool use_3d_optimization = true; 
+    bool use_3d_optimization = false; 
 
     if (use_3d_optimization){
         std::cout << "[Info] Running OptimizeSMPL3D...\n";
@@ -308,7 +307,7 @@ void RunAMASSValidation(const SmplModel& model) {
     std::cout << "[AMASS] mean joint L2 error = "
             << (J_fit - J_gt).rowwise().norm().mean() << " m\n";
 
-    auto final_landmarks = GenerateSyntheticLandmarks(model, camera, beta_opt, theta_opt, trans_opt,true);
+    auto final_landmarks = GenerateSyntheticLandmarks(model, camera, beta_opt, theta_opt, trans_opt, false);
     SaveLandmarksToFile("landmarks_optimized.txt", final_landmarks);
 
     Eigen::Matrix<double, Eigen::Dynamic, 3, Eigen::RowMajor> verts_opt;
@@ -401,7 +400,6 @@ int main() {
 
     SmplModel model;
     model.LoadFromNPZ("../../Data/models/smpl_neutral.npz");
-
     // Mode 1: Validation (Check if algorithm works on AMASS)
     RunAMASSValidation(model);
 
@@ -410,3 +408,4 @@ int main() {
 
     return 0;
 }
+

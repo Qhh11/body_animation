@@ -1,9 +1,10 @@
 #pragma once
 #include <Eigen/Dense>
 #include <ceres/rotation.h>
-#include <vector>
 #include "smpl_model.h"
 
+// FAST joints-only SMPL forward for optimization.
+// Assumes SMPL has 24 joints (standard SMPL). If your model.J != 24, it falls back.
 template <typename T>
 void SMPLJointsForward(
     const T* beta,
@@ -13,10 +14,91 @@ void SMPLJointsForward(
     Eigen::Matrix<T, Eigen::Dynamic, 3, Eigen::RowMajor>& out_joints_world
 ) {
     const int J = model.J;
-    const int N = model.N;
+
     out_joints_world.resize(J, 3);
 
-    // 1) v_shaped
+    // --------- Preferred fast path: J==24 with joint caches ----------
+    const bool has_joint_cache =
+        (model.J_template_3d.rows() == J && model.J_template_3d.cols() == 3) &&
+        (model.J_shapedirs_3d.rows() == J * 3 && model.J_shapedirs_3d.cols() >= 10);
+
+    if (J == 24 && has_joint_cache) {
+        // joints_shaped: (24 x 3) on stack (fixed size)
+        Eigen::Matrix<T, 24, 3, Eigen::RowMajor> joints;
+        // global rotations/positions on stack
+        Eigen::Matrix<T, 24, 3, Eigen::RowMajor> global_p; // positions
+        // store rotation matrices
+        std::array<Eigen::Matrix<T,3,3>, 24> global_R;
+
+        // 1) joints = J_template_3d + J_shapedirs_3d * beta
+        for (int j = 0; j < 24; ++j) {
+            joints(j,0) = T(model.J_template_3d(j,0));
+            joints(j,1) = T(model.J_template_3d(j,1));
+            joints(j,2) = T(model.J_template_3d(j,2));
+
+            const int base = j * 3;
+            // add 10 betas
+            for (int c = 0; c < 3; ++c) {
+                T off = T(0);
+                for (int k = 0; k < 10; ++k) {
+                    off += T(model.J_shapedirs_3d(base + c, k)) * beta[k];
+                }
+                joints(j,c) += off;
+            }
+        }
+
+        // 2) FK recursion (R,p)
+        for (int i = 0; i < 24; ++i) {
+            T aa[3] = { theta[i*3+0], theta[i*3+1], theta[i*3+2] };
+            T Rcolmaj[9];
+            ceres::AngleAxisToRotationMatrix(aa, Rcolmaj);
+
+            Eigen::Matrix<T,3,3> R;
+            R(0,0)=Rcolmaj[0]; R(0,1)=Rcolmaj[3]; R(0,2)=Rcolmaj[6];
+            R(1,0)=Rcolmaj[1]; R(1,1)=Rcolmaj[4]; R(1,2)=Rcolmaj[7];
+            R(2,0)=Rcolmaj[2]; R(2,1)=Rcolmaj[5]; R(2,2)=Rcolmaj[8];
+
+            int p = (i == 0) ? -1 : model.kintree_table(0, i);
+            if (p < 0 || p >= 24) p = -1;
+
+            if (p == -1) {
+                global_R[i] = R;
+                global_p(i,0) = joints(i,0);
+                global_p(i,1) = joints(i,1);
+                global_p(i,2) = joints(i,2);
+            } else {
+                global_R[i] = global_R[p] * R;
+
+                Eigen::Matrix<T,3,1> rel;
+                rel(0) = joints(i,0) - joints(p,0);
+                rel(1) = joints(i,1) - joints(p,1);
+                rel(2) = joints(i,2) - joints(p,2);
+
+                Eigen::Matrix<T,3,1> parent_p;
+                parent_p(0) = global_p(p,0);
+                parent_p(1) = global_p(p,1);
+                parent_p(2) = global_p(p,2);
+
+                Eigen::Matrix<T,3,1> cur_p = parent_p + global_R[p] * rel;
+                global_p(i,0) = cur_p(0);
+                global_p(i,1) = cur_p(1);
+                global_p(i,2) = cur_p(2);
+            }
+        }
+
+        // 3) output + trans  (FIXED: global_p(i,*) not global_p)
+        for (int i = 0; i < 24; ++i) {
+            out_joints_world(i,0) = global_p(i,0) + trans[0];
+            out_joints_world(i,1) = global_p(i,1) + trans[1];
+            out_joints_world(i,2) = global_p(i,2) + trans[2];
+        }
+        return;
+    }
+
+    // --------- Fallback path (generic J): your original method (slow) ----------
+    // Keep this so code still runs if you load a non-24-joint model.
+    const int N = model.N;
+
     Eigen::Matrix<T, Eigen::Dynamic, 3, Eigen::RowMajor> v_shaped(N, 3);
     for (int i = 0; i < N; ++i) {
         v_shaped(i,0) = T(model.v_template(i,0));
@@ -29,7 +111,6 @@ void SMPLJointsForward(
         v_shaped(i,c) += off;
     }
 
-    // 2) joints = J_regressor * v_shaped
     Eigen::Matrix<T, Eigen::Dynamic, 3, Eigen::RowMajor> joints(J, 3);
     joints.setZero();
     for (int j = 0; j < J; ++j) {
@@ -43,26 +124,26 @@ void SMPLJointsForward(
         }
     }
 
-    // 3) parents
+    // Generic FK using 4x4 (slow but safe)
     std::vector<int> parents(J, -1);
     parents[0] = -1;
     for (int i = 1; i < J; ++i) {
         int p = model.kintree_table(0, i);
-        parents[i] = (p >= 0 && p < J) ? p : -1;
+        if (p < 0 || p >= J) p = -1;
+        parents[i] = p;
     }
 
-    // 4) FK global transforms
     std::vector<Eigen::Matrix<T,4,4>> global_T(J);
     for (int i = 0; i < J; ++i) {
         T aa[3] = { theta[i*3+0], theta[i*3+1], theta[i*3+2] };
-        T R[9];
-        ceres::AngleAxisToRotationMatrix(aa, R);
+        T Rcolmaj[9];
+        ceres::AngleAxisToRotationMatrix(aa, Rcolmaj);
 
         Eigen::Matrix<T,4,4> local;
         local.setIdentity();
-        local(0,0)=R[0]; local(0,1)=R[3]; local(0,2)=R[6];
-        local(1,0)=R[1]; local(1,1)=R[4]; local(1,2)=R[7];
-        local(2,0)=R[2]; local(2,1)=R[5]; local(2,2)=R[8];
+        local(0,0)=Rcolmaj[0]; local(0,1)=Rcolmaj[3]; local(0,2)=Rcolmaj[6];
+        local(1,0)=Rcolmaj[1]; local(1,1)=Rcolmaj[4]; local(1,2)=Rcolmaj[7];
+        local(2,0)=Rcolmaj[2]; local(2,1)=Rcolmaj[5]; local(2,2)=Rcolmaj[8];
 
         int p = parents[i];
         if (p == -1) {
@@ -78,7 +159,6 @@ void SMPLJointsForward(
         }
     }
 
-    // 5) output + trans
     for (int i = 0; i < J; ++i) {
         out_joints_world(i,0) = global_T[i](0,3) + trans[0];
         out_joints_world(i,1) = global_T[i](1,3) + trans[1];

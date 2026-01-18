@@ -1,6 +1,7 @@
 #define EIGEN_STACK_ALLOCATION_LIMIT 1000000
 
 #include "optimizer.h"
+
 #include <thread>
 #include <ceres/ceres.h>
 #include <ceres/manifold.h>
@@ -34,14 +35,37 @@ const int OPENPOSE_TO_SMPL[25] = {
     -1   // 24: RHeel
 };
 
-static void SetupSolverOptions(ceres::Solver::Options& options, int max_iter) {
-    options.linear_solver_type = ceres::DENSE_QR;
-    options.num_threads = std::max(1u, std::thread::hardware_concurrency());
-    options.minimizer_progress_to_stdout = true;
-    options.max_num_iterations = max_iter;
+static int AutoThreads(int cfg_threads) {
+    if (cfg_threads > 0) return cfg_threads;
+    unsigned hc = std::thread::hardware_concurrency();
+    return std::max(1u, hc);
 }
 
-static void AddAllKeypointReprojBlock(
+static void SetupSolverOptions(ceres::Solver::Options& options,
+                               const OptimizerConfig& cfg,
+                               int max_iter) {
+    // This problem is tiny dense => Normal Cholesky is typically fastest
+    options.linear_solver_type = ceres::DENSE_NORMAL_CHOLESKY;
+
+    options.num_threads = AutoThreads(cfg.threads);
+    options.max_num_iterations = max_iter;
+
+    // printing is expensive (especially on Windows)
+    options.minimizer_progress_to_stdout = cfg.print_progress;
+
+    // Reasonable termination for speed
+    options.function_tolerance  = 1e-6;
+    options.gradient_tolerance  = 1e-10;
+    options.parameter_tolerance = 1e-8;
+
+    // LM is usually stable for reprojection
+    options.trust_region_strategy_type = ceres::LEVENBERG_MARQUARDT;
+
+    // If you want maximum speed:
+    // options.num_linear_solver_threads = options.num_threads; // only for some solvers
+}
+
+static void AddAllKeypointReprojBlock_AutoDiff(
     ceres::Problem& problem,
     const std::vector<Landmark2D>& observed,
     const CameraIntrinsics& camera,
@@ -49,7 +73,6 @@ static void AddAllKeypointReprojBlock(
     double* beta,
     double* theta,
     double* trans,
-    bool use_pose_blendshapes,
     const OptimizerConfig& cfg,
     ceres::LossFunction* loss
 ) {
@@ -57,7 +80,6 @@ static void AddAllKeypointReprojBlock(
         observed,
         camera,
         model,
-        use_pose_blendshapes,
         cfg.min_confidence,
         cfg.use_stable_joints_only,
         cfg.flip_y_in_projection
@@ -70,15 +92,39 @@ static void AddAllKeypointReprojBlock(
         return;
     }
 
-    auto* cost = new ceres::DynamicAutoDiffCostFunction<AllKeypointsReprojectionResidual>(functor);
-    cost->AddParameterBlock(10);
-    cost->AddParameterBlock(72);
-    cost->AddParameterBlock(3);
-    cost->SetNumResiduals(2 * K);
+    // Key speed change:
+    // Use AutoDiffCostFunction with DYNAMIC residual count (cheaper than DynamicAutoDiffCostFunction).
+    auto* cost = new ceres::AutoDiffCostFunction<AllKeypointsReprojectionResidual, ceres::DYNAMIC, 10, 72, 3>(
+        functor,
+        2 * K
+    );
 
     problem.AddResidualBlock(cost, loss, beta, theta, trans);
 }
 
+static void AddDepthBlock_AutoDiff(
+    ceres::Problem& problem,
+    const OptimizerConfig& cfg,
+    const SmplModel& model,
+    double* beta,
+    double* theta,
+    double* trans
+) {
+    if (!cfg.use_depth || cfg.depth_data == nullptr || cfg.depth_data->empty()) return;
+
+    auto* functor = new DepthResidual(*cfg.depth_data, model, cfg.w_depth);
+
+    auto* cost = new ceres::AutoDiffCostFunction<DepthResidual, ceres::DYNAMIC, 10, 72, 3>(
+        functor,
+        (int)cfg.depth_data->size()
+    );
+
+    problem.AddResidualBlock(cost, nullptr, beta, theta, trans);
+}
+
+// ------------------------------
+// OptimizeSMPL (2D)
+// ------------------------------
 bool OptimizeSMPL(
     const std::vector<Landmark2D>& observed_keypoints,
     const CameraIntrinsics& camera,
@@ -91,40 +137,35 @@ bool OptimizeSMPL(
     std::cout << "[Optimizer] Starting 2D Optimization...\n";
 
     // ----------------------------
-    // Stage 1: ONLY trans + ONE root axis (avoid flip /倒立)
+    // Stage 1: trans + ONE root axis
     // ----------------------------
     {
-        std::cout << "\n>>> Stage 1: trans + single-axis root (FAST & stable)\n";
+        std::cout << "\n>>> Stage 1: trans + single-axis root\n";
         ceres::Problem problem;
 
-        AddAllKeypointReprojBlock(
+        AddAllKeypointReprojBlock_AutoDiff(
             problem, observed_keypoints, camera, model,
             beta, theta, trans,
-            /*use_pose_blendshapes=*/false,
             config,
             new ceres::HuberLoss(20.0)
         );
 
-        // fix shape
         problem.SetParameterBlockConstant(beta);
 
-        // lock all theta except one root axis
+        // lock all theta except one axis
         std::vector<int> const_idx;
         const_idx.reserve(71);
-
-        // lock theta[0..71] except index = config.root_free_axis
         for (int i = 0; i < 72; ++i) {
-            if (i == config.root_free_axis) continue; // free only one axis
+            if (i == config.root_free_axis) continue;
             const_idx.push_back(i);
         }
         problem.SetManifold(theta, new ceres::SubsetManifold(72, const_idx));
 
-        // bounds on depth
         problem.SetParameterLowerBound(trans, 2, 0.5);
         problem.SetParameterUpperBound(trans, 2, 20.0);
 
         ceres::Solver::Options options;
-        SetupSolverOptions(options, 30);
+        SetupSolverOptions(options, config, config.max_iter_stage1);
         ceres::Solver::Summary summary;
         ceres::Solve(options, &problem, &summary);
         if (config.verbose) std::cout << summary.BriefReport() << "\n";
@@ -137,17 +178,16 @@ bool OptimizeSMPL(
         std::cout << "\n>>> Stage 2: full pose (beta fixed)\n";
         ceres::Problem problem;
 
-        AddAllKeypointReprojBlock(
+        AddAllKeypointReprojBlock_AutoDiff(
             problem, observed_keypoints, camera, model,
             beta, theta, trans,
-            /*use_pose_blendshapes=*/true,
             config,
             new ceres::HuberLoss(5.0)
         );
 
         problem.SetParameterBlockConstant(beta);
 
-        // stronger pose reg for 2D 
+        // Pose regularization
         const double pose_reg_weight = 2.0;
         for (int i = 3; i < 72; ++i) {
             problem.AddResidualBlock(
@@ -156,23 +196,15 @@ bool OptimizeSMPL(
                 nullptr, theta
             );
         }
-        // Depth constraint (if enabled)
-        if (config.use_depth && config.depth_data != nullptr) {
-            problem.AddResidualBlock(
-                new ceres::AutoDiffCostFunction<DepthResidual, ceres::DYNAMIC, 10, 72, 3>(
-                    new DepthResidual(*config.depth_data, model, config.w_depth, true),
-                    static_cast<int>(config.depth_data->size())
-                ),
-                nullptr, beta, theta, trans
-            );
-        }
 
-        // ---- Shoulder / collar soft limits (energy) ----
+        // Depth constraint (optional)
+        AddDepthBlock_AutoDiff(problem, config, model, beta, theta, trans);
+
+        // Shoulder / collar soft limits
         const double w_shoulder_limit = 30.0;
         const double w_collar_limit   = 20.0;
-
-        const double shoulder_amax = 2.0; // ~115 deg
-        const double collar_amax   = 1.0; // ~57 deg
+        const double shoulder_amax = 2.0;
+        const double collar_amax   = 1.0;
 
         for (int j : {13, 14}) {
             problem.AddResidualBlock(
@@ -189,7 +221,7 @@ bool OptimizeSMPL(
             );
         }
 
-        // ---- Stronger local pose prior for shoulder/collar (energy, not hard) ----
+        // Stronger local reg for collar/shoulder
         auto add_pose_reg_joint = [&](int j, double w) {
             for (int k = 0; k < 3; ++k) {
                 const int idx = 3 * j + k;
@@ -200,21 +232,17 @@ bool OptimizeSMPL(
                 );
             }
         };
-        // collars + shoulders stronger than generic pose reg
         for (int j : {13,14,16,17}) add_pose_reg_joint(j, 5.0);
 
-        // hinge constraints (keep)
-        const double hinge_lock_weight = 100.0; 
-        const double limit_weight = 50.0;
-
-        const double root_upright_w = 10.0; 
-
+        // Root upright
+        const double root_upright_w = 10.0;
         problem.AddResidualBlock(
             new ceres::AutoDiffCostFunction<RootUprightResidual, 2, 72>(
                 new RootUprightResidual(root_upright_w)),
             nullptr, theta
         );
 
+        // Hinge constraints
         auto add_hinge = [&](int j, Eigen::Vector3d axis, double w_perp, double w_range, double min_a, double max_a) {
             problem.AddResidualBlock(
                 new ceres::AutoDiffCostFunction<HingeAxisResidual, 2, 72>(
@@ -223,61 +251,45 @@ bool OptimizeSMPL(
             );
         };
 
-        // 先假设 hinge 轴是 X（你得试 1~2 次确认哪个轴对应 flexion）
         Eigen::Vector3d HINGE_X(1,0,0);
-        // knees (joint ids 4,5) 
+
+        // knees
         for (int k : {4, 5}) {
-            add_hinge(k, HINGE_X,
-                    /*w_perp=*/120.0, /*w_range=*/60.0,
-                    /*min_a=*/0.0, /*max_a=*/2.6);
+            add_hinge(k, HINGE_X, 120.0, 60.0, 0.0, 2.6);
         }
-
-        // elbows (joint ids 18,19) - 降低权重让手肘更自由
+        // elbows
         for (int e : {18, 19}) {
-            add_hinge(e, HINGE_X,
-                    /*w_perp=*/60.0, /*w_range=*/30.0,
-                    /*min_a=*/-2.6, /*max_a=*/0.1);
+            add_hinge(e, HINGE_X, 60.0, 30.0, -2.6, 0.1);
         }
-
-        
 
         problem.SetParameterLowerBound(trans, 2, 0.5);
         problem.SetParameterUpperBound(trans, 2, 20.0);
 
         ceres::Solver::Options options;
-        SetupSolverOptions(options, 40);
+        SetupSolverOptions(options, config, config.max_iter_stage2);
         ceres::Solver::Summary summary;
         ceres::Solve(options, &problem, &summary);
         if (config.verbose) std::cout << summary.BriefReport() << "\n";
     }
 
     // ----------------------------
-    // Stage 3: allow beta refine (with strong shape prior)
+    // Stage 3: refine beta + pose + trans
     // ----------------------------
     {
         std::cout << "\n>>> Stage 3: refine beta + pose + trans\n";
         ceres::Problem problem;
 
-        AddAllKeypointReprojBlock(
+        AddAllKeypointReprojBlock_AutoDiff(
             problem, observed_keypoints, camera, model,
             beta, theta, trans,
-            /*use_pose_blendshapes=*/true,
             config,
             new ceres::HuberLoss(2.0)
         );
 
-        // Depth constraint (if enabled)
-        if (config.use_depth && config.depth_data != nullptr) {
-            problem.AddResidualBlock(
-                new ceres::AutoDiffCostFunction<DepthResidual, ceres::DYNAMIC, 10, 72, 3>(
-                    new DepthResidual(*config.depth_data, model, config.w_depth, true),
-                    static_cast<int>(config.depth_data->size())
-                ),
-                nullptr, beta, theta, trans
-            );
-        }
+        // Depth constraint (optional)
+        AddDepthBlock_AutoDiff(problem, config, model, beta, theta, trans);
 
-        // shape reg
+        // Shape reg
         const double shape_reg_weight = 80.0;
         for (int i = 0; i < 10; ++i) {
             problem.AddResidualBlock(
@@ -287,19 +299,19 @@ bool OptimizeSMPL(
             );
         }
 
-        const double root_upright_w = 10.0; 
+        // Root upright
+        const double root_upright_w = 10.0;
         problem.AddResidualBlock(
             new ceres::AutoDiffCostFunction<RootUprightResidual, 2, 72>(
                 new RootUprightResidual(root_upright_w)),
             nullptr, theta
         );
 
-         // ---- Shoulder / collar soft limits (energy) ----
+        // Shoulder / collar soft limits
         const double w_shoulder_limit = 30.0;
         const double w_collar_limit   = 20.0;
-
-        const double shoulder_amax = 2.0; // ~115 deg
-        const double collar_amax   = 1.0; // ~57 deg
+        const double shoulder_amax = 2.0;
+        const double collar_amax   = 1.0;
 
         for (int j : {13, 14}) {
             problem.AddResidualBlock(
@@ -316,7 +328,7 @@ bool OptimizeSMPL(
             );
         }
 
-        // ---- Stronger local pose prior for shoulder/collar (energy, not hard) ----
+        // Stronger local reg for collar/shoulder
         auto add_pose_reg_joint = [&](int j, double w) {
             for (int k = 0; k < 3; ++k) {
                 const int idx = 3 * j + k;
@@ -327,10 +339,9 @@ bool OptimizeSMPL(
                 );
             }
         };
-        // collars + shoulders stronger than generic pose reg
         for (int j : {13,14,16,17}) add_pose_reg_joint(j, 5.0);
 
-        // keep pose reg
+        // global pose reg
         for (int i = 3; i < 72; ++i) {
             problem.AddResidualBlock(
                 new ceres::AutoDiffCostFunction<PoseRegularizer, 1, 72>(
@@ -339,6 +350,7 @@ bool OptimizeSMPL(
             );
         }
 
+        // weaker hinge
         auto add_hinge = [&](int j, Eigen::Vector3d axis, double w_perp, double w_range, double min_a, double max_a) {
             problem.AddResidualBlock(
                 new ceres::AutoDiffCostFunction<HingeAxisResidual, 2, 72>(
@@ -347,8 +359,6 @@ bool OptimizeSMPL(
             );
         };
 
-
-        // Stage3: weaker hinge than stage2
         Eigen::Vector3d HINGE_X(1,0,0);
         for (int k : {4,5}) add_hinge(k, HINGE_X, 60.0, 30.0, 0.0, 2.6);
         for (int e : {18,19}) add_hinge(e, HINGE_X, 60.0, 30.0, -2.6, 0.1);
@@ -357,36 +367,19 @@ bool OptimizeSMPL(
         problem.SetParameterUpperBound(trans, 2, 20.0);
 
         ceres::Solver::Options options;
-        SetupSolverOptions(options, 40);
+        SetupSolverOptions(options, config, config.max_iter_stage3);
         ceres::Solver::Summary summary;
         ceres::Solve(options, &problem, &summary);
 
-        std::cout << "[Final] " << summary.BriefReport() << "\n";
+        if (config.verbose) std::cout << "[Final] " << summary.BriefReport() << "\n";
     }
 
     return true;
 }
 
 // ------------------------------
-// 3D unit test
+// OptimizeSMPL3D (unit test)
 // ------------------------------
-static void AddJoints3DBlock(
-    ceres::Problem& problem,
-    const MatX3dRM& J_obs,
-    const SmplModel& model,
-    bool use_pose_blendshapes,
-    double* beta, double* theta, double* trans,
-    double w,
-    ceres::LossFunction* loss
-) {
-    auto* functor = new Joints3DResidual(J_obs, model, w, use_pose_blendshapes);
-    auto* cost = new ceres::AutoDiffCostFunction<Joints3DResidual, ceres::DYNAMIC, 10, 72, 3>(
-        functor,
-        3 * static_cast<int>(J_obs.rows())
-    );
-    problem.AddResidualBlock(cost, loss, beta, theta, trans);
-}
-
 static void AddJoints3DBlockFast(
     ceres::Problem& problem,
     const MatX3dRM& J_obs,
@@ -417,7 +410,7 @@ bool OptimizeSMPL3D(const MatX3dRM& J_obs,
         problem.SetManifold(theta, new ceres::SubsetManifold(72, const_idx));
 
         ceres::Solver::Options options;
-        SetupSolverOptions(options, 50);
+        SetupSolverOptions(options, config, 50);
         ceres::Solver::Summary summary;
         ceres::Solve(options, &problem, &summary);
         if (!summary.IsSolutionUsable()) return false;
@@ -430,7 +423,6 @@ bool OptimizeSMPL3D(const MatX3dRM& J_obs,
         AddJoints3DBlockFast(problem, J_obs, model, beta, theta, trans, config.w_3d, nullptr);
         problem.SetParameterBlockConstant(beta);
 
-        // ---- Shoulder / collar soft limits (energy) ----
         const double w_shoulder_limit = 30.0;
         const double w_collar_limit   = 20.0;
         const double shoulder_amax = 2.0;
@@ -451,20 +443,7 @@ bool OptimizeSMPL3D(const MatX3dRM& J_obs,
             );
         }
 
-        // ---- Stronger pose prior for collar/shoulder to reduce twist ambiguity ----
-        auto add_pose_reg_joint = [&](int j, double w) {
-            for (int k = 0; k < 3; ++k) {
-                const int idx = 3 * j + k;
-                problem.AddResidualBlock(
-                    new ceres::AutoDiffCostFunction<PoseRegularizer, 1, 72>(
-                        new PoseRegularizer(idx, w)),
-                    nullptr, theta
-                );
-            }
-        };
-        for (int j : {13,14,16,17}) add_pose_reg_joint(j, 5e-2);  // 3D里权重比2D小很多
-
-        const double pose_reg_w =1e-2;
+        const double pose_reg_w = 1e-2;
         for (int i = 3; i < 72; ++i) {
             problem.AddResidualBlock(
                 new ceres::AutoDiffCostFunction<PoseRegularizer, 1, 72>(
@@ -474,7 +453,7 @@ bool OptimizeSMPL3D(const MatX3dRM& J_obs,
         }
 
         ceres::Solver::Options options;
-        SetupSolverOptions(options, 200);
+        SetupSolverOptions(options, config, 60);
         ceres::Solver::Summary summary;
         ceres::Solve(options, &problem, &summary);
         if (!summary.IsSolutionUsable()) return false;

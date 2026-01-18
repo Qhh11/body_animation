@@ -1,6 +1,7 @@
 #pragma once
 
 #include <ceres/ceres.h>
+#include <ceres/rotation.h>
 #include <Eigen/Dense>
 
 #include <vector>
@@ -10,8 +11,6 @@
 
 #include "smpl_model.h"
 #include "smpl_math.h"
-#include <ceres/rotation.h>
-
 
 using MatX3dRM = Eigen::Matrix<double, Eigen::Dynamic, 3, Eigen::RowMajor>;
 
@@ -38,16 +37,20 @@ struct CameraIntrinsics {
         : fx(fx_), fy(fy_), cx(cx_), cy(cy_), width(w_), height(h_) {}
 };
 
-struct JointDepthData;  // forward declaration
+// Depth constraint data (Z in camera/world depending on your forward convention)
+struct JointDepthData {
+    int smpl_joint_idx;
+    double depth_z;  // GT depth (Z coordinate)
+};
 
 struct OptimizerConfig {
     bool verbose = true;
 
     // ---------- 2D fitting ----------
-    float min_confidence = 0.20f;     // OpenPose 建议别太低
-    bool use_stable_joints_only = true; // 只用躯干+四肢（更稳）
-    bool flip_y_in_projection = true;   // v = fy * (-Y/Z) + cy
-    int root_free_axis = 1;             // Stage1 只放开一个root轴：0/1/2试哪个最稳（默认1）
+    float min_confidence = 0.20f;
+    bool use_stable_joints_only = true;
+    bool flip_y_in_projection = true;
+    int root_free_axis = 1;  // Stage1 free only one root axis for stability
 
     // ---------- Depth constraint ----------
     bool use_depth = false;
@@ -58,6 +61,13 @@ struct OptimizerConfig {
     bool amass_unit_test = false;
     bool unit_test_exact = true;
     double w_3d = 1.0;
+
+    // ---------- speed / solver ----------
+    int threads = -1;                 // -1: auto
+    bool print_progress = false;      // IMPORTANT: printing is slow
+    int max_iter_stage1 = 40;
+    int max_iter_stage2 = 60;
+    int max_iter_stage3 = 60;
 };
 
 // ------------------------------
@@ -68,7 +78,6 @@ extern const int OPENPOSE_TO_SMPL[25];
 
 // ============================================================
 // Helper (template): joints from mesh forward (slow but consistent with mesh)
-// Used for 3D unit test / debug, NOT recommended for 2D optimization.
 // ============================================================
 template <typename T>
 inline void SMPLJointsFromMeshForward(
@@ -123,123 +132,11 @@ struct PoseRegularizer {
     double lambda_;
 };
 
-struct AnatomicalLimitResidual {
-    AnatomicalLimitResidual(int joint_idx, int axis,
-                            double min_angle, double max_angle, double weight)
-        : joint_idx_(joint_idx),
-          axis_(axis),
-          min_a_(min_angle),
-          max_a_(max_angle),
-          weight_(weight) {}
-    template <typename T>
-    bool operator()(const T* const theta, T* residual) const {
-        const T angle = theta[joint_idx_ * 3 + axis_];
-        residual[0] = T(0);
-        if (angle < T(min_a_)) residual[0] = T(weight_) * (T(min_a_) - angle);
-        else if (angle > T(max_a_)) residual[0] = T(weight_) * (angle - T(max_a_));
-        return true;
-    }
-    int joint_idx_;
-    int axis_;
-    double min_a_, max_a_, weight_;
-};
-
-// ------------------------------
-// 2D reprojection residual (FAST):
-// - uses SMPLJointsForward (FK-only) for speed
-// - supports stable joint filtering + y-flip projection
-// Residual dim: 2 * NumUsedKeypoints()
-// Parameter blocks: beta(10), theta(72), trans(3)
-// ------------------------------
-struct AllKeypointsReprojectionResidual {
-    AllKeypointsReprojectionResidual(
-        const std::vector<Landmark2D>& observed,
-        const CameraIntrinsics& cam,
-        const SmplModel& model,
-        bool use_pose_blendshapes,
-        float min_confidence,
-        bool use_stable_only,
-        bool flip_y
-    )
-    : camera_(cam),
-      model_(model),
-      use_pose_blendshapes_(use_pose_blendshapes),
-      flip_y_(flip_y)
-    {
-        // stable joints: 1,2,3,4,5,6,7,8,9,10,11,12,13,14
-        std::array<bool,25> allowed{};
-        allowed.fill(true);
-        if (use_stable_only) {
-            allowed.fill(false);
-            int ids[] = {1,2,3,4,5,6,7,8,9,10,11,12,13,14};
-            for (int id : ids) allowed[id] = true;
-        }
-
-        lms_.reserve(observed.size());
-        smpl_ids_.reserve(observed.size());
-
-        for (const auto& lm : observed) {
-            if (lm.confidence < min_confidence) continue;
-            if (lm.joint_id < 0 || lm.joint_id >= 25) continue;
-            if (!allowed[lm.joint_id]) continue;
-
-            const int sid = OPENPOSE_TO_SMPL[lm.joint_id];
-            if (sid < 0 || sid >= model_.J) continue;
-
-            lms_.push_back(lm);
-            smpl_ids_.push_back(sid);
-        }
-    }
-
-    int NumUsedKeypoints() const { return static_cast<int>(lms_.size()); }
-
-    template <typename T>
-    bool operator()(T const* const* parameters, T* residuals) const
-    {
-        const T* beta  = parameters[0];
-        const T* theta = parameters[1];
-        const T* trans = parameters[2];
-
-        // FAST: joints-only FK
-        Eigen::Matrix<T, Eigen::Dynamic, 3, Eigen::RowMajor> Jw;
-        SMPLJointsForward<T>(beta, theta, trans, model_, Jw);
-
-        for (int i = 0; i < static_cast<int>(lms_.size()); ++i) {
-            const int jid = smpl_ids_[i];
-
-            const T X = Jw(jid, 0);
-            const T Y = Jw(jid, 1);
-            T       Z = Jw(jid, 2);
-            if (Z < T(1e-6)) Z = T(1e-6);
-
-            const T u = T(camera_.fx) * (X / Z) + T(camera_.cx);
-            const T v = T(camera_.fy) * ((flip_y_ ? -Y : Y) / Z) + T(camera_.cy);
-
-            const float c = std::max(1e-6f, lms_[i].confidence);
-            const T wconf = ceres::sqrt(T(c)); // sqrt(conf) 比 conf 稳
-            residuals[2*i + 0] = wconf * (u - T(lms_[i].x));
-            residuals[2*i + 1] = wconf * (v - T(lms_[i].y));
-        }
-
-        return true;
-    }
-
-private:
-    std::vector<Landmark2D> lms_;
-    std::vector<int> smpl_ids_;
-
-    CameraIntrinsics camera_;
-    const SmplModel& model_;
-    bool use_pose_blendshapes_;
-    bool flip_y_;
-};
-
 struct RootUprightResidual {
     explicit RootUprightResidual(double w_) : w(w_) {}
     template <typename T>
     bool operator()(const T* const theta, T* residuals) const {
-        // theta[0:3] is root angle-axis
-        const T* aa = theta; // root
+        const T* aa = theta; // root axis-angle
         const T up[3] = {T(0), T(1), T(0)};
         T up_rot[3];
         ceres::AngleAxisRotatePoint(aa, up, up_rot);
@@ -272,27 +169,16 @@ struct HingeAxisResidual {
         Eigen::Matrix<T,3,1> r(theta[base+0], theta[base+1], theta[base+2]);
         Eigen::Matrix<T,3,1> u(T(u_.x()), T(u_.y()), T(u_.z()));
 
-        // parallel component (hinge DOF)
         const T a = u.dot(r);
-        // perpendicular component (forbidden twist/swing)
         Eigen::Matrix<T,3,1> perp = r - u * a;
 
-        // smooth norm to avoid nondiff at 0
         const T perp_norm = ceres::sqrt(perp.squaredNorm() + T(1e-12));
         residual[0] = T(w_perp_) * perp_norm;
 
-        // range clamp on a (hard constraints)
-        //T range_pen = T(0);
-        //if (a < T(min_a_)) range_pen = T(min_a_) - a;
-        //else if (a > T(max_a_)) range_pen = a - T(max_a_);
-        //residual[1] = T(w_range_) * range_pen;
-        
-        // Soft penalty: quadratic energy that increases toward boundaries
-        // Center of comfortable range, with smooth penalty toward extremes
+        // soft range penalty (normalized)
         const T center = T((min_a_ + max_a_) / 2.0);
         const T half_range = T((max_a_ - min_a_) / 2.0);
-        const T deviation = (a - center) / half_range;  // normalized: 0 at center, ±1 at boundaries
-        // Quadratic penalty: small in middle, grows near boundaries
+        const T deviation = (a - center) / half_range;
         residual[1] = T(w_range_) * deviation * deviation;
 
         return true;
@@ -303,7 +189,6 @@ struct HingeAxisResidual {
     double w_perp_, w_range_, min_a_, max_a_;
 };
 
-// Soft ball-joint angle limit: penalize only when |axis-angle| exceeds amax
 struct SoftAngleLimitResidual {
     SoftAngleLimitResidual(int joint_idx, double amax, double w)
         : j_(joint_idx), amax_(amax), w_(w) {}
@@ -318,7 +203,6 @@ struct SoftAngleLimitResidual {
         const T ang = ceres::sqrt(rx*rx + ry*ry + rz*rz + T(1e-12));
         const T over = ang - T(amax_);
 
-        // smooth max(0, over)
         const T abs_over = ceres::sqrt(over * over + T(1e-12));
         const T max0 = (abs_over + over) * T(0.5);
 
@@ -328,6 +212,88 @@ struct SoftAngleLimitResidual {
 
     int j_;
     double amax_, w_;
+};
+
+// ------------------------------
+// 2D reprojection residual (FAST-ish):
+// - prefilters observed keypoints (once in ctor)
+// - evaluates SMPLJointsForward once per residual eval
+// Residual dim: 2 * K
+// Parameter blocks: beta(10), theta(72), trans(3)
+// ------------------------------
+struct AllKeypointsReprojectionResidual {
+    AllKeypointsReprojectionResidual(
+        const std::vector<Landmark2D>& observed,
+        const CameraIntrinsics& cam,
+        const SmplModel& model,
+        float min_confidence,
+        bool use_stable_only,
+        bool flip_y
+    )
+    : camera_(cam),
+      model_(model),
+      flip_y_(flip_y)
+    {
+        std::array<bool,25> allowed{};
+        allowed.fill(true);
+        if (use_stable_only) {
+            allowed.fill(false);
+            int ids[] = {1,2,3,4,5,6,7,8,9,10,11,12,13,14};
+            for (int id : ids) allowed[id] = true;
+        }
+
+        lms_.reserve(observed.size());
+        smpl_ids_.reserve(observed.size());
+
+        for (const auto& lm : observed) {
+            if (lm.confidence < min_confidence) continue;
+            if (lm.joint_id < 0 || lm.joint_id >= 25) continue;
+            if (!allowed[lm.joint_id]) continue;
+
+            const int sid = OPENPOSE_TO_SMPL[lm.joint_id];
+            if (sid < 0 || sid >= model_.J) continue;
+
+            lms_.push_back(lm);
+            smpl_ids_.push_back(sid);
+        }
+    }
+
+    int NumUsedKeypoints() const { return static_cast<int>(lms_.size()); }
+
+    template <typename T>
+    bool operator()(const T* const beta,
+                    const T* const theta,
+                    const T* const trans,
+                    T* residuals) const
+    {
+        Eigen::Matrix<T, Eigen::Dynamic, 3, Eigen::RowMajor> Jw;
+        SMPLJointsForward<T>(beta, theta, trans, model_, Jw);
+
+        for (int i = 0; i < (int)lms_.size(); ++i) {
+            const int jid = smpl_ids_[i];
+
+            const T X = Jw(jid, 0);
+            const T Y = Jw(jid, 1);
+            T       Z = Jw(jid, 2);
+            if (Z < T(1e-6)) Z = T(1e-6);
+
+            const T u = T(camera_.fx) * (X / Z) + T(camera_.cx);
+            const T v = T(camera_.fy) * ((flip_y_ ? -Y : Y) / Z) + T(camera_.cy);
+
+            const float c = std::max(1e-6f, lms_[i].confidence);
+            const T wconf = ceres::sqrt(T(c));
+            residuals[2*i + 0] = wconf * (u - T(lms_[i].x));
+            residuals[2*i + 1] = wconf * (v - T(lms_[i].y));
+        }
+        return true;
+    }
+
+private:
+    std::vector<Landmark2D> lms_;
+    std::vector<int> smpl_ids_;
+    CameraIntrinsics camera_;
+    const SmplModel& model_;
+    bool flip_y_;
 };
 
 // ------------------------------
@@ -372,7 +338,6 @@ struct Joints3DResidualFast {
                     const T* const theta,
                     const T* const trans,
                     T* residuals) const {
-        // Use joints-only forward (FK + cached regressor), no 6890-vert mesh
        Eigen::Matrix<T, Eigen::Dynamic, 3, Eigen::RowMajor> J_pred;
        SMPLJointsForward<T>(beta, theta, trans, model, J_pred);
 
@@ -388,21 +353,16 @@ struct Joints3DResidualFast {
     double w;
 };
 
-
 // ------------------------------
 // Depth residual: constrain Z coordinate of joints
+// Residual dim: NumDepthPoints()
+// Parameter blocks: beta(10), theta(72), trans(3)
 // ------------------------------
-struct JointDepthData {
-    int smpl_joint_idx;
-    double depth_z;  // GT depth (Z coordinate)
-};
-
 struct DepthResidual {
     DepthResidual(const std::vector<JointDepthData>& depth_data_,
                   const SmplModel& model_,
-                  double w_,
-                  bool use_pose_blendshapes_)
-        : depth_data(depth_data_), model(model_), w(w_), use_pose_blendshapes(use_pose_blendshapes_) {}
+                  double w_)
+        : depth_data(depth_data_), model(model_), w(w_) {}
 
     int NumDepthPoints() const { return static_cast<int>(depth_data.size()); }
 
@@ -412,12 +372,12 @@ struct DepthResidual {
                     const T* const trans,
                     T* residuals) const {
         Eigen::Matrix<T, Eigen::Dynamic, 3, Eigen::RowMajor> J_pred;
-        SMPLJointsForward<T>(beta, theta, trans, model, J_pred);  // Fast version
+        SMPLJointsForward<T>(beta, theta, trans, model, J_pred);
 
         for (int i = 0; i < NumDepthPoints(); ++i) {
             int j = depth_data[i].smpl_joint_idx;
-            T z_pred = J_pred(j, 2);  // predicted Z
-            T z_gt = T(depth_data[i].depth_z);  // GT Z
+            T z_pred = J_pred(j, 2);
+            T z_gt = T(depth_data[i].depth_z);
             residuals[i] = T(w) * (z_pred - z_gt);
         }
         return true;
@@ -426,7 +386,6 @@ struct DepthResidual {
     std::vector<JointDepthData> depth_data;
     const SmplModel& model;
     double w;
-    bool use_pose_blendshapes;
 };
 
 // ------------------------------

@@ -1,3 +1,5 @@
+#define EIGEN_STACK_ALLOCATION_LIMIT 1000000
+
 #include "optimizer.h"
 #include <thread>
 #include <ceres/ceres.h>
@@ -154,12 +156,23 @@ bool OptimizeSMPL(
                 nullptr, theta
             );
         }
+        // Depth constraint (if enabled)
+        if (config.use_depth && config.depth_data != nullptr) {
+            problem.AddResidualBlock(
+                new ceres::AutoDiffCostFunction<DepthResidual, ceres::DYNAMIC, 10, 72, 3>(
+                    new DepthResidual(*config.depth_data, model, config.w_depth, true),
+                    static_cast<int>(config.depth_data->size())
+                ),
+                nullptr, beta, theta, trans
+            );
+        }
 
         // hinge constraints (keep)
         const double hinge_lock_weight = 100.0; 
         const double limit_weight = 50.0;
 
         const double root_upright_w = 10.0; 
+
         problem.AddResidualBlock(
             new ceres::AutoDiffCostFunction<RootUprightResidual, 2, 72>(
                 new RootUprightResidual(root_upright_w)),
@@ -183,10 +196,10 @@ bool OptimizeSMPL(
                     /*min_a=*/0.0, /*max_a=*/2.6);
         }
 
-        // elbows (joint ids 18,19) 
+        // elbows (joint ids 18,19) - 降低权重让手肘更自由
         for (int e : {18, 19}) {
             add_hinge(e, HINGE_X,
-                    /*w_perp=*/300.0, /*w_range=*/80.0,
+                    /*w_perp=*/60.0, /*w_range=*/30.0,
                     /*min_a=*/-2.6, /*max_a=*/0.1);
         }
 
@@ -216,6 +229,17 @@ bool OptimizeSMPL(
             config,
             new ceres::HuberLoss(2.0)
         );
+
+        // Depth constraint (if enabled)
+        if (config.use_depth && config.depth_data != nullptr) {
+            problem.AddResidualBlock(
+                new ceres::AutoDiffCostFunction<DepthResidual, ceres::DYNAMIC, 10, 72, 3>(
+                    new DepthResidual(*config.depth_data, model, config.w_depth, true),
+                    static_cast<int>(config.depth_data->size())
+                ),
+                nullptr, beta, theta, trans
+            );
+        }
 
         // shape reg
         const double shape_reg_weight = 80.0;
@@ -250,6 +274,7 @@ bool OptimizeSMPL(
                 nullptr, theta
             );
         };
+
 
         // Stage3: weaker hinge than stage2
         Eigen::Vector3d HINGE_X(1,0,0);

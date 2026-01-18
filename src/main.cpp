@@ -186,7 +186,7 @@ static std::vector<Landmark2D> GenerateSyntheticLandmarks(
         if (Zc < 1e-6) Zc = 1e-6;
 
         float px = float(camera.fx * (X / Zc) + camera.cx);
-        float py = float(camera.fy * (Y / Zc) + camera.cy);
+        float py = float(camera.fy * (-Y / Zc) + camera.cy);  // flip Y to match optimizer
 
         landmarks.emplace_back(px, py, 1.0f, joint_id);
     }
@@ -237,6 +237,13 @@ void RunAMASSValidation(const SmplModel& model) {
     SMPLJointsFromMeshForward<double>(beta_gt, theta_gt, trans_gt, model, J_gt, /*use_pose_blendshapes=*/true);
     std::cout << "[GT] J_gt = " << J_gt.rows() << "x" << J_gt.cols() << "\n";
 
+    // Generate GT depth data (Z coordinate of each joint)
+    std::vector<JointDepthData> depth_gt;
+    for (int i = 0; i < 24; i++) {
+        depth_gt.push_back({i, J_gt(i, 2)});
+    }
+    std::cout << "[GT] Generated depth data for " << depth_gt.size() << " joints.\n";
+
     // Camera + synthetic observations
     CameraIntrinsics camera = CreateDefaultCamera(800, 800);
 
@@ -262,18 +269,37 @@ void RunAMASSValidation(const SmplModel& model) {
     SMPLForward<double>(beta_opt, theta_opt, trans_opt, model, V0);
     SaveOBJ("mesh_before_opt.obj", V0, model.faces);
 
-    // 3D optimizer config
+    // Optimizer config
     OptimizerConfig cfg;
     cfg.verbose = true;
     cfg.amass_unit_test = true;
-    cfg.unit_test_exact = true;  
+    cfg.unit_test_exact = true;
     cfg.w_3d = 1.0;
 
-    bool ok = OptimizeSMPL3D(J_gt, model, beta_opt, theta_opt, trans_opt, cfg);
-    if (!ok) {
-        std::cerr << "[Error] OptimizeSMPL3D failed.\n";
+    // Enable depth constraint for 2D optimization
+    cfg.use_depth = true;
+    cfg.w_depth = 50.0;
+    cfg.depth_data = &depth_gt;
+
+    bool use_3d_optimization = false; 
+
+    if (use_3d_optimization){
+        std::cout << "[Info] Running OptimizeSMPL3D...\n";
+        bool ok = OptimizeSMPL3D(J_gt, model, beta_opt, theta_opt, trans_opt, cfg);
+        if (!ok) {
+            std::cerr << "[Error] OptimizeSMPL3D failed.\n";
         return;
+        }
+    } else{
+        std::cout << "[Info] Running OptimizeSMPL...\n";
+        bool ok = OptimizeSMPL(observed_landmarks, camera, model, beta_opt, theta_opt, trans_opt, cfg);
+        if (!ok) {
+            std::cerr << "[Error] OptimizeSMPL failed.\n";
+            return;
+        }
     }
+
+   
 
     // after
     Eigen::Matrix<double, Eigen::Dynamic, 3, Eigen::RowMajor> J_fit;
@@ -377,10 +403,10 @@ int main() {
     model.LoadFromNPZ("../../Data/models/smpl_neutral.npz");
 
     // Mode 1: Validation (Check if algorithm works on AMASS)
-    //RunAMASSValidation(model);
+    RunAMASSValidation(model);
 
     // Mode 2: Real Data (Uncomment to run)
-    RunOpenPoseInference(model);
+    //RunOpenPoseInference(model);
 
     return 0;
 }

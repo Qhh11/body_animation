@@ -38,6 +38,8 @@ struct CameraIntrinsics {
         : fx(fx_), fy(fy_), cx(cx_), cy(cy_), width(w_), height(h_) {}
 };
 
+struct JointDepthData;  // forward declaration
+
 struct OptimizerConfig {
     bool verbose = true;
 
@@ -46,6 +48,11 @@ struct OptimizerConfig {
     bool use_stable_joints_only = true; // 只用躯干+四肢（更稳）
     bool flip_y_in_projection = true;   // v = fy * (-Y/Z) + cy
     int root_free_axis = 1;             // Stage1 只放开一个root轴：0/1/2试哪个最稳（默认1）
+
+    // ---------- Depth constraint ----------
+    bool use_depth = false;
+    double w_depth = 50.0;
+    const std::vector<JointDepthData>* depth_data = nullptr;
 
     // ---------- 3D unit test ----------
     bool amass_unit_test = false;
@@ -274,11 +281,20 @@ struct HingeAxisResidual {
         const T perp_norm = ceres::sqrt(perp.squaredNorm() + T(1e-12));
         residual[0] = T(w_perp_) * perp_norm;
 
-        // range clamp on a
-        T range_pen = T(0);
-        if (a < T(min_a_)) range_pen = T(min_a_) - a;
-        else if (a > T(max_a_)) range_pen = a - T(max_a_);
-        residual[1] = T(w_range_) * range_pen;
+        // range clamp on a (hard constraints)
+        //T range_pen = T(0);
+        //if (a < T(min_a_)) range_pen = T(min_a_) - a;
+        //else if (a > T(max_a_)) range_pen = a - T(max_a_);
+        //residual[1] = T(w_range_) * range_pen;
+        
+        // Soft penalty: quadratic energy that increases toward boundaries
+        // Center of comfortable range, with smooth penalty toward extremes
+        const T center = T((min_a_ + max_a_) / 2.0);
+        const T half_range = T((max_a_ - min_a_) / 2.0);
+        const T deviation = (a - center) / half_range;  // normalized: 0 at center, ±1 at boundaries
+        // Quadratic penalty: small in middle, grows near boundaries
+        residual[1] = T(w_range_) * deviation * deviation;
+
         return true;
     }
 
@@ -315,6 +331,46 @@ struct Joints3DResidual {
     }
 
     MatX3dRM J_obs;
+    const SmplModel& model;
+    double w;
+    bool use_pose_blendshapes;
+};
+
+// ------------------------------
+// Depth residual: constrain Z coordinate of joints
+// ------------------------------
+struct JointDepthData {
+    int smpl_joint_idx;
+    double depth_z;  // GT depth (Z coordinate)
+};
+
+struct DepthResidual {
+    DepthResidual(const std::vector<JointDepthData>& depth_data_,
+                  const SmplModel& model_,
+                  double w_,
+                  bool use_pose_blendshapes_)
+        : depth_data(depth_data_), model(model_), w(w_), use_pose_blendshapes(use_pose_blendshapes_) {}
+
+    int NumDepthPoints() const { return static_cast<int>(depth_data.size()); }
+
+    template <typename T>
+    bool operator()(const T* const beta,
+                    const T* const theta,
+                    const T* const trans,
+                    T* residuals) const {
+        Eigen::Matrix<T, Eigen::Dynamic, 3, Eigen::RowMajor> J_pred;
+        SMPLJointsForward<T>(beta, theta, trans, model, J_pred);  // Fast version
+
+        for (int i = 0; i < NumDepthPoints(); ++i) {
+            int j = depth_data[i].smpl_joint_idx;
+            T z_pred = J_pred(j, 2);  // predicted Z
+            T z_gt = T(depth_data[i].depth_z);  // GT Z
+            residuals[i] = T(w) * (z_pred - z_gt);
+        }
+        return true;
+    }
+
+    std::vector<JointDepthData> depth_data;
     const SmplModel& model;
     double w;
     bool use_pose_blendshapes;

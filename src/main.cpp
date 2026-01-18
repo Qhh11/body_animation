@@ -174,7 +174,7 @@ static std::vector<Landmark2D> GenerateSyntheticLandmarks(
     landmarks.reserve(25);
 
     Eigen::Matrix<double, Eigen::Dynamic, 3, Eigen::RowMajor> Jw;
-    SMPLJointsFromMeshForward<double>(beta, theta, trans, model, Jw, use_pose_blendshapes);
+    SMPLJointsForward<double>(beta, theta, trans, model, Jw);
 
     for (int joint_id = 0; joint_id < 25; ++joint_id) {
         int smpl_joint_id = OPENPOSE_TO_SMPL[joint_id];
@@ -206,7 +206,7 @@ void RunAMASSValidation(const SmplModel& model) {
     std::cout << "\n=== MODE 1: Running AMASS Validation (Real AMASS Data) ===\n";
 
 
-    std::string amass_path = "../../Data/CMU/01/01_01_poses_formatted.txt";
+    std::string amass_path = "../../Data/CMU/02/02_09_poses_formatted.txt";
     std::vector<AmassFrame> amass_frames;
     if (!AmassLoader::Load(amass_path, amass_frames)) return;
     if (amass_frames.empty()) return;
@@ -234,7 +234,7 @@ void RunAMASSValidation(const SmplModel& model) {
     std::cout << "[GT] Using AMASS Frame " << frame_idx << " as Ground Truth.\n";
 
     Eigen::Matrix<double, Eigen::Dynamic, 3, Eigen::RowMajor> J_gt;
-    SMPLJointsFromMeshForward<double>(beta_gt, theta_gt, trans_gt, model, J_gt, /*use_pose_blendshapes=*/true);
+    SMPLJointsForward<double>(beta_gt, theta_gt, trans_gt, model, J_gt);
     std::cout << "[GT] J_gt = " << J_gt.rows() << "x" << J_gt.cols() << "\n";
 
     // Generate GT depth data (Z coordinate of each joint)
@@ -281,7 +281,7 @@ void RunAMASSValidation(const SmplModel& model) {
     cfg.w_depth = 50.0;
     cfg.depth_data = &depth_gt;
 
-    bool use_3d_optimization = false; 
+    bool use_3d_optimization = true; 
 
     if (use_3d_optimization){
         std::cout << "[Info] Running OptimizeSMPL3D...\n";
@@ -303,7 +303,7 @@ void RunAMASSValidation(const SmplModel& model) {
 
     // after
     Eigen::Matrix<double, Eigen::Dynamic, 3, Eigen::RowMajor> J_fit;
-    SMPLJointsFromMeshForward<double>(beta_opt, theta_opt, trans_opt, model, J_fit,/*use_pose_blendshapes=*/true);
+    SMPLJointsForward<double>(beta_opt, theta_opt, trans_opt, model, J_fit); 
 
     std::cout << "[AMASS] mean joint L2 error = "
             << (J_fit - J_gt).rowwise().norm().mean() << " m\n";

@@ -1,8 +1,8 @@
 import numpy as np
 import os
 
-input_path = '../Data/CMU/01/01_01_poses.npz'
-output_path = '../Data/CMU/01/01_01_poses_formatted.txt'
+input_path = '../Data/CMU/06/06_09_poses.npz'
+output_path = '../Data/CMU/06/06_09_poses_formatted.txt'
 
 print(f"Loading {input_path}...")
 

@@ -336,6 +336,33 @@ struct Joints3DResidual {
     bool use_pose_blendshapes;
 };
 
+// 3D joints residual (FAST, no mesh)
+struct Joints3DResidualFast {
+    Joints3DResidualFast(const MatX3dRM& J_obs_, const SmplModel& model_, double w_)
+        : J_obs(J_obs_), model(model_), w(w_) {}
+
+    template <typename T>
+    bool operator()(const T* const beta,
+                    const T* const theta,
+                    const T* const trans,
+                    T* residuals) const {
+        // Use joints-only forward (FK + cached regressor), no 6890-vert mesh
+       Eigen::Matrix<T, Eigen::Dynamic, 3, Eigen::RowMajor> J_pred;
+       SMPLJointsForward<T>(beta, theta, trans, model, J_pred);
+
+        for (int i = 0; i < 24; ++i) {
+            residuals[3*i+0] = T(w) * (J_pred(i,0) - T(J_obs(i,0)));
+            residuals[3*i+1] = T(w) * (J_pred(i,1) - T(J_obs(i,1)));
+            residuals[3*i+2] = T(w) * (J_pred(i,2) - T(J_obs(i,2)));
+        }
+        return true;
+    }
+    MatX3dRM J_obs;
+    const SmplModel& model;
+    double w;
+};
+
+
 // ------------------------------
 // Depth residual: constrain Z coordinate of joints
 // ------------------------------

@@ -315,6 +315,19 @@ static void AddJoints3DBlock(
     problem.AddResidualBlock(cost, loss, beta, theta, trans);
 }
 
+static void AddJoints3DBlockFast(
+    ceres::Problem& problem,
+    const MatX3dRM& J_obs,
+    const SmplModel& model,
+    double* beta, double* theta, double* trans,
+    double w,
+    ceres::LossFunction* loss
+) {
+    auto* functor = new Joints3DResidualFast(J_obs, model, w);
+    auto* cost = new ceres::AutoDiffCostFunction<Joints3DResidualFast, 72, 10, 72, 3>(functor);
+    problem.AddResidualBlock(cost, loss, beta, theta, trans);
+}
+
 bool OptimizeSMPL3D(const MatX3dRM& J_obs,
                     const SmplModel& model,
                     double* beta,
@@ -324,7 +337,7 @@ bool OptimizeSMPL3D(const MatX3dRM& J_obs,
     // Stage1: trans + root only
     {
         ceres::Problem problem;
-        AddJoints3DBlock(problem, J_obs, model, true, beta, theta, trans, config.w_3d, nullptr);
+        AddJoints3DBlockFast(problem, J_obs, model, beta, theta, trans, config.w_3d, nullptr);
         problem.SetParameterBlockConstant(beta);
 
         std::vector<int> const_idx;
@@ -342,7 +355,7 @@ bool OptimizeSMPL3D(const MatX3dRM& J_obs,
     // Stage2: full pose
     {
         ceres::Problem problem;
-        AddJoints3DBlock(problem, J_obs, model, true, beta, theta, trans, config.w_3d, nullptr);
+        AddJoints3DBlockFast(problem, J_obs, model, beta, theta, trans, config.w_3d, nullptr);
         problem.SetParameterBlockConstant(beta);
 
         const double pose_reg_w = config.unit_test_exact ? 1e-2 : 1e-3;

@@ -303,6 +303,32 @@ struct HingeAxisResidual {
     double w_perp_, w_range_, min_a_, max_a_;
 };
 
+// Soft ball-joint angle limit: penalize only when |axis-angle| exceeds amax
+struct SoftAngleLimitResidual {
+    SoftAngleLimitResidual(int joint_idx, double amax, double w)
+        : j_(joint_idx), amax_(amax), w_(w) {}
+
+    template <typename T>
+    bool operator()(const T* const theta, T* residual) const {
+        const int base = 3 * j_;
+        const T rx = theta[base + 0];
+        const T ry = theta[base + 1];
+        const T rz = theta[base + 2];
+
+        const T ang = ceres::sqrt(rx*rx + ry*ry + rz*rz + T(1e-12));
+        const T over = ang - T(amax_);
+
+        // smooth max(0, over)
+        const T abs_over = ceres::sqrt(over * over + T(1e-12));
+        const T max0 = (abs_over + over) * T(0.5);
+
+        residual[0] = T(w_) * max0;
+        return true;
+    }
+
+    int j_;
+    double amax_, w_;
+};
 
 // ------------------------------
 // 3D joints residual (used for AMASS unit test)

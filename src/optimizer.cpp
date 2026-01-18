@@ -167,6 +167,42 @@ bool OptimizeSMPL(
             );
         }
 
+        // ---- Shoulder / collar soft limits (energy) ----
+        const double w_shoulder_limit = 30.0;
+        const double w_collar_limit   = 20.0;
+
+        const double shoulder_amax = 2.0; // ~115 deg
+        const double collar_amax   = 1.0; // ~57 deg
+
+        for (int j : {13, 14}) {
+            problem.AddResidualBlock(
+                new ceres::AutoDiffCostFunction<SoftAngleLimitResidual, 1, 72>(
+                    new SoftAngleLimitResidual(j, collar_amax, w_collar_limit)),
+                nullptr, theta
+            );
+        }
+        for (int j : {16, 17}) {
+            problem.AddResidualBlock(
+                new ceres::AutoDiffCostFunction<SoftAngleLimitResidual, 1, 72>(
+                    new SoftAngleLimitResidual(j, shoulder_amax, w_shoulder_limit)),
+                nullptr, theta
+            );
+        }
+
+        // ---- Stronger local pose prior for shoulder/collar (energy, not hard) ----
+        auto add_pose_reg_joint = [&](int j, double w) {
+            for (int k = 0; k < 3; ++k) {
+                const int idx = 3 * j + k;
+                problem.AddResidualBlock(
+                    new ceres::AutoDiffCostFunction<PoseRegularizer, 1, 72>(
+                        new PoseRegularizer(idx, w)),
+                    nullptr, theta
+                );
+            }
+        };
+        // collars + shoulders stronger than generic pose reg
+        for (int j : {13,14,16,17}) add_pose_reg_joint(j, 5.0);
+
         // hinge constraints (keep)
         const double hinge_lock_weight = 100.0; 
         const double limit_weight = 50.0;
@@ -257,6 +293,42 @@ bool OptimizeSMPL(
                 new RootUprightResidual(root_upright_w)),
             nullptr, theta
         );
+
+         // ---- Shoulder / collar soft limits (energy) ----
+        const double w_shoulder_limit = 30.0;
+        const double w_collar_limit   = 20.0;
+
+        const double shoulder_amax = 2.0; // ~115 deg
+        const double collar_amax   = 1.0; // ~57 deg
+
+        for (int j : {13, 14}) {
+            problem.AddResidualBlock(
+                new ceres::AutoDiffCostFunction<SoftAngleLimitResidual, 1, 72>(
+                    new SoftAngleLimitResidual(j, collar_amax, w_collar_limit)),
+                nullptr, theta
+            );
+        }
+        for (int j : {16, 17}) {
+            problem.AddResidualBlock(
+                new ceres::AutoDiffCostFunction<SoftAngleLimitResidual, 1, 72>(
+                    new SoftAngleLimitResidual(j, shoulder_amax, w_shoulder_limit)),
+                nullptr, theta
+            );
+        }
+
+        // ---- Stronger local pose prior for shoulder/collar (energy, not hard) ----
+        auto add_pose_reg_joint = [&](int j, double w) {
+            for (int k = 0; k < 3; ++k) {
+                const int idx = 3 * j + k;
+                problem.AddResidualBlock(
+                    new ceres::AutoDiffCostFunction<PoseRegularizer, 1, 72>(
+                        new PoseRegularizer(idx, w)),
+                    nullptr, theta
+                );
+            }
+        };
+        // collars + shoulders stronger than generic pose reg
+        for (int j : {13,14,16,17}) add_pose_reg_joint(j, 5.0);
 
         // keep pose reg
         for (int i = 3; i < 72; ++i) {
@@ -358,7 +430,41 @@ bool OptimizeSMPL3D(const MatX3dRM& J_obs,
         AddJoints3DBlockFast(problem, J_obs, model, beta, theta, trans, config.w_3d, nullptr);
         problem.SetParameterBlockConstant(beta);
 
-        const double pose_reg_w = config.unit_test_exact ? 1e-2 : 1e-3;
+        // ---- Shoulder / collar soft limits (energy) ----
+        const double w_shoulder_limit = 30.0;
+        const double w_collar_limit   = 20.0;
+        const double shoulder_amax = 2.0;
+        const double collar_amax   = 1.0;
+
+        for (int j : {13, 14}) {
+            problem.AddResidualBlock(
+                new ceres::AutoDiffCostFunction<SoftAngleLimitResidual, 1, 72>(
+                    new SoftAngleLimitResidual(j, collar_amax, w_collar_limit)),
+                nullptr, theta
+            );
+        }
+        for (int j : {16, 17}) {
+            problem.AddResidualBlock(
+                new ceres::AutoDiffCostFunction<SoftAngleLimitResidual, 1, 72>(
+                    new SoftAngleLimitResidual(j, shoulder_amax, w_shoulder_limit)),
+                nullptr, theta
+            );
+        }
+
+        // ---- Stronger pose prior for collar/shoulder to reduce twist ambiguity ----
+        auto add_pose_reg_joint = [&](int j, double w) {
+            for (int k = 0; k < 3; ++k) {
+                const int idx = 3 * j + k;
+                problem.AddResidualBlock(
+                    new ceres::AutoDiffCostFunction<PoseRegularizer, 1, 72>(
+                        new PoseRegularizer(idx, w)),
+                    nullptr, theta
+                );
+            }
+        };
+        for (int j : {13,14,16,17}) add_pose_reg_joint(j, 5e-2);  // 3D里权重比2D小很多
+
+        const double pose_reg_w =1e-2;
         for (int i = 3; i < 72; ++i) {
             problem.AddResidualBlock(
                 new ceres::AutoDiffCostFunction<PoseRegularizer, 1, 72>(

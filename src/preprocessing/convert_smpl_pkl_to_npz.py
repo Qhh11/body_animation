@@ -6,8 +6,8 @@ import io
 import pickle
 import numpy as np
 
-PKL_PATH = "../../Data/models/SMPL_python_v.1.1-4.0/basicmodel_neutral_lbs_10_207_0_v1.1.0.pkl"
-OUT_NPZ  = "../../Data/models/smpl_neutral.npz"
+PKL_PATH = "/config/workspace/Exercises/Data/models/SMPL_python_v.1.1-4.0/basicmodel_neutral_lbs_10_207_0_v1.1.0.pkl"
+OUT_NPZ  = "/config/workspace/Exercises/Data/models/smpl_neutral.npz"
 
 
 def normalize_protocol0_newlines(raw: bytes) -> bytes:

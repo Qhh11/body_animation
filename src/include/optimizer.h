@@ -107,11 +107,11 @@ struct OptimizerConfig {
     // Optional tuning parameters (in meters and weights).
     double arm_torso_d_elbow = 0.08;
     double arm_torso_d_wrist = 0.10;
-    double arm_torso_w_elbow = 200.0;
+    double arm_torso_w_elbow = 80.0;
     double arm_torso_w_wrist = 120.0;
 
-    int arm_torso_seg_a = 6;  // spine2
-    int arm_torso_seg_b = 9;  // spine3
+    int arm_torso_seg_a = 3;  // spine2
+    int arm_torso_seg_b = 12;  // spine3
 
 
     // ---------- 3D unit test ----------
@@ -227,6 +227,56 @@ struct RootUprightResidual {
         return true;
     }
     double w;
+};
+struct ArmSegToTorsoSegFloorResidual {
+    ArmSegToTorsoSegFloorResidual(int arm_a, int arm_b,
+                                  int torso_a, int torso_b,
+                                  double dmin, double w,
+                                  const SmplModel& model_)
+        : aa(arm_a), ab(arm_b), ta(torso_a), tb(torso_b),
+          dmin(dmin), w(w), model(model_) {}
+
+    template <typename T>
+    bool operator()(const T* const beta,
+                    const T* const theta,
+                    const T* const trans,
+                    T* residual) const
+    {
+        Eigen::Matrix<T, Eigen::Dynamic, 3, Eigen::RowMajor> J;
+        SMPLJointsForward<T>(beta, theta, trans, model, J);
+
+        const Eigen::Matrix<T,3,1> A0 = J.row(aa).transpose();
+        const Eigen::Matrix<T,3,1> A1 = J.row(ab).transpose();
+        const Eigen::Matrix<T,3,1> B0 = J.row(ta).transpose();
+        const Eigen::Matrix<T,3,1> B1 = J.row(tb).transpose();
+
+        // torso segment projection helper
+        auto dist_point_to_seg = [&](const Eigen::Matrix<T,3,1>& P)->T{
+            const Eigen::Matrix<T,3,1> AB = B1 - B0;
+            const T ab2 = AB.squaredNorm() + T(1e-12);
+            T t = (P - B0).dot(AB) / ab2;
+            t = ceres::fmin(T(1), ceres::fmax(T(0), t));
+            const Eigen::Matrix<T,3,1> Q = B0 + t * AB;
+            return ceres::sqrt((P - Q).squaredNorm() + T(1e-12));
+        };
+
+        // sample along arm segment
+        const T ts[3] = {T(0.2), T(0.5), T(0.8)};
+        T sse = T(0);
+        for (int i=0;i<3;++i){
+            const Eigen::Matrix<T,3,1> P = A0 + ts[i]*(A1 - A0);
+            const T dist = dist_point_to_seg(P);
+            const T x = T(dmin) - dist;
+            const T viol = (ceres::abs(x) + x) * T(0.5); // max(0,x)
+            sse += viol * viol;
+        }
+        residual[0] = T(w) * ceres::sqrt(sse + T(1e-12));
+        return true;
+    }
+
+    int aa, ab, ta, tb;
+    double dmin, w;
+    const SmplModel& model;
 };
 
 // Coarse torso collision proxy: distance from a point joint to a torso segment (A-B).

@@ -255,38 +255,37 @@ static void AddBendLimitExpPriors(
     );
 }
 
-static void AddArmTorsoSeparation(
+static void AddArmTorsoSeparationCapsule(
     ceres::Problem& problem,
     const SmplModel& model,
     double* beta, double* theta, double* trans,
     const OptimizerConfig& cfg
-) {
+){
     if (!cfg.use_arm_torso_sep) return;
 
-    const int A = cfg.arm_torso_seg_a;
-    const int B = cfg.arm_torso_seg_b;
+    const int torsoA = 3;   // spine1
+    const int torsoB = 12;  // neck
 
-    const double d_elbow = cfg.arm_torso_d_elbow;
-    const double d_wrist = cfg.arm_torso_d_wrist;
+    // 这才是“胶囊厚度”的关键：dmin = r_torso + r_arm + margin
+    const double r_torso = 0.12;
+    const double r_uarm  = 0.06;
+    const double r_farm  = 0.05;
+    const double margin  = 0.01;
 
-    const double w_elbow = cfg.arm_torso_w_elbow;
-    const double w_wrist = cfg.arm_torso_w_wrist;
+    const double w = 300.0; // 先大一点，能明显顶出来
 
-    auto add = [&](int joint, double dmin, double w) {
+    auto add = [&](int a0,int a1,double dmin){
         problem.AddResidualBlock(
-            new ceres::AutoDiffCostFunction<PointToSegmentDistanceFloorResidual, 1, 10, 72, 3>(
-                new PointToSegmentDistanceFloorResidual(joint, A, B, dmin, w, model)),
+            new ceres::AutoDiffCostFunction<ArmSegToTorsoSegFloorResidual, 1, 10, 72, 3>(
+                new ArmSegToTorsoSegFloorResidual(a0,a1, torsoA,torsoB, dmin, w, model)),
             nullptr, beta, theta, trans
         );
     };
 
-    // elbows
-    add(18, d_elbow, w_elbow);
-    add(19, d_elbow, w_elbow);
-
-    // wrists (optional but fine)
-    add(20, d_wrist, w_wrist);
-    add(21, d_wrist, w_wrist);
+    add(16,18, r_torso + r_uarm + margin);
+    add(18,20, r_torso + r_farm + margin);
+    add(17,19, r_torso + r_uarm + margin);
+    add(19,21, r_torso + r_farm + margin);
 }
 
 
@@ -386,13 +385,13 @@ bool OptimizeSMPL(
         AddHingePriors(problem, config, model, beta, theta, trans);
         AddBendLimitExpPriors(problem, config, theta, axis_L_knee, axis_R_knee,axis_L_elb,  axis_R_elb);
 
-        AddArmTorsoSeparation(problem, model, beta, theta, trans, config);
+        AddArmTorsoSeparationCapsule(problem, model, beta, theta, trans, config);
 
         // Shoulder / collar soft limits
-        const double w_shoulder_limit = 30.0;
-        const double w_collar_limit   = 20.0;
-        const double shoulder_amax = 2.0;
-        const double collar_amax   = 1.0;
+        const double w_shoulder_limit = 60.0;
+        const double w_collar_limit   = 40.0;
+        const double shoulder_amax = 1.7;
+        const double collar_amax   = 0.8;
 
         for (int j : {13, 14}) {
             problem.AddResidualBlock(
@@ -502,7 +501,7 @@ bool OptimizeSMPL(
             );
         }
 
-        AddArmTorsoSeparation(problem, model, beta, theta, trans, config);
+        AddArmTorsoSeparationCapsule(problem, model, beta, theta, trans, config);
 
         problem.SetParameterLowerBound(trans, 2, 0.5);
         problem.SetParameterUpperBound(trans, 2, 20.0);
@@ -571,8 +570,6 @@ bool OptimizeSMPL3D(const MatX3dRM& J_obs,
 
         std::cout << "[Dbg] bend axes: knee(L/R)=" << axis_L_knee << "/" << axis_R_knee
                 << " elbow(L/R)=" << axis_L_elb << "/" << axis_R_elb << "\n";
-
-        AddDiagonalPosePriorBlock_AutoDiff(problem, config, theta);
         AddHingePriors(problem, config, model, beta, theta, trans);
         AddBendLimitExpPriors(problem, config, theta, axis_L_knee, axis_R_knee,axis_L_elb,  axis_R_elb);
         AddSpineSoftLimits(problem, theta);

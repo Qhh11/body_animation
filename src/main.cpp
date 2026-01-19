@@ -21,10 +21,41 @@ void SaveOBJ(const std::string& filename,
              const Eigen::Matrix<double, Eigen::Dynamic, 3, Eigen::RowMajor>& vertices,
              const Eigen::MatrixXi& faces);
 
-// Global GMM pose prior (loaded once, used by all functions)
-static GMMPosePrior g_gmm_prior;
-
 namespace {
+static DiagonalPosePrior69 BuildPosePriorFromAmassFrames(
+    const std::vector<AmassFrame>& frames,
+    int stride = 5,
+    double min_std = 0.15
+) {
+    DiagonalPosePrior69 prior;
+    std::array<double, 69> mean{};
+    std::array<double, 69> m2{};
+    int n = 0;
+
+    for (int t = 0; t < (int)frames.size(); t += std::max(1, stride)) {
+        const auto& th = frames[t].theta; // expects theta[72]
+        n++;
+        for (int i = 0; i < 69; ++i) {
+            const double x = th[3 + i];
+            const double delta = x - mean[i];
+            mean[i] += delta / (double)n;
+            const double delta2 = x - mean[i];
+            m2[i] += delta * delta2;
+        }
+    }
+
+    for (int i = 0; i < 69; ++i) {
+        const double var = (n > 1) ? (m2[i] / (double)(n - 1)) : 1.0;
+        const double stdv = std::max(min_std, std::sqrt(std::max(1e-12, var)));
+        prior.mean[i] = mean[i];
+        prior.inv_std[i] = 1.0 / stdv;
+    }
+
+    prior.ready = true;
+    return prior;
+}
+
+
 
 static void EstimateGlobalTranslationXY(
     const std::vector<Landmark2D>& landmarks,
@@ -220,7 +251,7 @@ double RunAMASSValidation(const SmplModel& model, const std::string& amass_path,
     if (frame_idx >= (int)amass_frames.size()) {
         frame_idx = (int)amass_frames.size() - 1;
     }
-
+    
     const AmassFrame& frame_gt = amass_frames[frame_idx];
 
     double beta_gt[10];
@@ -233,7 +264,7 @@ double RunAMASSValidation(const SmplModel& model, const std::string& amass_path,
     trans_gt[0] = 0.0;
     trans_gt[1] = 0.0;
     trans_gt[2] = 3.0;
-
+    
     Eigen::Matrix<double, 72, 1> pose72;   // axis-angle, 72
     Eigen::Matrix<double, 10, 1> betas10;  // 10
     Eigen::Vector3d trans3;                // 3
@@ -288,27 +319,38 @@ double RunAMASSValidation(const SmplModel& model, const std::string& amass_path,
         SaveOBJ(base_name + "_mesh_init.obj", V0, model.faces);
     }
 
+    DiagonalPosePrior69 prior = BuildPosePriorFromAmassFrames(amass_frames, /*stride=*/5);
+
     // Optimizer config
     OptimizerConfig cfg;
-    cfg.verbose = false;  // 批量测试时关闭详细输出
+    cfg.verbose = true;
     cfg.amass_unit_test = true;
     cfg.unit_test_exact = true;
     cfg.w_3d = 1.0;
 
-    // Enable depth constraint for 2D optimization
     cfg.use_depth = true;
     cfg.w_depth = 50.0;
     cfg.depth_data = &depth_gt;
 
-    // Enable GMM pose prior
-    if (g_gmm_prior.loaded) {
-        cfg.use_gmm_prior = true;
-        cfg.w_gmm = 1.0;
-        cfg.gmm_prior = &g_gmm_prior;
-        std::cout << "[Config] Using GMM pose prior\n";
-    } else {
-        std::cout << "[Config] Using L2 pose prior (GMM not loaded)\n";
-    }
+    // Use our own diagonal pose prior (no external GMM)
+    cfg.use_pose_prior = true;
+    cfg.w_pose_prior = 0.8;      // you can tune: 0.3 ~ 2.0
+    cfg.pose_prior = &prior;
+
+    // Strongly recommend hinge priors to suppress twist
+    cfg.use_hinge_priors = true;
+    cfg.use_bend_limits = true;
+    cfg.w_bend = 0.05;            // small, hinge already constrains a lot
+    cfg.w_hinge_perp_elbow  = 30.0;
+    cfg.w_hinge_range_elbow = 10.0;
+
+    // Root upright should be mild, otherwise torso compensates
+    cfg.use_root_upright = true;
+    cfg.root_upright_w_stage2 = 0.5;
+    cfg.root_upright_w_stage3 = 0.0;
+
+    // Arm torso seperation
+    cfg.use_arm_torso_sep = true;
 
     bool use_3d_optimization = false;
 
@@ -390,8 +432,7 @@ void RunOpenPoseInference(const SmplModel& model) {
     cfg.verbose = true;
     cfg.min_confidence = 0.20f;
     cfg.use_stable_joints_only = true;    
-    cfg.flip_y_in_projection = true;     
-    cfg.root_free_axis = 1;               
+    cfg.flip_y_in_projection = true;                   
 
     const bool ok = OptimizeSMPL(lms, camera, model, beta, theta, trans, cfg);
     if (!ok) {
@@ -480,13 +521,14 @@ void RunBatchValidation(const SmplModel& model) {
     }
 }
 
+
+
 int main(int argc, char** argv) {
     google::InitGoogleLogging("SMPL_Optimizer");
     std::cout << ">>> Start SMPL Project..." << std::endl;
 
     SmplModel model;
     model.LoadFromNPZ("../../Data/models/smpl_neutral.npz");
-    g_gmm_prior.LoadFromNPZ("../../Data/models/gmm_08.npz");
 
     if (argc > 1) {
         std::string arg1 = argv[1];

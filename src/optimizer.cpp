@@ -557,25 +557,43 @@ bool OptimizeSMPL3D(const MatX3dRM& J_obs,
         if (config.verbose) std::cout << "[3D Stage1] " << summary.BriefReport() << "\n";
     }
 
-    // Stage2: full pose (+ priors)
+    // Stage2: full pose
     {
         ceres::Problem problem;
         AddJoints3DBlockFast(problem, J_obs, model, beta, theta, trans, config.w_3d, nullptr);
         problem.SetParameterBlockConstant(beta);
-        // Detect dominant bend axes for knees and elbows.
-        const int axis_L_knee = DetectDominantAxisForChild(model, beta, theta, trans, 4, 7);
-        const int axis_R_knee = DetectDominantAxisForChild(model, beta, theta, trans, 5, 8);
-        const int axis_L_elb  = DetectDominantAxisForChild(model, beta, theta, trans, 18, 20);
-        const int axis_R_elb  = DetectDominantAxisForChild(model, beta, theta, trans, 19, 21);
 
-        std::cout << "[Dbg] bend axes: knee(L/R)=" << axis_L_knee << "/" << axis_R_knee
-                << " elbow(L/R)=" << axis_L_elb << "/" << axis_R_elb << "\n";
-        AddHingePriors(problem, config, model, beta, theta, trans);
-        AddBendLimitExpPriors(problem, config, theta, axis_L_knee, axis_R_knee,axis_L_elb,  axis_R_elb);
-        AddSpineSoftLimits(problem, theta);
+        const double w_shoulder_limit = 30.0;
+        const double w_collar_limit   = 20.0;
+        const double shoulder_amax = 2.0;
+        const double collar_amax   = 1.0;
+
+        for (int j : {13, 14}) {
+            problem.AddResidualBlock(
+                new ceres::AutoDiffCostFunction<SoftAngleLimitResidual, 1, 72>(
+                    new SoftAngleLimitResidual(j, collar_amax, w_collar_limit)),
+                nullptr, theta
+            );
+        }
+        for (int j : {16, 17}) {
+            problem.AddResidualBlock(
+                new ceres::AutoDiffCostFunction<SoftAngleLimitResidual, 1, 72>(
+                    new SoftAngleLimitResidual(j, shoulder_amax, w_shoulder_limit)),
+                nullptr, theta
+            );
+        }
+
+        const double pose_reg_w = 1e-2;
+        for (int i = 3; i < 72; ++i) {
+            problem.AddResidualBlock(
+                new ceres::AutoDiffCostFunction<PoseRegularizer, 1, 72>(
+                    new PoseRegularizer(i, pose_reg_w)),
+                nullptr, theta
+            );
+        }
 
         ceres::Solver::Options options;
-        SetupSolverOptions(options, config, 80);
+        SetupSolverOptions(options, config, 200);
         ceres::Solver::Summary summary;
         ceres::Solve(options, &problem, &summary);
         if (!summary.IsSolutionUsable()) return false;
@@ -584,6 +602,7 @@ bool OptimizeSMPL3D(const MatX3dRM& J_obs,
 
     return true;
 }
+
 
 CameraIntrinsics CreateDefaultCamera(int image_width, int image_height) {
     float focal = image_width * 1.2f;

@@ -20,3 +20,5 @@ Libs/
 
 .DS_Store
 *.json
+
+Data/

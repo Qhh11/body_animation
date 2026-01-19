@@ -2,7 +2,9 @@
 #include <fstream>
 #include <iostream>
 #include <vector>
+#include <array>
 #include <cmath> // For M_PI
+#include <cstdlib>
 #include "smpl_model.h"
 #include "smpl_math.h"
 #include "optimizer.h"
@@ -18,6 +20,9 @@ using json = nlohmann::json;
 void SaveOBJ(const std::string& filename,
              const Eigen::Matrix<double, Eigen::Dynamic, 3, Eigen::RowMajor>& vertices,
              const Eigen::MatrixXi& faces);
+
+// Global GMM pose prior (loaded once, used by all functions)
+static GMMPosePrior g_gmm_prior;
 
 namespace {
 
@@ -193,26 +198,28 @@ static std::vector<Landmark2D> GenerateSyntheticLandmarks(
     return landmarks;
 }
 
-
-
-
 void EigenToArray(const Eigen::VectorXd& src, double* dst, int size) { for(int i=0; i<size; ++i) dst[i] = src[i]; }
 void EigenToArray3(const Eigen::Vector3d& src, double* dst) { dst[0] = src[0]; dst[1] = src[1]; dst[2] = src[2]; }
 
 // =========================================================
 // MODE 1: AMASS Validation (Analysis-by-Synthesis)
+// Returns mean joint error in meters, or -1 on failure
 // =========================================================
-void RunAMASSValidation(const SmplModel& model) {
-    std::cout << "\n=== MODE 1: Running AMASS Validation (Real AMASS Data) ===\n";
+double RunAMASSValidation(const SmplModel& model, const std::string& amass_path, int frame_idx = -1, bool save_mesh = true) {
+    std::cout << "\n=== AMASS Validation: " << amass_path << " ===\n";
 
-
-    std::string amass_path = "../../Data/CMU/01/01_01_poses_formatted.txt";
     std::vector<AmassFrame> amass_frames;
-    if (!AmassLoader::Load(amass_path, amass_frames)) return;
-    if (amass_frames.empty()) return;
+    if (!AmassLoader::Load(amass_path, amass_frames)) return -1.0;
+    if (amass_frames.empty()) return -1.0;
 
-    int frame_idx = 100;
-    if ((int)amass_frames.size() <= frame_idx) frame_idx = 0;
+    // frame_idx = -1 表示自动选取 70% 位置的帧（动作更丰富）
+    if (frame_idx < 0) {
+        frame_idx = (int)(amass_frames.size() * 0.7);
+    }
+    // 边界检查
+    if (frame_idx >= (int)amass_frames.size()) {
+        frame_idx = (int)amass_frames.size() - 1;
+    }
 
     const AmassFrame& frame_gt = amass_frames[frame_idx];
 
@@ -249,28 +256,41 @@ void RunAMASSValidation(const SmplModel& model) {
 
     auto observed_landmarks = GenerateSyntheticLandmarks(model, camera, beta_gt, theta_gt, trans_gt , false);
     if (observed_landmarks.empty()) {
-        std::cerr << "[Error] No landmarks generated (likely behind camera / bad forward).\n";
-        return;
+        std::cerr << "[Error] No landmarks generated.\n";
+        return -1.0;
     }
-    SaveLandmarksToFile("landmarks_gt.txt", observed_landmarks); 
 
-    // Save GT mesh
-    Eigen::Matrix<double, Eigen::Dynamic, 3, Eigen::RowMajor> verts_gt;
-    SMPLForward<double>(beta_gt, theta_gt, trans_gt, model, verts_gt);
-    SaveOBJ("mesh_ground_truth.obj", verts_gt, model.faces);
+    // 从路径提取文件名作为前缀 (e.g. "CMU_91_91_33_poses")
+    std::string base_name;
+    {
+        size_t last_slash = amass_path.find_last_of("/\\");
+        std::string filename = (last_slash != std::string::npos) ? amass_path.substr(last_slash + 1) : amass_path;
+        size_t dot_pos = filename.find_last_of('.');
+        base_name = (dot_pos != std::string::npos) ? filename.substr(0, dot_pos) : filename;
+    }
 
-    double beta_opt[10] = {0};
+    // Save GT mesh (optional)
+    if (save_mesh) {
+        SaveLandmarksToFile(base_name + "_landmarks_gt.txt", observed_landmarks);
+        Eigen::Matrix<double, Eigen::Dynamic, 3, Eigen::RowMajor> verts_gt;
+        SMPLForward<double>(beta_gt, theta_gt, trans_gt, model, verts_gt);
+        SaveOBJ(base_name + "_mesh_gt.obj", verts_gt, model.faces);
+    }
+
+    // init
+    double beta_opt[10]  = {0};
     double theta_opt[72] = {0};
     double trans_opt[3]  = {0.0, 0.0, 2.5};
 
-
-    Eigen::Matrix<double, Eigen::Dynamic, 3, Eigen::RowMajor> V0;
-    SMPLForward<double>(beta_opt, theta_opt, trans_opt, model, V0);
-    SaveOBJ("mesh_before_opt.obj", V0, model.faces);
+    if (save_mesh) {
+        Eigen::Matrix<double, Eigen::Dynamic, 3, Eigen::RowMajor> V0;
+        SMPLForward<double>(beta_opt, theta_opt, trans_opt, model, V0);
+        SaveOBJ(base_name + "_mesh_init.obj", V0, model.faces);
+    }
 
     // Optimizer config
     OptimizerConfig cfg;
-    cfg.verbose = true;
+    cfg.verbose = false;  // 批量测试时关闭详细输出
     cfg.amass_unit_test = true;
     cfg.unit_test_exact = true;
     cfg.w_3d = 1.0;
@@ -280,46 +300,54 @@ void RunAMASSValidation(const SmplModel& model) {
     cfg.w_depth = 50.0;
     cfg.depth_data = &depth_gt;
 
-    bool use_3d_optimization = false; 
+    // Enable GMM pose prior
+    if (g_gmm_prior.loaded) {
+        cfg.use_gmm_prior = true;
+        cfg.w_gmm = 1.0;
+        cfg.gmm_prior = &g_gmm_prior;
+        std::cout << "[Config] Using GMM pose prior\n";
+    } else {
+        std::cout << "[Config] Using L2 pose prior (GMM not loaded)\n";
+    }
 
-    if (use_3d_optimization){
-        std::cout << "[Info] Running OptimizeSMPL3D...\n";
+    bool use_3d_optimization = false;
+
+    if (use_3d_optimization) {
         bool ok = OptimizeSMPL3D(J_gt, model, beta_opt, theta_opt, trans_opt, cfg);
         if (!ok) {
             std::cerr << "[Error] OptimizeSMPL3D failed.\n";
-        return;
+            return -1.0;
         }
-    } else{
-        std::cout << "[Info] Running OptimizeSMPL...\n";
+    } else {
         bool ok = OptimizeSMPL(observed_landmarks, camera, model, beta_opt, theta_opt, trans_opt, cfg);
         if (!ok) {
             std::cerr << "[Error] OptimizeSMPL failed.\n";
-            return;
+            return -1.0;
         }
     }
 
-   
-
-    // after
+    // Compute error
     Eigen::Matrix<double, Eigen::Dynamic, 3, Eigen::RowMajor> J_fit;
-    SMPLJointsForward<double>(beta_opt, theta_opt, trans_opt, model, J_fit); 
+    SMPLJointsForward<double>(beta_opt, theta_opt, trans_opt, model, J_fit);
 
-    std::cout << "[AMASS] mean joint L2 error = "
-            << (J_fit - J_gt).rowwise().norm().mean() << " m\n";
+    double mean_error = (J_fit - J_gt).rowwise().norm().mean();
+    std::cout << "[Result] " << base_name << " frame " << frame_idx << " -> error = " << mean_error << " m\n";
 
-    auto final_landmarks = GenerateSyntheticLandmarks(model, camera, beta_opt, theta_opt, trans_opt, false);
-    SaveLandmarksToFile("landmarks_optimized.txt", final_landmarks);
+    if (save_mesh) {
+        auto final_landmarks = GenerateSyntheticLandmarks(model, camera, beta_opt, theta_opt, trans_opt, true);
+        SaveLandmarksToFile(base_name + "_landmarks_opt.txt", final_landmarks);
 
-    Eigen::Matrix<double, Eigen::Dynamic, 3, Eigen::RowMajor> verts_opt;
-    SMPLForward<double>(beta_opt, theta_opt, trans_opt, model, verts_opt);
-    SaveOBJ("mesh_after_opt.obj", verts_opt, model.faces);
+        Eigen::Matrix<double, Eigen::Dynamic, 3, Eigen::RowMajor> verts_opt;
+        SMPLForward<double>(beta_opt, theta_opt, trans_opt, model, verts_opt);
+        SaveOBJ(base_name + "_mesh_opt.obj", verts_opt, model.faces);
 
-    std::ofstream cam_file("camera_params.txt");
-    cam_file << camera.fx << " " << camera.fy << " " << camera.cx << " " << camera.cy << "\n";
-    cam_file << camera.width << " " << camera.height << "\n";
-    cam_file.close();
+        std::ofstream cam_file(base_name + "_camera.txt");
+        cam_file << camera.fx << " " << camera.fy << " " << camera.cx << " " << camera.cy << "\n";
+        cam_file << camera.width << " " << camera.height << "\n";
+        cam_file.close();
+    }
 
-    std::cout << "[Success] AMASS validation finished.\n";
+    return mean_error;
 }
 
 // =========================================================
@@ -394,18 +422,85 @@ void SaveOBJ(const std::string& filename,
     }
 }
 
-int main() {
+void RunBatchValidation(const SmplModel& model) {
+    std::cout << "\n========== BATCH AMASS VALIDATION (Most Complex Frames) ==========\n";
+
+    std::vector<std::pair<std::string, int>> files = {
+        {"../../Data/sampled/CMU_80_80_33_poses.txt", 1303},  // complexity: 3.71
+        {"../../Data/sampled/CMU_80_80_40_poses.txt", 504},   // complexity: 3.42
+        {"../../Data/sampled/CMU_82_82_06_poses.txt", 250},   // complexity: 3.81
+        {"../../Data/sampled/CMU_82_82_12_poses.txt", 117},   // complexity: 2.41
+        {"../../Data/sampled/CMU_83_83_19_poses.txt", 342},   // complexity: 2.36
+        // {"../../Data/sampled/CMU_83_83_21_poses.txt", 316},   // complexity: 2.53
+        // {"../../Data/sampled/CMU_83_83_26_poses.txt", 200},   // complexity: 2.81
+        // {"../../Data/sampled/CMU_83_83_31_poses.txt", 658},   // complexity: 2.85
+        // {"../../Data/sampled/CMU_83_83_34_poses.txt", 578},   // complexity: 2.84
+        // {"../../Data/sampled/CMU_83_83_51_poses.txt", 295},   // complexity: 2.72
+        // {"../../Data/sampled/CMU_83_83_63_poses.txt", 456},   // complexity: 2.57
+        // {"../../Data/sampled/CMU_83_83_67_poses.txt", 371},   // complexity: 2.33
+        // {"../../Data/sampled/CMU_83_83_68_poses.txt", 383},   // complexity: 2.26
+        // {"../../Data/sampled/CMU_85_85_07_poses.txt", 689},   // complexity: 4.65 (最复杂!)
+        // {"../../Data/sampled/CMU_91_91_01_poses.txt", 1954},  // complexity: 2.32
+        // {"../../Data/sampled/CMU_91_91_06_poses.txt", 65},    // complexity: 2.77
+        // {"../../Data/sampled/CMU_91_91_13_poses.txt", 984},   // complexity: 2.34
+        // {"../../Data/sampled/CMU_91_91_33_poses.txt", 1159},  // complexity: 3.16
+        // {"../../Data/sampled/CMU_91_91_60_poses.txt", 149},   // complexity: 2.93
+        // {"../../Data/sampled/CMU_91_91_62_poses.txt", 1015}   // complexity: 2.23
+    };
+
+    std::vector<double> errors;
+    int success = 0, fail = 0;
+
+    for (const auto& item : files) {
+        double err = RunAMASSValidation(model, item.first, item.second, /*save_mesh=*/true);
+        if (err >= 0) {
+            errors.push_back(err);
+            success++;
+        } else {
+            fail++;
+        }
+    }
+
+    std::cout << "\n========== BATCH RESULTS ==========\n";
+    std::cout << "Success: " << success << " / " << files.size() << "\n";
+    std::cout << "Failed:  " << fail << "\n";
+
+    if (!errors.empty()) {
+        double sum = 0, min_e = errors[0], max_e = errors[0];
+        for (double e : errors) {
+            sum += e;
+            min_e = std::min(min_e, e);
+            max_e = std::max(max_e, e);
+        }
+        double mean = sum / errors.size();
+
+        std::cout << "Mean error: " << mean << " m\n";
+        std::cout << "Min error:  " << min_e << " m\n";
+        std::cout << "Max error:  " << max_e << " m\n";
+    }
+}
+
+int main(int argc, char** argv) {
     google::InitGoogleLogging("SMPL_Optimizer");
     std::cout << ">>> Start SMPL Project..." << std::endl;
 
     SmplModel model;
     model.LoadFromNPZ("../../Data/models/smpl_neutral.npz");
-    // Mode 1: Validation (Check if algorithm works on AMASS)
-    RunAMASSValidation(model);
+    g_gmm_prior.LoadFromNPZ("../../Data/models/gmm_08.npz");
+
+    if (argc > 1) {
+        std::string arg1 = argv[1];
+        if (arg1 == "--batch") {
+            RunBatchValidation(model);
+        } else {
+            RunAMASSValidation(model, arg1, /*frame_idx=*/100, /*save_mesh=*/true);
+        }
+    } else {
+        RunBatchValidation(model);
+    }
 
     // Mode 2: Real Data (Uncomment to run)
     //RunOpenPoseInference(model);
 
     return 0;
 }
-

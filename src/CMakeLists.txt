@@ -3,6 +3,7 @@ project(SMPL_Project)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_BUILD_TYPE Debug)
 
 # 1. Include Paths
 include_directories(include)
@@ -19,6 +20,8 @@ include_directories(${CERES_INCLUDE_DIRS})
 
 find_package(ZLIB REQUIRED)
 
+find_package(nlohmann_json 3.2.0 REQUIRED)
+
 # 3. Executable
 # Removed render.cpp, added optimizer.cpp
 add_executable(main
@@ -32,6 +35,7 @@ add_executable(main
 target_link_libraries(main
     ${CERES_LIBRARIES}
     ZLIB::ZLIB
+    nlohmann_json::nlohmann_json
 )
 
 add_definitions(-DEIGEN_NO_DEBUG)

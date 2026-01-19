@@ -8,6 +8,8 @@
 #include <array>
 #include <algorithm>
 #include <iostream>
+#include <limits>       // for std::numeric_limits
+#include <type_traits>  // for std::is_same_v
 
 #include "smpl_model.h"
 #include "smpl_math.h"
@@ -43,6 +45,23 @@ struct JointDepthData {
     double depth_z;  // GT depth (Z coordinate)
 };
 
+// ------------------------------
+// GMM Pose Prior (from SMPLify)
+// ------------------------------
+struct GMMPosePrior {
+    static constexpr int K = 8;    // number of Gaussian components
+    static constexpr int D = 69;   // pose dimension (excluding root)
+
+    Eigen::Matrix<double, K, 1> weights;                    // (K,)
+    Eigen::Matrix<double, K, D, Eigen::RowMajor> means;     // (K, D)
+    // Cholesky of precision matrices for efficient Mahalanobis distance
+    std::array<Eigen::Matrix<double, D, D, Eigen::RowMajor>, K> prec_choleskys;
+
+    bool loaded = false;
+
+    bool LoadFromNPZ(const std::string& npz_path);
+};
+
 struct OptimizerConfig {
     bool verbose = true;
 
@@ -50,12 +69,37 @@ struct OptimizerConfig {
     float min_confidence = 0.20f;
     bool use_stable_joints_only = true;
     bool flip_y_in_projection = true;
-    int root_free_axis = 1;  // Stage1 free only one root axis for stability
+
+    // NOTE: Historical option (kept for backward compatibility).
+    // Previous implementation freed only one scalar component of the root axis-angle
+    // in Stage1. This is generally *not* SMPLify-style and can block valid global
+    // pitch/roll (e.g., forward bending), causing the optimizer to compensate using
+    // spine/shoulder joints.
+    // We now optimize full 3-DoF root (theta[0:3]) in Stage1; root_free_axis is unused.
+    int root_free_axis = 1;
 
     // ---------- Depth constraint ----------
     bool use_depth = false;
-    double w_depth = 50.0;
+    double w_depth = 15.0;  // 调低，给旋转留空间
     const std::vector<JointDepthData>* depth_data = nullptr;
+
+    // ---------- Root upright regularizer ----------
+    // Penalizes root pitch/roll by encouraging the body's up-vector to align with world Y.
+    // For actions with noticeable forward bending, this should be small (or disabled),
+    // otherwise the optimizer may compensate using spine/shoulder joints.
+    bool use_root_upright = true;
+    double root_upright_w_stage2 = 1.0;  // 软化，允许前倾
+    double root_upright_w_stage3 = 0.0;  // 关闭，让2D数据主导
+
+    // ---------- GMM pose prior (SMPLify style) ----------
+    bool use_gmm_prior = false;
+    double w_gmm = 1.0;  // weight for GMM prior
+    const GMMPosePrior* gmm_prior = nullptr;
+
+    // ---------- SMPLify E_a: Bend limit prior ----------
+    // Penalizes unnatural bending of knees and elbows using exp()
+    bool use_bend_limits = true;
+    double w_bend = 1.0;  // weight for bend limit prior
 
     // ---------- 3D unit test ----------
     bool amass_unit_test = false;
@@ -130,6 +174,75 @@ struct PoseRegularizer {
     }
     int index_;
     double lambda_;
+};
+
+// ------------------------------
+// GMM Pose Prior Residual (SMPLify style)
+// Computes negative log-likelihood of pose under GMM
+// Residual dimension: 69 (one per pose parameter, weighted by GMM)
+// ------------------------------
+struct GMMPosePriorResidual {
+    GMMPosePriorResidual(const GMMPosePrior& gmm, double weight)
+        : gmm_(gmm), weight_(weight) {}
+
+    template <typename T>
+    bool operator()(const T* const theta, T* residuals) const {
+        // theta[0:3] is root, we use theta[3:72] for GMM (69 dims)
+        constexpr int D = 69;
+        constexpr int K = 8;
+
+        // Compute weighted sum of Mahalanobis distances
+        // For numerical stability, we use log-sum-exp trick
+        // -log(sum_k w_k * exp(-0.5 * d_k^2)) where d_k is Mahalanobis distance
+
+        // First compute Mahalanobis distance for each component
+        // d_k = (x - mu_k)^T * Sigma_k^{-1} * (x - mu_k)
+        //     = ||L_k^T * (x - mu_k)||^2  where L_k is Cholesky of precision
+
+        // For Ceres, we output the weighted residual for each dimension
+        // We use the component with highest responsibility (simplification)
+        // Or we can output sqrt of negative log likelihood
+
+        // Simple approach: find best component, output L_k^T * (x - mu_k)
+        // This is an approximation but works well in practice
+
+        T min_dist = T(1e10);
+        int best_k = 0;
+
+        for (int k = 0; k < K; ++k) {
+            T dist = T(0);
+            for (int i = 0; i < D; ++i) {
+                T diff = theta[3 + i] - T(gmm_.means(k, i));
+                T weighted = T(0);
+                for (int j = 0; j <= i; ++j) {  // Lower triangular
+                    weighted += T(gmm_.prec_choleskys[k](i, j)) * (theta[3 + j] - T(gmm_.means(k, j)));
+                }
+                dist += weighted * weighted;
+            }
+            // Include log weight penalty
+            T log_w = T(std::log(gmm_.weights(k) + 1e-10));
+            T score = dist - T(2.0) * log_w;  // -2*log(w) + d^2
+
+            if (score < min_dist) {
+                min_dist = score;
+                best_k = k;
+            }
+        }
+
+        // Output residuals using best component
+        for (int i = 0; i < D; ++i) {
+            T weighted = T(0);
+            for (int j = 0; j <= i; ++j) {
+                weighted += T(gmm_.prec_choleskys[best_k](i, j)) * (theta[3 + j] - T(gmm_.means(best_k, j)));
+            }
+            residuals[i] = T(weight_) * weighted;
+        }
+
+        return true;
+    }
+
+    const GMMPosePrior& gmm_;
+    double weight_;
 };
 
 struct RootUprightResidual {
@@ -212,6 +325,35 @@ struct SoftAngleLimitResidual {
 
     int j_;
     double amax_, w_;
+};
+
+// ------------------------------
+// SMPLify E_a: Bend Limit Prior (Eq. 3 in paper)
+// Penalizes unnatural joint bending (hyperextension) using exp penalty
+// E_a(θ) = Σ exp(θ_i) for knees/elbows
+// ------------------------------
+struct BendLimitResidual {
+    // joint_idx: SMPL joint index (4,5 for knees, 18,19 for elbows)
+    // axis_idx: which component of axis-angle is bend axis (0=x, 1=y, 2=z)
+    // sign: +1 means penalize θ > 0, -1 means penalize θ < 0
+    // weight: scaling factor
+    BendLimitResidual(int joint_idx, int axis_idx, double sign, double weight)
+        : joint_idx_(joint_idx), axis_idx_(axis_idx), sign_(sign), weight_(weight) {}
+
+    template <typename T>
+    bool operator()(const T* const theta, T* residual) const {
+        const int idx = 3 * joint_idx_ + axis_idx_;
+        // exp(sign * theta) penalizes when sign*theta > 0
+        // For knees: sign=+1, penalize hyperextension (theta > 0)
+        // For elbows: sign=-1, penalize hyperextension (theta < 0 means extending)
+        residual[0] = T(weight_) * ceres::exp(T(sign_) * theta[idx]);
+        return true;
+    }
+
+    int joint_idx_;
+    int axis_idx_;
+    double sign_;
+    double weight_;
 };
 
 // ------------------------------

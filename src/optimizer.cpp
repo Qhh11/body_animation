@@ -3,8 +3,70 @@
 #include "optimizer.h"
 
 #include <thread>
+#include <fstream>
 #include <ceres/ceres.h>
 #include <ceres/manifold.h>
+#include <nlohmann/json.hpp>
+#include <cnpy.h>
+
+using json = nlohmann::json;
+
+// ------------------------------
+// GMM Pose Prior Loading
+// ------------------------------
+bool GMMPosePrior::LoadFromNPZ(const std::string& npz_path) {
+    try {
+        cnpy::npz_t npz = cnpy::npz_load(npz_path);
+
+        // Load weights (K,)
+        cnpy::NpyArray arr_w = npz["weights"];
+        if (arr_w.shape.size() != 1 || arr_w.shape[0] != K) {
+            std::cerr << "[GMM] Invalid weights shape\n";
+            return false;
+        }
+        double* w_data = arr_w.data<double>();
+        for (int k = 0; k < K; ++k) {
+            weights(k) = w_data[k];
+        }
+
+        // Load means (K, D)
+        cnpy::NpyArray arr_m = npz["means"];
+        if (arr_m.shape.size() != 2 || arr_m.shape[0] != K || arr_m.shape[1] != D) {
+            std::cerr << "[GMM] Invalid means shape\n";
+            return false;
+        }
+        double* m_data = arr_m.data<double>();
+        for (int k = 0; k < K; ++k) {
+            for (int d = 0; d < D; ++d) {
+                means(k, d) = m_data[k * D + d];
+            }
+        }
+
+        // Load precision Cholesky (K, D, D)
+        cnpy::NpyArray arr_pc = npz["prec_choleskys"];
+        if (arr_pc.shape.size() != 3 || arr_pc.shape[0] != K ||
+            arr_pc.shape[1] != D || arr_pc.shape[2] != D) {
+            std::cerr << "[GMM] Invalid prec_choleskys shape\n";
+            return false;
+        }
+        double* pc_data = arr_pc.data<double>();
+        for (int k = 0; k < K; ++k) {
+            for (int i = 0; i < D; ++i) {
+                for (int j = 0; j < D; ++j) {
+                    prec_choleskys[k](i, j) = pc_data[k * D * D + i * D + j];
+                }
+            }
+        }
+
+        loaded = true;
+        std::cout << "[GMM] Loaded pose prior from " << npz_path << "\n";
+        std::cout << "[GMM] K=" << K << ", D=" << D << "\n";
+        return true;
+    } catch (const std::exception& e) {
+        std::cerr << "[GMM] Failed to load: " << e.what() << "\n";
+        return false;
+    }
+}
 
 // OpenPose BODY_25 to SMPL mapping (define ONCE here)
 const int OPENPOSE_TO_SMPL[25] = {
@@ -121,6 +183,20 @@ static void AddDepthBlock_AutoDiff(
     problem.AddResidualBlock(cost, nullptr, beta, theta, trans);
 }
 
+static void AddGMMPriorBlock_AutoDiff(
+    ceres::Problem& problem,
+    const OptimizerConfig& cfg,
+    double* theta
+) {
+    if (!cfg.use_gmm_prior || cfg.gmm_prior == nullptr || !cfg.gmm_prior->loaded) return;
+
+    auto* functor = new GMMPosePriorResidual(*cfg.gmm_prior, cfg.w_gmm);
+
+    auto* cost = new ceres::AutoDiffCostFunction<GMMPosePriorResidual, 69, 72>(functor);
+
+    problem.AddResidualBlock(cost, nullptr, theta);
+}
+
 // ------------------------------
 // OptimizeSMPL (2D)
 // ------------------------------
@@ -136,10 +212,10 @@ bool OptimizeSMPL(
     std::cout << "[Optimizer] Starting 2D Optimization...\n";
 
     // ----------------------------
-    // Stage 1: trans + ONE root axis
+    // Stage 1: trans + full 3-DoF root (SMPLify-style)
     // ----------------------------
     {
-        std::cout << "\n>>> Stage 1: trans + single-axis root\n";
+        std::cout << "\n>>> Stage 1: trans + full root (3DoF)\n";
         ceres::Problem problem;
 
         AddAllKeypointReprojBlock_AutoDiff(
@@ -151,11 +227,12 @@ bool OptimizeSMPL(
 
         problem.SetParameterBlockConstant(beta);
 
-        // lock all theta except one axis
+        // Lock all joints except the root (theta[0:3]).
+        // This is the standard SMPLify practice: first place the body globally
+        // (translation + global orientation), then refine articulated pose.
         std::vector<int> const_idx;
-        const_idx.reserve(71);
-        for (int i = 0; i < 72; ++i) {
-            if (i == config.root_free_axis) continue;
+        const_idx.reserve(69);
+        for (int i = 3; i < 72; ++i) {
             const_idx.push_back(i);
         }
         problem.SetManifold(theta, new ceres::SubsetManifold(72, const_idx));
@@ -186,17 +263,22 @@ bool OptimizeSMPL(
 
         problem.SetParameterBlockConstant(beta);
 
-        // Pose regularization
-        const double pose_reg_weight = 2.0;
-        for (int i = 3; i < 72; ++i) {
-            problem.AddResidualBlock(
-                new ceres::AutoDiffCostFunction<PoseRegularizer, 1, 72>(
-                    new PoseRegularizer(i, pose_reg_weight)),
-                nullptr, theta
-            );
+        // Pose prior: GMM or simple L2
+        if (config.use_gmm_prior && config.gmm_prior != nullptr && config.gmm_prior->loaded) {
+            AddGMMPriorBlock_AutoDiff(problem, config, theta);
+        } else {
+            // Fallback: simple L2 pose regularizer
+            const double pose_reg_weight = 2.0;
+            for (int i = 3; i < 72; ++i) {
+                problem.AddResidualBlock(
+                    new ceres::AutoDiffCostFunction<PoseRegularizer, 1, 72>(
+                        new PoseRegularizer(i, pose_reg_weight)),
+                    nullptr, theta
+                );
+            }
         }
 
-        // Depth constraint (optional)
+        // Depth constraint
         AddDepthBlock_AutoDiff(problem, config, model, beta, theta, trans);
 
         // Shoulder / collar soft limits
@@ -233,33 +315,52 @@ bool OptimizeSMPL(
         };
         for (int j : {13,14,16,17}) add_pose_reg_joint(j, 5.0);
 
-        // Root upright
-        const double root_upright_w = 1.0;
-        problem.AddResidualBlock(
-            new ceres::AutoDiffCostFunction<RootUprightResidual, 2, 72>(
-                new RootUprightResidual(root_upright_w)),
-            nullptr, theta
-        );
-
-        // Hinge constraints
-        auto add_hinge = [&](int j, Eigen::Vector3d axis, double w_perp, double w_range, double min_a, double max_a) {
+        // Root upright (optional / configurable)
+        if (config.use_root_upright && config.root_upright_w_stage2 > 0.0) {
             problem.AddResidualBlock(
-                new ceres::AutoDiffCostFunction<HingeAxisResidual, 2, 72>(
-                    new HingeAxisResidual(j, axis, w_perp, w_range, min_a, max_a)),
+                new ceres::AutoDiffCostFunction<RootUprightResidual, 2, 72>(
+                    new RootUprightResidual(config.root_upright_w_stage2)),
                 nullptr, theta
             );
-        };
-
-        Eigen::Vector3d HINGE_X(1,0,0);
-
-        // knees
-        for (int k : {4, 5}) {
-            add_hinge(k, HINGE_X, 120.0, 60.0, 0.0, 2.6);
         }
-        // elbows
-        for (int e : {18, 19}) {
-            add_hinge(e, HINGE_X, 60.0, 30.0, -2.6, 0.1);
+
+        // SMPLify E_a: Bend limit prior (replaces Hinge constraints)
+        if (config.use_bend_limits) {
+            // Knees (joints 4, 5): penalize hyperextension (theta > 0 on X axis)
+            for (int k : {4, 5}) {
+                problem.AddResidualBlock(
+                    new ceres::AutoDiffCostFunction<BendLimitResidual, 1, 72>(
+                        new BendLimitResidual(k, 0, +1.0, config.w_bend)),
+                    nullptr, theta
+                );
+            }
+            // Elbows (joints 18, 19): penalize hyperextension (theta < 0 on X axis)
+            for (int e : {18, 19}) {
+                problem.AddResidualBlock(
+                    new ceres::AutoDiffCostFunction<BendLimitResidual, 1, 72>(
+                        new BendLimitResidual(e, 0, -1.0, config.w_bend)),
+                    nullptr, theta
+                );
+            }
         }
+
+        // [COMMENTED OUT] Old Hinge constraints
+        // auto add_hinge = [&](int j, Eigen::Vector3d axis, double w_perp, double w_range, double min_a, double max_a) {
+        //     problem.AddResidualBlock(
+        //         new ceres::AutoDiffCostFunction<HingeAxisResidual, 2, 72>(
+        //             new HingeAxisResidual(j, axis, w_perp, w_range, min_a, max_a)),
+        //         nullptr, theta
+        //     );
+        // };
+        // Eigen::Vector3d HINGE_X(1,0,0);
+        // // knees
+        // for (int k : {4, 5}) {
+        //     add_hinge(k, HINGE_X, 120.0, 60.0, 0.0, 2.6);
+        // }
+        // // elbows
+        // for (int e : {18, 19}) {
+        //     add_hinge(e, HINGE_X, 60.0, 30.0, -2.6, 0.1);
+        // }
 
         problem.SetParameterLowerBound(trans, 2, 0.5);
         problem.SetParameterUpperBound(trans, 2, 20.0);
@@ -282,14 +383,14 @@ bool OptimizeSMPL(
             problem, observed_keypoints, camera, model,
             beta, theta, trans,
             config,
-            new ceres::HuberLoss(2.0)
+            new ceres::HuberLoss(5.0)
         );
 
         // Depth constraint (optional)
         AddDepthBlock_AutoDiff(problem, config, model, beta, theta, trans);
 
-        // Shape reg
-        const double shape_reg_weight = 80.0;
+        // Shape reg (降低权重，允许体型变化)
+        const double shape_reg_weight = 25.0;
         for (int i = 0; i < 10; ++i) {
             problem.AddResidualBlock(
                 new ceres::AutoDiffCostFunction<ShapeRegularizer, 1, 10>(
@@ -298,6 +399,14 @@ bool OptimizeSMPL(
             );
         }
 
+        // Root upright (optional / configurable)
+        if (config.use_root_upright && config.root_upright_w_stage3 > 0.0) {
+            problem.AddResidualBlock(
+                new ceres::AutoDiffCostFunction<RootUprightResidual, 2, 72>(
+                    new RootUprightResidual(config.root_upright_w_stage3)),
+                nullptr, theta
+            );
+        }
 
         // Shoulder / collar soft limits
         const double w_shoulder_limit = 30.0;
@@ -333,27 +442,51 @@ bool OptimizeSMPL(
         };
         for (int j : {13,14,16,17}) add_pose_reg_joint(j, 5.0);
 
-        // global pose reg
-        for (int i = 3; i < 72; ++i) {
-            problem.AddResidualBlock(
-                new ceres::AutoDiffCostFunction<PoseRegularizer, 1, 72>(
-                    new PoseRegularizer(i, 5.0)),
-                nullptr, theta
-            );
+        // Global pose prior: GMM or simple L2
+        if (config.use_gmm_prior && config.gmm_prior != nullptr && config.gmm_prior->loaded) {
+            AddGMMPriorBlock_AutoDiff(problem, config, theta);
+        } else {
+            // Fallback: simple L2 pose regularizer
+            for (int i = 3; i < 72; ++i) {
+                problem.AddResidualBlock(
+                    new ceres::AutoDiffCostFunction<PoseRegularizer, 1, 72>(
+                        new PoseRegularizer(i, 5.0)),
+                    nullptr, theta
+                );
+            }
         }
 
-        // weaker hinge
-        auto add_hinge = [&](int j, Eigen::Vector3d axis, double w_perp, double w_range, double min_a, double max_a) {
-            problem.AddResidualBlock(
-                new ceres::AutoDiffCostFunction<HingeAxisResidual, 2, 72>(
-                    new HingeAxisResidual(j, axis, w_perp, w_range, min_a, max_a)),
-                nullptr, theta
-            );
-        };
+        // SMPLify E_a: Bend limit prior (replaces Hinge constraints)
+        if (config.use_bend_limits) {
+            // Knees (joints 4, 5): penalize hyperextension (theta > 0 on X axis)
+            for (int k : {4, 5}) {
+                problem.AddResidualBlock(
+                    new ceres::AutoDiffCostFunction<BendLimitResidual, 1, 72>(
+                        new BendLimitResidual(k, 0, +1.0, config.w_bend)),
+                    nullptr, theta
+                );
+            }
+            // Elbows (joints 18, 19): penalize hyperextension (theta < 0 on X axis)
+            for (int e : {18, 19}) {
+                problem.AddResidualBlock(
+                    new ceres::AutoDiffCostFunction<BendLimitResidual, 1, 72>(
+                        new BendLimitResidual(e, 0, -1.0, config.w_bend)),
+                    nullptr, theta
+                );
+            }
+        }
 
-        Eigen::Vector3d HINGE_X(1,0,0);
-        for (int k : {4,5}) add_hinge(k, HINGE_X, 60.0, 30.0, 0.0, 2.6);
-        for (int e : {18,19}) add_hinge(e, HINGE_X, 60.0, 30.0, -2.6, 0.1);
+        // [COMMENTED OUT] Old weaker hinge constraints
+        // auto add_hinge = [&](int j, Eigen::Vector3d axis, double w_perp, double w_range, double min_a, double max_a) {
+        //     problem.AddResidualBlock(
+        //         new ceres::AutoDiffCostFunction<HingeAxisResidual, 2, 72>(
+        //             new HingeAxisResidual(j, axis, w_perp, w_range, min_a, max_a)),
+        //         nullptr, theta
+        //     );
+        // };
+        // Eigen::Vector3d HINGE_X(1,0,0);
+        // for (int k : {4,5}) add_hinge(k, HINGE_X, 60.0, 30.0, 0.0, 2.6);
+        // for (int e : {18,19}) add_hinge(e, HINGE_X, 60.0, 30.0, -2.6, 0.1);
 
         problem.SetParameterLowerBound(trans, 2, 0.5);
         problem.SetParameterUpperBound(trans, 2, 20.0);

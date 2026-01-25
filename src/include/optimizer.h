@@ -141,13 +141,24 @@ struct OptimizerConfig {
     double arm_torso_w_elbow = 80.0;
     double arm_torso_w_wrist = 120.0;
 
-    int arm_torso_seg_a = 3;   // spine2 (你原来写 spine2)
-    int arm_torso_seg_b = 12;  // spine3 (你原来写 spine3)
+    int arm_torso_seg_a = 3;   
+    int arm_torso_seg_b = 12; 
 
     // ---------- 3D unit test ----------
     bool amass_unit_test = false;
     bool unit_test_exact = true;
     double w_3d = 1.0;
+
+    // ---------- temporal smoothness (tracking) ----------
+    bool use_temporal = false;     // 开关
+    double w_temp_pose = 10.0;     // 一阶：||theta_t - theta_prev||^2 权重
+    double w_temp_trans = 2.0;     // 一阶：||trans_t - trans_prev||^2 权重
+    bool use_temporal_acc = false; // 二阶加速度项
+    double w_temp_acc_pose = 2.0;  // 二阶：||theta_t - 2*theta_{t-1} + theta_{t-2}||^2
+
+    // 只对 body pose 做时序（建议默认 true）：theta[3:71]
+    bool temporal_body_only = true;
+
 
     // ---------- speed / solver ----------
     int threads = -1;                 // -1: auto
@@ -454,6 +465,65 @@ struct BendLimitResidual {
     double weight_;
 };
 
+struct TemporalPoseResidual {
+    TemporalPoseResidual(const double* theta_prev_, double w_, bool body_only_)
+        : prev(theta_prev_), w(w_), body_only(body_only_) {}
+
+    template <typename T>
+    bool operator()(const T* const theta, T* residuals) const {
+        int k = 0;
+        if (body_only) {
+            for (int i = 3; i < 72; ++i) residuals[k++] = T(w) * (theta[i] - T(prev[i]));
+        } else {
+            for (int i = 0; i < 72; ++i) residuals[k++] = T(w) * (theta[i] - T(prev[i]));
+        }
+        return true;
+    }
+    const double* prev;
+    double w;
+    bool body_only;
+};
+
+struct TemporalTransResidual {
+    TemporalTransResidual(const double* trans_prev_, double w_)
+        : prev(trans_prev_), w(w_) {}
+
+    template <typename T>
+    bool operator()(const T* const trans, T* residuals) const {
+        residuals[0] = T(w) * (trans[0] - T(prev[0]));
+        residuals[1] = T(w) * (trans[1] - T(prev[1]));
+        residuals[2] = T(w) * (trans[2] - T(prev[2]));
+        return true;
+    }
+    const double* prev;
+    double w;
+};
+
+struct TemporalAccelPoseResidual {
+    TemporalAccelPoseResidual(const double* theta_prev_, const double* theta_prev2_,
+                              double w_, bool body_only_)
+        : p1(theta_prev_), p2(theta_prev2_), w(w_), body_only(body_only_) {}
+
+    template <typename T>
+    bool operator()(const T* const theta, T* residuals) const {
+        int k = 0;
+        if (body_only) {
+            for (int i = 3; i < 72; ++i) {
+                residuals[k++] = T(w) * (theta[i] - T(2.0)*T(p1[i]) + T(p2[i]));
+            }
+        } else {
+            for (int i = 0; i < 72; ++i) {
+                residuals[k++] = T(w) * (theta[i] - T(2.0)*T(p1[i]) + T(p2[i]));
+            }
+        }
+        return true;
+    }
+    const double* p1;
+    const double* p2;
+    double w;
+    bool body_only;
+};
+
 // ------------------------------
 // 2D reprojection residual
 // ------------------------------
@@ -662,5 +732,16 @@ bool OptimizeSMPL(const std::vector<Landmark2D>& observed_keypoints,
                   double* theta,
                   double* trans,
                   const OptimizerConfig& config);
+                  
+bool OptimizeSMPLTracked(const std::vector<Landmark2D>& observed_keypoints,
+                         const CameraIntrinsics& camera,
+                         const SmplModel& model,
+                         double* beta,
+                         double* theta,
+                         double* trans,
+                         const OptimizerConfig& cfg,
+                         const double* theta_prev,
+                         const double* trans_prev,
+                         const double* theta_prev2 = nullptr);
 
 CameraIntrinsics CreateDefaultCamera(int image_width, int image_height);

@@ -15,6 +15,8 @@
 #include "smpl_math.h"
 #include "optimizer.h"
 #include "amass_loader.h"
+#include <filesystem>
+namespace fs = std::filesystem;
 
 using json = nlohmann::json;
 
@@ -59,7 +61,7 @@ static void EstimateGlobalTranslationXY(
 }
 
 // ------------------------------
-// OpenPose json loader (你的版本原封不动保留)
+// OpenPose json loader 
 // ------------------------------
 bool LoadLandmarksFromJSON(
     const std::string& json_path,
@@ -140,6 +142,17 @@ bool LoadLandmarksFromJSON(
               << " (score=" << best_score << ")\n";
 
     return !landmarks.empty();
+}
+
+static std::string MakeOpenPoseJsonPath(const std::string& dir, int frame) {
+    char buf[512];
+    std::snprintf(buf, sizeof(buf), "%s/image_%05d_keypoints.json", dir.c_str(), frame);
+    return std::string(buf);
+}
+static std::string MakeOutObj(const std::string& out_dir, int frame) {
+    char buf[512];
+    std::snprintf(buf, sizeof(buf), "%s/mesh_%05d.obj", out_dir.c_str(), frame);
+    return std::string(buf);
 }
 
 void SaveLandmarksToFile(const std::string& filename, const std::vector<Landmark2D>& landmarks) {
@@ -412,7 +425,7 @@ double RunAMASSValidation(const SmplModel& model, const std::string& amass_path,
 void RunOpenPoseInference(const SmplModel& model) {
     std::cout << "\n=== MODE 2: Running Real OpenPose Data ===\n";
 
-    std::string json_path = "../../Data/openpose_output/courtyard_basketball_01/image_00025_keypoints.json";
+    std::string json_path = "../../Data/openpose_output/courtyard_basketball_01/image_00024_keypoints.json";
     std::vector<Landmark2D> lms;
     if (!LoadLandmarksFromJSON(json_path, lms)) {
         std::cerr << "Failed to load json.\n";
@@ -483,6 +496,87 @@ void RunOpenPoseInference(const SmplModel& model) {
 
 } // namespace
 
+void RunOpenPoseSequenceInference(const SmplModel& model) {
+    std::cout << "\n=== MODE 3: OpenPose SEQUENCE (0-60) ===\n";
+
+    const std::string seq_dir = "../../Data/openpose_output/courtyard_basketball_01";
+    const std::string out_dir = "./seq_out";
+    fs::create_directories(out_dir);
+
+    const int start = 0;
+    const int end   = 60;
+
+    const int img_w = 1080;
+    const int img_h = 1920;
+    CameraIntrinsics camera(1962.0f, 1969.0f, 540.0f, 960.0f, img_w, img_h);
+
+    OptimizerConfig cfg = MakeCfgForOpenPose();
+    cfg.use_temporal = true;
+    cfg.w_temp_pose  = 12.0;   
+    cfg.w_temp_trans = 2.0;
+    cfg.use_temporal_acc = false;
+
+    double beta[10]  = {0.0};
+
+    double theta[72] = {0.0};
+    double trans[3]  = {0.0, 0.0, 3.0};
+
+    // 前两帧缓存（用于 temporal）
+    double theta_prev[72]  = {0.0};
+    double theta_prev2[72] = {0.0};
+    double trans_prev[3]   = {0.0, 0.0, 3.0};
+
+    bool has_prev = false;
+    bool has_prev2 = false;
+
+    for (int f = start; f <= end; ++f) {
+        std::string json_path = MakeOpenPoseJsonPath(seq_dir, f);
+        std::vector<Landmark2D> lms;
+        if (!LoadLandmarksFromJSON(json_path, lms)) {
+            std::cerr << "[Frame " << f << "] failed to load: " << json_path << "\n";
+            continue;
+        }
+
+        // warm start：默认用上一帧结果
+        if (has_prev) {
+            std::memcpy(theta, theta_prev, sizeof(theta));
+            std::memcpy(trans, trans_prev, sizeof(trans));
+        } else {
+            EstimateGlobalTranslationXY(lms, camera, 3.0, trans);
+        }
+
+        // 第一帧建议跑完整 OptimizeSMPL（含 Stage3），后续帧建议 tracked（只到 Stage2 或者 Stage3 也可但不推荐）
+        bool ok = false;
+        if (!has_prev) {
+            ok = OptimizeSMPL(lms, camera, model, beta, theta, trans, cfg); 
+        } else {
+            ok = OptimizeSMPLTracked(lms, camera, model, beta, theta, trans, cfg,
+                                     theta_prev, trans_prev,
+                                     has_prev2 ? theta_prev2 : nullptr);
+        }
+
+        if (!ok) {
+            std::cerr << "[Frame " << f << "] Optimize failed\n";
+            continue;
+        }
+
+        Eigen::Matrix<double, Eigen::Dynamic, 3, Eigen::RowMajor> V;
+        SMPLForward<double>(beta, theta, trans, model, V);
+        SaveOBJ(MakeOutObj(out_dir, f), V, model.faces);
+
+        if (has_prev) {
+            std::memcpy(theta_prev2, theta_prev, sizeof(theta_prev2));
+            has_prev2 = true;
+        }
+        std::memcpy(theta_prev, theta, sizeof(theta_prev));
+        std::memcpy(trans_prev, trans, sizeof(trans_prev));
+        has_prev = true;
+
+        std::cout << "[Frame " << f << "] done\n";
+    }
+
+    std::cout << "[Done] sequence saved under " << out_dir << "\n";
+}
 
 void SaveOBJ(const std::string& filename,
              const Eigen::Matrix<double, Eigen::Dynamic, 3, Eigen::RowMajor>& vertices,
@@ -560,7 +654,8 @@ int main(int argc, char** argv) {
             RunAMASSValidation(model, arg1, 100, true);
         }
     } else {
-        RunOpenPoseInference(model);
+        RunOpenPoseSequenceInference(model);
+        //RunOpenPoseInference(model);
     }
 
     return 0;

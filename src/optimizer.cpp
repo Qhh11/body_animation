@@ -111,7 +111,7 @@ static void SetupSolverOptions(ceres::Solver::Options& options,
 }
 
 // -----------------------------------------
-// Data term adders (统一风格)
+// Data term adders 
 // -----------------------------------------
 static void AddAllKeypointReprojBlock(
     ceres::Problem& problem,
@@ -416,6 +416,41 @@ static void AddPosePriorsUnified(ceres::Problem& problem,
     }
 }
 
+static void AddTemporalPriors(ceres::Problem& problem,
+                              const OptimizerConfig& cfg,
+                              double* theta, double* trans,
+                              const double* theta_prev,
+                              const double* trans_prev,
+                              const double* theta_prev2) 
+{
+    if (!cfg.use_temporal) return;
+    if (theta_prev) {
+        const int dim = cfg.temporal_body_only ? 69 : 72;
+        problem.AddResidualBlock(
+            new ceres::AutoDiffCostFunction<TemporalPoseResidual, ceres::DYNAMIC, 72>(
+                new TemporalPoseResidual(theta_prev, cfg.w_temp_pose, cfg.temporal_body_only),
+                dim),
+            nullptr, theta
+        );
+    }
+    if (trans_prev) {
+        problem.AddResidualBlock(
+            new ceres::AutoDiffCostFunction<TemporalTransResidual, 3, 3>(
+                new TemporalTransResidual(trans_prev, cfg.w_temp_trans)),
+            nullptr, trans
+        );
+    }
+    if (cfg.use_temporal_acc && theta_prev && theta_prev2) {
+        const int dim = cfg.temporal_body_only ? 69 : 72;
+        problem.AddResidualBlock(
+            new ceres::AutoDiffCostFunction<TemporalAccelPoseResidual, ceres::DYNAMIC, 72>(
+                new TemporalAccelPoseResidual(theta_prev, theta_prev2, cfg.w_temp_acc_pose, cfg.temporal_body_only),
+                dim),
+            nullptr, theta
+        );
+    }
+}
+
 // -----------------------------------------
 // OptimizeSMPL (2D)
 // -----------------------------------------
@@ -506,7 +541,7 @@ bool OptimizeSMPL(
         AddDepthBlock(problem, cfg, model, beta, theta, trans);
         AddRelativeDepthBlock(problem, cfg, model, beta, theta, trans);
 
-        // shape regularization (保持你原来的)
+        // shape regularization 
         const double shape_reg_weight = 25.0;
         for (int i = 0; i < 10; ++i) {
             problem.AddResidualBlock(
@@ -532,6 +567,123 @@ bool OptimizeSMPL(
 
     return true;
 }
+
+bool OptimizeSMPLTracked(
+    const std::vector<Landmark2D>& observed_keypoints,
+    const CameraIntrinsics& camera,
+    const SmplModel& model,
+    double* beta,
+    double* theta,
+    double* trans,
+    const OptimizerConfig& cfg,
+    const double* theta_prev,
+    const double* trans_prev,
+    const double* theta_prev2
+) {
+    std::cout << "[Optimizer] Starting 2D Optimization...\n";
+    // ----------------------------
+    // Stage 1: trans + root only
+    // ----------------------------
+    {
+        if (cfg.verbose) std::cout << "\n>>> Stage 1: trans + full root (3DoF)\n";
+        ceres::Problem problem;
+
+        AddAllKeypointReprojBlock(problem, observed_keypoints, camera, model,
+                                  beta, theta, trans, cfg,
+                                  new ceres::HuberLoss(20.0));
+
+        problem.SetParameterBlockConstant(beta);
+
+        // Lock all joints except the root (theta[0:3]).
+        std::vector<int> const_idx;
+        const_idx.reserve(69);
+        for (int i = 3; i < 72; ++i) const_idx.push_back(i);
+        problem.SetManifold(theta, new ceres::SubsetManifold(72, const_idx));
+
+        // simple Z bounds
+        problem.SetParameterLowerBound(trans, 2, 0.5);
+        problem.SetParameterUpperBound(trans, 2, 20.0);
+
+        ceres::Solver::Options options;
+        SetupSolverOptions(options, cfg, cfg.max_iter_stage1);
+        ceres::Solver::Summary summary;
+        ceres::Solve(options, &problem, &summary);
+
+        if (cfg.verbose) std::cout << summary.BriefReport() << "\n";
+        if (!summary.IsSolutionUsable()) return false;
+    }
+
+    // ----------------------------
+    // Stage 2: full pose (beta fixed)
+    // ----------------------------
+    {
+        if (cfg.verbose) std::cout << "\n>>> Stage 2: full pose (beta fixed)\n";
+        ceres::Problem problem;
+
+        AddAllKeypointReprojBlock(problem, observed_keypoints, camera, model,
+                                  beta, theta, trans, cfg,
+                                  new ceres::HuberLoss(5.0));
+
+        problem.SetParameterBlockConstant(beta);
+
+        AddDepthBlock(problem, cfg, model, beta, theta, trans);
+        AddRelativeDepthBlock(problem, cfg, model, beta, theta, trans);
+
+        AddPosePriorsUnified(problem, cfg, model, beta, theta, trans, PriorStage::Stage2);
+        AddTemporalPriors(problem, cfg, theta, trans, theta_prev, trans_prev, theta_prev2);
+        problem.SetParameterLowerBound(trans, 2, 0.5);
+        problem.SetParameterUpperBound(trans, 2, 20.0);
+
+        ceres::Solver::Options options;
+        SetupSolverOptions(options, cfg, cfg.max_iter_stage2);
+        ceres::Solver::Summary summary;
+        ceres::Solve(options, &problem, &summary);
+
+        if (cfg.verbose) std::cout << summary.BriefReport() << "\n";
+        if (!summary.IsSolutionUsable()) return false;
+    }
+
+    // ----------------------------
+    // Stage 3: refine beta + pose + trans
+    // ----------------------------
+    {
+        if (cfg.verbose) std::cout << "\n>>> Stage 3: refine beta + pose + trans\n";
+        ceres::Problem problem;
+
+        AddAllKeypointReprojBlock(problem, observed_keypoints, camera, model,
+                                  beta, theta, trans, cfg,
+                                  new ceres::HuberLoss(5.0));
+
+        AddDepthBlock(problem, cfg, model, beta, theta, trans);
+        AddRelativeDepthBlock(problem, cfg, model, beta, theta, trans);
+
+        // shape regularization 
+        const double shape_reg_weight = 25.0;
+        for (int i = 0; i < 10; ++i) {
+            problem.AddResidualBlock(
+                new ceres::AutoDiffCostFunction<ShapeRegularizer, 1, 10>(
+                    new ShapeRegularizer(i, shape_reg_weight)),
+                nullptr, beta
+            );
+        }
+
+        AddPosePriorsUnified(problem, cfg, model, beta, theta, trans, PriorStage::Stage3);
+        AddTemporalPriors(problem, cfg, theta, trans, theta_prev, trans_prev, theta_prev2);
+        problem.SetParameterLowerBound(trans, 2, 0.5);
+        problem.SetParameterUpperBound(trans, 2, 20.0);
+
+        ceres::Solver::Options options;
+        SetupSolverOptions(options, cfg, cfg.max_iter_stage3);
+        ceres::Solver::Summary summary;
+        ceres::Solve(options, &problem, &summary);
+
+        if (cfg.verbose) std::cout << "[Final] " << summary.BriefReport() << "\n";
+        if (!summary.IsSolutionUsable()) return false;
+    }
+
+    return true;
+}
+
 
 // -----------------------------------------
 // OptimizeSMPL3D (unit test)

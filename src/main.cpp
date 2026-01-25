@@ -56,6 +56,69 @@ static DiagonalPosePrior69 BuildPosePriorFromAmassFrames(
 }
 
 
+static DiagonalPosePrior69 BuildPosePriorFromAmassFrames(
+    const std::vector<AmassFrame>& frames,
+    int stride = 5,
+    double min_std = 0.15
+) {
+    DiagonalPosePrior69 prior;
+    std::array<double, 69> mean{};
+    std::array<double, 69> m2{};
+    int n = 0;
+
+    for (int t = 0; t < (int)frames.size(); t += std::max(1, stride)) {
+        const auto& th = frames[t].theta; // expects theta[72]
+        n++;
+        for (int i = 0; i < 69; ++i) {
+            const double x = th[3 + i];
+            const double delta = x - mean[i];
+            mean[i] += delta / (double)n;
+            const double delta2 = x - mean[i];
+            m2[i] += delta * delta2;
+        }
+    }
+
+    for (int i = 0; i < 69; ++i) {
+        const double var = (n > 1) ? (m2[i] / (double)(n - 1)) : 1.0;
+        const double stdv = std::max(min_std, std::sqrt(std::max(1e-12, var)));
+        prior.mean[i] = mean[i];
+        prior.inv_std[i] = 1.0 / stdv;
+    }
+
+    prior.ready = true;
+    return prior;
+}
+
+static bool SavePosePriorToJSON(const std::string& path, const DiagonalPosePrior69& prior) {
+    if (!prior.ready) return false;
+    json j;
+    j["mean"] = json::array();
+    j["inv_std"] = json::array();
+    for (int i = 0; i < 69; ++i) {
+        j["mean"].push_back(prior.mean[i]);
+        j["inv_std"].push_back(prior.inv_std[i]);
+    }
+    std::ofstream out(path);
+    if (!out.is_open()) return false;
+    out << j.dump(2);
+    return true;
+}
+
+static bool LoadPosePriorFromJSON(const std::string& path, DiagonalPosePrior69& prior) {
+    std::ifstream in(path);
+    if (!in.is_open()) return false;
+    json j; in >> j;
+    if (!j.contains("mean") || !j.contains("inv_std")) return false;
+    if (j["mean"].size() != 69 || j["inv_std"].size() != 69) return false;
+
+    for (int i = 0; i < 69; ++i) {
+        prior.mean[i] = j["mean"][i].get<double>();
+        prior.inv_std[i] = j["inv_std"][i].get<double>();
+    }
+    prior.ready = true;
+    return true;
+}
+
 
 static void EstimateGlobalTranslationXY(
     const std::vector<Landmark2D>& landmarks,
@@ -313,6 +376,10 @@ double RunAMASSValidation(const SmplModel& model, const std::string& amass_path,
     double theta_opt[72] = {0};
     double trans_opt[3]  = {0.0, 0.0, 2.5};
 
+    DiagonalPosePrior69 prior = BuildPosePriorFromAmassFrames(amass_frames, /*stride=*/5);
+    SavePosePriorToJSON("pose_prior_amass.json", prior);
+    for (int i = 0; i < 69; ++i) theta_opt[3 + i] = prior.mean[i];
+
     if (save_mesh) {
         Eigen::Matrix<double, Eigen::Dynamic, 3, Eigen::RowMajor> V0;
         SMPLForward<double>(beta_opt, theta_opt, trans_opt, model, V0);
@@ -352,7 +419,7 @@ double RunAMASSValidation(const SmplModel& model, const std::string& amass_path,
     // Arm torso seperation
     cfg.use_arm_torso_sep = true;
 
-    bool use_3d_optimization = false;
+    bool use_3d_optimization = true;
 
     if (use_3d_optimization) {
         bool ok = OptimizeSMPL3D(J_gt, model, beta_opt, theta_opt, trans_opt, cfg);
@@ -396,44 +463,77 @@ double RunAMASSValidation(const SmplModel& model, const std::string& amass_path,
 // MODE 2: Real OpenPose Video
 // =========================================================
 void RunOpenPoseInference(const SmplModel& model) {
-    std::cout << "\n=== MODE 2: Running Real OpenPose Data (Fine-Tuned) ===" << std::endl;
+    std::cout << "\n=== MODE 2: OpenPose (AMASS-like config) ===\n";
 
     std::string json_path = "../../Data/OpenPose/my_openpose/output_jsons/dance_000000000120_keypoints.json";
+
     std::vector<Landmark2D> lms;
     if (!LoadLandmarksFromJSON(json_path, lms)) {
-        std::cerr << "Failed to load json.\n";
+        std::cerr << "Failed to load OpenPose json.\n";
         return;
     }
     SaveLandmarksToFile("landmarks_input.txt", lms);
 
-    // -------- Camera --------
-    const int img_w = 1280;
-    const int img_h = 720;
+    // ---- Camera ----
+    const int img_w = 1280, img_h = 720;
     CameraIntrinsics camera = CreateDefaultCamera(img_w, img_h);
 
-    // -------- Init params --------
+    // ---- Load AMASS prior (precomputed) ----
+    DiagonalPosePrior69 prior;
+    if (!LoadPosePriorFromJSON("pose_prior_amass.json", prior)) {
+        std::cerr << "[Warn] pose_prior_amass.json not found. Falling back to zeros.\n";
+        prior.ready = false;
+    }
+
+    // ---- Init params (AMASS-like) ----
     double beta[10]  = {0.0};
     double theta[72] = {0.0};
     double trans[3]  = {0.0, 0.0, 3.0};
 
-    // 轻微初值（可选）：让手臂不要完全T pose（你也可以先注释）
-    // theta[16*3 + 2] = -0.4;
-    // theta[17*3 + 2] =  0.4;
+    if (prior.ready) {
+        for (int i = 0; i < 69; ++i) theta[3 + i] = prior.mean[i];  
+    }
 
-    // init trans x/y with bbox center, keep z=3.0
+    // init trans x/y with bbox center
     EstimateGlobalTranslationXY(lms, camera, /*z_assumed=*/3.0, trans);
 
+    // Save init mesh
     Eigen::Matrix<double, Eigen::Dynamic, 3, Eigen::RowMajor> V_init;
     SMPLForward<double>(beta, theta, trans, model, V_init);
     SaveOBJ("mesh_before_opt.obj", V_init, model.faces);
 
-    // -------- Optimize --------
+    // ---- Optimizer config (copy your AMASS settings) ----
     OptimizerConfig cfg;
     cfg.verbose = true;
-    cfg.min_confidence = 0.20f;
-    cfg.use_stable_joints_only = true;    
-    cfg.flip_y_in_projection = true;                   
 
+    cfg.min_confidence = 0.20f;
+    cfg.use_stable_joints_only = true;
+    cfg.flip_y_in_projection = true;
+
+    // Pose prior (same as AMASS)
+    cfg.use_pose_prior = prior.ready;
+    cfg.pose_prior = prior.ready ? &prior : nullptr;
+    cfg.w_pose_prior = 0.8;      // 0.3~2.0 可调
+
+    // Hinge / bend limits (same as AMASS)
+    cfg.use_hinge_priors = false;
+    cfg.use_bend_limits = false;
+    cfg.w_bend = 0.05;
+    cfg.w_hinge_perp_elbow  = 30.0;
+    cfg.w_hinge_range_elbow = 10.0;
+
+    // Root upright
+    cfg.use_root_upright = true;
+    cfg.root_upright_w_stage2 = 0.5;
+    cfg.root_upright_w_stage3 = 0.0;
+
+    // Arm–torso separation
+    cfg.use_arm_torso_sep = true;
+
+    // Depth off (OpenPose 2D only)
+    cfg.use_depth = false;
+
+    // ---- Optimize ----
     const bool ok = OptimizeSMPL(lms, camera, model, beta, theta, trans, cfg);
     if (!ok) {
         std::cerr << "OptimizeSMPL failed.\n";
@@ -446,8 +546,7 @@ void RunOpenPoseInference(const SmplModel& model) {
 
     std::cout << "[Done] saved mesh_after_opt.obj\n";
 }
-
-} // namespace
+}
 
 void SaveOBJ(const std::string& filename,
              const Eigen::Matrix<double, Eigen::Dynamic, 3, Eigen::RowMajor>& vertices,
@@ -522,10 +621,9 @@ void RunBatchValidation(const SmplModel& model) {
 }
 
 
-
 int main(int argc, char** argv) {
     google::InitGoogleLogging("SMPL_Optimizer");
-    std::cout << ">>> Start SMPL Project..." << std::endl;
+    std::cout << ">>> Start SMPL Project...\n";
 
     SmplModel model;
     model.LoadFromNPZ("../../Data/models/smpl_neutral.npz");
@@ -534,15 +632,17 @@ int main(int argc, char** argv) {
         std::string arg1 = argv[1];
         if (arg1 == "--batch") {
             RunBatchValidation(model);
-        } else {
-            RunAMASSValidation(model, arg1, /*frame_idx=*/100, /*save_mesh=*/true);
+            return 0;
         }
+        if (arg1 == "--openpose") {
+            RunOpenPoseInference(model);
+            return 0;
+        }
+        // otherwise treat as AMASS file path
+        RunAMASSValidation(model, arg1, /*frame_idx=*/100, /*save_mesh=*/true);
+        return 0;
     } else {
         RunBatchValidation(model);
+        return 0;
     }
-
-    // Mode 2: Real Data (Uncomment to run)
-    //RunOpenPoseInference(model);
-
-    return 0;
 }

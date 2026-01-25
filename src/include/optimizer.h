@@ -455,6 +455,7 @@ struct AllKeypointsReprojectionResidual {
             lms_.push_back(lm);
             smpl_ids_.push_back(sid);
         }
+
     }
 
     int NumUsedKeypoints() const { return static_cast<int>(lms_.size()); }

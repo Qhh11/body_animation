@@ -58,6 +58,37 @@ static void SetupSolverOptions(ceres::Solver::Options& options,
     options.trust_region_strategy_type = ceres::LEVENBERG_MARQUARDT;
 }
 
+static void Print2DError(
+    const std::vector<Landmark2D>& obs,
+    const CameraIntrinsics& cam,
+    const SmplModel& model,
+    const double* beta,
+    const double* theta,
+    const double* trans,
+    const OptimizerConfig& cfg
+) {
+    AllKeypointsReprojectionResidual tmp(
+        obs, cam, model,
+        cfg.min_confidence,
+        cfg.use_stable_joints_only,
+        cfg.flip_y_in_projection
+    );
+    const int K = tmp.NumUsedKeypoints();
+    if (K <= 0) {
+        std::cout << "[2D RMSE] K=0 (no valid keypoints)\n";
+        return;
+    }
+
+    std::vector<double> res(2 * K, 0.0);
+    tmp(beta, theta, trans, res.data());
+
+    double sse = 0.0;
+    for (double r : res) sse += r * r;
+
+    const double rmse = std::sqrt(sse / (2.0 * K));
+    std::cout << "[2D RMSE] " << rmse << " px (K=" << K << ")\n";
+}
+
 static void AddAllKeypointReprojBlock_AutoDiff(
     ceres::Problem& problem,
     const std::vector<Landmark2D>& observed,
@@ -214,8 +245,6 @@ static void AddHingePriors(
         nullptr, theta
     );
 
-    std::cout << "[Dbg] hinge axis: knee(L/R)=" << axis_L_knee << "/" << axis_R_knee
-              << " elbow(L/R)=" << axis_L_elb << "/" << axis_R_elb << "\n";
 }
 
 static void AddBendLimitExpPriors(
@@ -348,6 +377,9 @@ bool OptimizeSMPL(
         ceres::Solver::Summary summary;
         ceres::Solve(options, &problem, &summary);
         if (config.verbose) std::cout << summary.BriefReport() << "\n";
+        Print2DError(observed_keypoints, camera, model, beta, theta, trans, config);
+        std::cout << "trans = " << trans[0] << " " << trans[1] << " " << trans[2] << "\n";
+
     }
 
     // ----------------------------
@@ -371,9 +403,6 @@ bool OptimizeSMPL(
         const int axis_R_knee = DetectDominantAxisForChild(model, beta, theta, trans, 5, 8);
         const int axis_L_elb  = DetectDominantAxisForChild(model, beta, theta, trans, 18, 20);
         const int axis_R_elb  = DetectDominantAxisForChild(model, beta, theta, trans, 19, 21);
-
-        std::cout << "[Dbg] bend axes: knee(L/R)=" << axis_L_knee << "/" << axis_R_knee
-                << " elbow(L/R)=" << axis_L_elb << "/" << axis_R_elb << "\n";
 
         // Depth constraint (optional)
         AddDepthBlock_AutoDiff(problem, config, model, beta, theta, trans);
@@ -428,6 +457,9 @@ bool OptimizeSMPL(
         ceres::Solver::Summary summary;
         ceres::Solve(options, &problem, &summary);
         if (config.verbose) std::cout << summary.BriefReport() << "\n";
+        Print2DError(observed_keypoints, camera, model, beta, theta, trans, config);
+        std::cout << "trans = " << trans[0] << " " << trans[1] << " " << trans[2] << "\n";
+
     }
 
     // ----------------------------
@@ -512,6 +544,9 @@ bool OptimizeSMPL(
         ceres::Solve(options, &problem, &summary);
 
         if (config.verbose) std::cout << "[Final] " << summary.BriefReport() << "\n";
+        Print2DError(observed_keypoints, camera, model, beta, theta, trans, config);
+        std::cout << "trans = " << trans[0] << " " << trans[1] << " " << trans[2] << "\n";
+
     }
 
     return true;

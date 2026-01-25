@@ -6,6 +6,64 @@
 #include <fstream>
 #include <ceres/ceres.h>
 #include <ceres/manifold.h>
+#include <cnpy.h>
+
+// ------------------------------
+// GMM Pose Prior Loading
+// ------------------------------
+bool GMMPosePrior::LoadFromNPZ(const std::string& npz_path) {
+    try {
+        cnpy::npz_t npz = cnpy::npz_load(npz_path);
+
+        // Load weights (K,)
+        cnpy::NpyArray arr_w = npz["weights"];
+        if (arr_w.shape.size() != 1 || arr_w.shape[0] != K) {
+            std::cerr << "[GMM] Invalid weights shape\n";
+            return false;
+        }
+        double* w_data = arr_w.data<double>();
+        for (int k = 0; k < K; ++k) {
+            weights(k) = w_data[k];
+        }
+
+        // Load means (K, D)
+        cnpy::NpyArray arr_m = npz["means"];
+        if (arr_m.shape.size() != 2 || arr_m.shape[0] != K || arr_m.shape[1] != D) {
+            std::cerr << "[GMM] Invalid means shape\n";
+            return false;
+        }
+        double* m_data = arr_m.data<double>();
+        for (int k = 0; k < K; ++k) {
+            for (int d = 0; d < D; ++d) {
+                means(k, d) = m_data[k * D + d];
+            }
+        }
+
+        // Load precision Cholesky (K, D, D)
+        cnpy::NpyArray arr_pc = npz["prec_choleskys"];
+        if (arr_pc.shape.size() != 3 || arr_pc.shape[0] != K ||
+            arr_pc.shape[1] != D || arr_pc.shape[2] != D) {
+            std::cerr << "[GMM] Invalid prec_choleskys shape\n";
+            return false;
+        }
+        double* pc_data = arr_pc.data<double>();
+        for (int k = 0; k < K; ++k) {
+            for (int i = 0; i < D; ++i) {
+                for (int j = 0; j < D; ++j) {
+                    prec_choleskys[k](i, j) = pc_data[k * D * D + i * D + j];
+                }
+            }
+        }
+
+        loaded = true;
+        std::cout << "[GMM] Loaded pose prior from " << npz_path << "\n";
+        std::cout << "[GMM] K=" << K << ", D=" << D << "\n";
+        return true;
+    } catch (const std::exception& e) {
+        std::cerr << "[GMM] Failed to load: " << e.what() << "\n";
+        return false;
+    }
+}
 
 // OpenPose BODY_25 to SMPL mapping (define ONCE here)
 const int OPENPOSE_TO_SMPL[25] = {
@@ -113,15 +171,41 @@ static void AddDepthBlock_AutoDiff(
     problem.AddResidualBlock(cost, nullptr, beta, theta, trans);
 }
 
-static void AddDiagonalPosePriorBlock_AutoDiff(
+static void AddRelativeDepthBlock_AutoDiff(
+    ceres::Problem& problem,
+    const OptimizerConfig& cfg,
+    const SmplModel& model,
+    double* beta,
+    double* theta,
+    double* trans
+) {
+    if (!cfg.use_relative_depth || cfg.relative_depth_pairs == nullptr ||
+        cfg.relative_depth_pairs->empty()) return;
+
+    auto* functor = new RelativeDepthResidual(*cfg.relative_depth_pairs, model, cfg.w_relative_depth);
+
+    auto* cost = new ceres::AutoDiffCostFunction<RelativeDepthResidual, ceres::DYNAMIC, 10, 72, 3>(
+        functor,
+        (int)cfg.relative_depth_pairs->size()
+    );
+
+    problem.AddResidualBlock(cost, nullptr, beta, theta, trans);
+
+    if (cfg.verbose) {
+        std::cout << "[Optimizer] Added relative depth constraint with "
+                  << cfg.relative_depth_pairs->size() << " pairs\n";
+    }
+}
+
+static void AddGMMPriorBlock_AutoDiff(
     ceres::Problem& problem,
     const OptimizerConfig& cfg,
     double* theta
 ) {
-    if (!cfg.use_pose_prior || cfg.pose_prior == nullptr || !cfg.pose_prior->ready) return;
+    if (!cfg.use_gmm_prior || cfg.gmm_prior == nullptr || !cfg.gmm_prior->loaded) return;
 
-    auto* functor = new DiagonalPosePriorResidual(*cfg.pose_prior, cfg.w_pose_prior);
-    auto* cost = new ceres::AutoDiffCostFunction<DiagonalPosePriorResidual, 69, 72>(functor);
+    auto* functor = new GMMPosePriorResidual(*cfg.gmm_prior, cfg.w_gmm);
+    auto* cost = new ceres::AutoDiffCostFunction<GMMPosePriorResidual, 69, 72>(functor);
     problem.AddResidualBlock(cost, nullptr, theta);
 }
 
@@ -377,9 +461,10 @@ bool OptimizeSMPL(
 
         // Depth constraint (optional)
         AddDepthBlock_AutoDiff(problem, config, model, beta, theta, trans);
+        AddRelativeDepthBlock_AutoDiff(problem, config, model, beta, theta, trans);
 
         // Our replacement pose prior (diagonal Gaussian)
-        AddDiagonalPosePriorBlock_AutoDiff(problem, config, theta);
+        AddGMMPriorBlock_AutoDiff(problem, config, theta);
 
         // Hinge priors for elbows/knees (critical to suppress twist ambiguity)
         AddHingePriors(problem, config, model, beta, theta, trans);
@@ -451,6 +536,7 @@ bool OptimizeSMPL(
 
         // Depth constraint (optional)
         AddDepthBlock_AutoDiff(problem, config, model, beta, theta, trans);
+        AddRelativeDepthBlock_AutoDiff(problem, config, model, beta, theta, trans);
 
         // Shape regularization
         const double shape_reg_weight = 25.0;
@@ -463,7 +549,7 @@ bool OptimizeSMPL(
         }
 
         // Our pose prior
-        AddDiagonalPosePriorBlock_AutoDiff(problem, config, theta);
+        AddGMMPriorBlock_AutoDiff(problem, config, theta);
 
         // Hinge priors
         AddHingePriors(problem, config, model, beta, theta, trans);

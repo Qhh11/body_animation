@@ -44,26 +44,24 @@ struct JointDepthData {
     double depth_z;
 };
 
-// ------------------------------
-// Simple pose prior: diagonal Gaussian on theta[3:72]
-// This replaces the external SMPLify GMM prior.
-// ------------------------------
-struct DiagonalPosePrior69 {
-    // Pose dimension excludes root: 72 - 3 = 69
-    static constexpr int D = 69;
+// Forward declaration for relative depth (full definition below)
+struct RelativeDepthPair;
 
-    std::array<double, D> mean{};
-    std::array<double, D> inv_std{};  // 1 / max(std, eps)
-    bool ready = false;
+// ------------------------------
+// GMM Pose Prior (from SMPLify)
+// ------------------------------
+struct GMMPosePrior {
+    static constexpr int K = 8;    // number of Gaussian components
+    static constexpr int D = 69;   // pose dimension (excluding root)
 
-    // Initialize to N(0, I) prior as a safe fallback.
-    void SetZeroMeanUnitStd(double std_value = 1.0) {
-        for (int i = 0; i < D; ++i) {
-            mean[i] = 0.0;
-            inv_std[i] = 1.0 / std::max(1e-6, std_value);
-        }
-        ready = true;
-    }
+    Eigen::Matrix<double, K, 1> weights;                    // (K,)
+    Eigen::Matrix<double, K, D, Eigen::RowMajor> means;     // (K, D)
+    // Cholesky of precision matrices for efficient Mahalanobis distance
+    std::array<Eigen::Matrix<double, D, D, Eigen::RowMajor>, K> prec_choleskys;
+
+    bool loaded = false;
+
+    bool LoadFromNPZ(const std::string& npz_path);
 };
 
 struct OptimizerConfig {
@@ -74,20 +72,25 @@ struct OptimizerConfig {
     bool use_stable_joints_only = true;
     bool flip_y_in_projection = true;
 
-    // ---------- Depth constraint ----------
+    // ---------- Depth constraint (absolute) ----------
     bool use_depth = false;
     double w_depth = 15.0;
     const std::vector<JointDepthData>* depth_data = nullptr;
+
+    // ---------- Relative depth constraint (for Sapiens/monocular) ----------
+    bool use_relative_depth = false;
+    double w_relative_depth = 20.0;
+    const std::vector<RelativeDepthPair>* relative_depth_pairs = nullptr;
 
     // ---------- Root upright regularizer ----------
     bool use_root_upright = true;
     double root_upright_w_stage2 = 1.0;
     double root_upright_w_stage3 = 0.0;
 
-    // ---------- Diagonal pose prior (our replacement for GMM) ----------
-    bool use_pose_prior = true;
-    double w_pose_prior = 1.0;
-    const DiagonalPosePrior69* pose_prior = nullptr;
+    // ---------- GMM pose prior (SMPLify style) ----------
+    bool use_gmm_prior = false;
+    double w_gmm = 1.0;
+    const GMMPosePrior* gmm_prior = nullptr;
 
     // ---------- Angle/hinge priors ----------
     // Strongly recommended to suppress twist ambiguity of elbows/knees.
@@ -190,25 +193,57 @@ struct PoseRegularizer {
 };
 
 // ------------------------------
-// Diagonal Gaussian pose prior residual
-// Residual dimension: 69, applied to theta[3:72]
+// GMM Pose Prior Residual (SMPLify style)
+// Computes negative log-likelihood of pose under GMM
+// Residual dimension: 69 (one per pose parameter, weighted by GMM)
 // ------------------------------
-struct DiagonalPosePriorResidual {
-    DiagonalPosePriorResidual(const DiagonalPosePrior69& prior, double weight)
-        : prior_(prior), weight_(weight) {}
+struct GMMPosePriorResidual {
+    GMMPosePriorResidual(const GMMPosePrior& gmm, double weight)
+        : gmm_(gmm), weight_(weight) {}
 
     template <typename T>
     bool operator()(const T* const theta, T* residuals) const {
-        // theta[0:3] is root, we apply prior to theta[3:72]
-        for (int i = 0; i < DiagonalPosePrior69::D; ++i) {
-            const T mu = T(prior_.mean[i]);
-            const T invs = T(prior_.inv_std[i]);
-            residuals[i] = T(weight_) * (theta[3 + i] - mu) * invs;
+        // theta[0:3] is root, we use theta[3:72] for GMM (69 dims)
+        constexpr int D = 69;
+        constexpr int K = 8;
+
+        // Find best component (lowest Mahalanobis distance + log weight penalty)
+        T min_dist = T(1e10);
+        int best_k = 0;
+
+        for (int k = 0; k < K; ++k) {
+            T dist = T(0);
+            for (int i = 0; i < D; ++i) {
+                T diff = theta[3 + i] - T(gmm_.means(k, i));
+                T weighted = T(0);
+                for (int j = 0; j <= i; ++j) {  // Lower triangular
+                    weighted += T(gmm_.prec_choleskys[k](i, j)) * (theta[3 + j] - T(gmm_.means(k, j)));
+                }
+                dist += weighted * weighted;
+            }
+            // Include log weight penalty
+            T log_w = T(std::log(gmm_.weights(k) + 1e-10));
+            T score = dist - T(2.0) * log_w;  // -2*log(w) + d^2
+
+            if (score < min_dist) {
+                min_dist = score;
+                best_k = k;
+            }
         }
+
+        // Output residuals using best component
+        for (int i = 0; i < D; ++i) {
+            T weighted = T(0);
+            for (int j = 0; j <= i; ++j) {
+                weighted += T(gmm_.prec_choleskys[best_k](i, j)) * (theta[3 + j] - T(gmm_.means(best_k, j)));
+            }
+            residuals[i] = T(weight_) * weighted;
+        }
+
         return true;
     }
 
-    const DiagonalPosePrior69& prior_;
+    const GMMPosePrior& gmm_;
     double weight_;
 };
 
@@ -524,7 +559,7 @@ struct Joints3DResidualFast {
 };
 
 // ------------------------------
-// Depth residual
+// Depth residual (absolute depth in meters)
 // ------------------------------
 struct DepthResidual {
     DepthResidual(const std::vector<JointDepthData>& depth_data_,
@@ -552,6 +587,73 @@ struct DepthResidual {
     }
 
     std::vector<JointDepthData> depth_data;
+    const SmplModel& model;
+    double w;
+};
+
+// ------------------------------
+// Relative depth residual (for Sapiens/monocular depth estimation)
+// Enforces relative depth ordering between pairs of joints.
+// If joint_a has smaller relative_depth than joint_b, then joint_a
+// should be closer to camera (smaller Z in world coordinates).
+// ------------------------------
+struct RelativeDepthPair {
+    int smpl_joint_a;
+    int smpl_joint_b;
+    double rel_depth_a;  // relative depth value at joint_a
+    double rel_depth_b;  // relative depth value at joint_b
+};
+
+struct RelativeDepthResidual {
+    RelativeDepthResidual(const std::vector<RelativeDepthPair>& pairs_,
+                          const SmplModel& model_,
+                          double w_)
+        : pairs(pairs_), model(model_), w(w_) {}
+
+    int NumPairs() const { return static_cast<int>(pairs.size()); }
+
+    template <typename T>
+    bool operator()(const T* const beta,
+                    const T* const theta,
+                    const T* const trans,
+                    T* residuals) const {
+        Eigen::Matrix<T, Eigen::Dynamic, 3, Eigen::RowMajor> J_pred;
+        SMPLJointsForward<T>(beta, theta, trans, model, J_pred);
+
+        // For each pair, enforce depth ordering consistency.
+        // Sapiens depth: LARGER value = FURTHER from camera
+        // SMPL world Z:  LARGER value = FURTHER from camera
+        // So they have the SAME direction!
+        //
+        // If rel_a > rel_b (a further in Sapiens), then z_a > z_b (a further in world)
+        // => rel_diff and z_diff should have the SAME sign
+        for (int i = 0; i < NumPairs(); ++i) {
+            const int ja = pairs[i].smpl_joint_a;
+            const int jb = pairs[i].smpl_joint_b;
+
+           const T z_a = J_pred(ja, 2);
+            const T z_b = J_pred(jb, 2);
+            const T z_diff = z_a - z_b;
+
+            const double rel_diff = pairs[i].rel_depth_a - pairs[i].rel_depth_b;
+
+            // ignore ambiguous pairs
+            const double eps = 1e-3;  // 你可以调：1e-3 ~ 1e-2
+            if (std::abs(rel_diff) < eps) {
+                residuals[i] = T(0);
+                continue;
+            }
+
+            const T s = T(rel_diff > 0 ? 1.0 : -1.0);
+
+            // penalize ONLY when ordering is wrong: s*z_diff < 0
+            const T violation = s * z_diff;  // >0 means wrong ordering (flipped sign)
+            residuals[i] = T(w) * (violation > T(0) ? violation : T(0));
+        }
+        return true;
+    }
+
+    std::vector<RelativeDepthPair> pairs;
     const SmplModel& model;
     double w;
 };

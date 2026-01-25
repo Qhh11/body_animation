@@ -21,41 +21,10 @@ void SaveOBJ(const std::string& filename,
              const Eigen::Matrix<double, Eigen::Dynamic, 3, Eigen::RowMajor>& vertices,
              const Eigen::MatrixXi& faces);
 
+// Global GMM pose prior (loaded once, used by all functions)
+static GMMPosePrior g_gmm_prior;
+
 namespace {
-static DiagonalPosePrior69 BuildPosePriorFromAmassFrames(
-    const std::vector<AmassFrame>& frames,
-    int stride = 5,
-    double min_std = 0.15
-) {
-    DiagonalPosePrior69 prior;
-    std::array<double, 69> mean{};
-    std::array<double, 69> m2{};
-    int n = 0;
-
-    for (int t = 0; t < (int)frames.size(); t += std::max(1, stride)) {
-        const auto& th = frames[t].theta; // expects theta[72]
-        n++;
-        for (int i = 0; i < 69; ++i) {
-            const double x = th[3 + i];
-            const double delta = x - mean[i];
-            mean[i] += delta / (double)n;
-            const double delta2 = x - mean[i];
-            m2[i] += delta * delta2;
-        }
-    }
-
-    for (int i = 0; i < 69; ++i) {
-        const double var = (n > 1) ? (m2[i] / (double)(n - 1)) : 1.0;
-        const double stdv = std::max(min_std, std::sqrt(std::max(1e-12, var)));
-        prior.mean[i] = mean[i];
-        prior.inv_std[i] = 1.0 / stdv;
-    }
-
-    prior.ready = true;
-    return prior;
-}
-
-
 
 static void EstimateGlobalTranslationXY(
     const std::vector<Landmark2D>& landmarks,
@@ -319,8 +288,6 @@ double RunAMASSValidation(const SmplModel& model, const std::string& amass_path,
         SaveOBJ(base_name + "_mesh_init.obj", V0, model.faces);
     }
 
-    DiagonalPosePrior69 prior = BuildPosePriorFromAmassFrames(amass_frames, /*stride=*/5);
-
     // Optimizer config
     OptimizerConfig cfg;
     cfg.verbose = true;
@@ -332,10 +299,15 @@ double RunAMASSValidation(const SmplModel& model, const std::string& amass_path,
     cfg.w_depth = 50.0;
     cfg.depth_data = &depth_gt;
 
-    // Use our own diagonal pose prior (no external GMM)
-    cfg.use_pose_prior = true;
-    cfg.w_pose_prior = 0.8;      // you can tune: 0.3 ~ 2.0
-    cfg.pose_prior = &prior;
+    // Use GMM pose prior
+    if (g_gmm_prior.loaded) {
+        cfg.use_gmm_prior = true;
+        cfg.w_gmm = 1.0;
+        cfg.gmm_prior = &g_gmm_prior;
+        std::cout << "[Config] Using GMM pose prior\n";
+    } else {
+        std::cout << "[Config] GMM not loaded, using L2 fallback\n";
+    }
 
     // Strongly recommend hinge priors to suppress twist
     cfg.use_hinge_priors = true;
@@ -396,9 +368,9 @@ double RunAMASSValidation(const SmplModel& model, const std::string& amass_path,
 // MODE 2: Real OpenPose Video
 // =========================================================
 void RunOpenPoseInference(const SmplModel& model) {
-    std::cout << "\n=== MODE 2: Running Real OpenPose Data (Fine-Tuned) ===" << std::endl;
+    std::cout << "\n=== MODE 2: Running Real OpenPose Data ===" << std::endl;
 
-    std::string json_path = "../../Data/OpenPose/my_openpose/output_jsons/dance_000000000120_keypoints.json";
+    std::string json_path = "../../Data/openpose_output/courtyard_basketball_01/image_00025_keypoints.json";
     std::vector<Landmark2D> lms;
     if (!LoadLandmarksFromJSON(json_path, lms)) {
         std::cerr << "Failed to load json.\n";
@@ -406,19 +378,16 @@ void RunOpenPoseInference(const SmplModel& model) {
     }
     SaveLandmarksToFile("landmarks_input.txt", lms);
 
-    // -------- Camera --------
-    const int img_w = 1280;
-    const int img_h = 720;
-    CameraIntrinsics camera = CreateDefaultCamera(img_w, img_h);
+    // -------- Camera (from courtyard_basketball_01.pkl) --------
+    const int img_w = 1080;
+    const int img_h = 1920;
+    // Real camera intrinsics: fx=1962, fy=1969, cx=540, cy=960
+    CameraIntrinsics camera(1962.0f, 1969.0f, 540.0f, 960.0f, img_w, img_h);
 
     // -------- Init params --------
     double beta[10]  = {0.0};
     double theta[72] = {0.0};
     double trans[3]  = {0.0, 0.0, 3.0};
-
-    // 轻微初值（可选）：让手臂不要完全T pose（你也可以先注释）
-    // theta[16*3 + 2] = -0.4;
-    // theta[17*3 + 2] =  0.4;
 
     // init trans x/y with bbox center, keep z=3.0
     EstimateGlobalTranslationXY(lms, camera, /*z_assumed=*/3.0, trans);
@@ -431,8 +400,70 @@ void RunOpenPoseInference(const SmplModel& model) {
     OptimizerConfig cfg;
     cfg.verbose = true;
     cfg.min_confidence = 0.20f;
-    cfg.use_stable_joints_only = true;    
-    cfg.flip_y_in_projection = true;                   
+    cfg.use_stable_joints_only = true;
+    cfg.flip_y_in_projection = true;
+
+    // Use GMM pose prior
+    if (g_gmm_prior.loaded) {
+        cfg.use_gmm_prior = true;
+        cfg.w_gmm = 1.0;
+        cfg.gmm_prior = &g_gmm_prior;
+        std::cout << "[Config] Using GMM pose prior\n";
+    }
+
+    // Enable hinge priors and bend limits
+    cfg.use_hinge_priors = true;
+    cfg.use_bend_limits = true;
+    cfg.w_bend = 0.05;
+    cfg.w_hinge_perp_elbow = 30.0;
+    cfg.w_hinge_range_elbow = 10.0;
+
+    // Root upright
+    cfg.use_root_upright = true;
+    cfg.root_upright_w_stage2 = 0.5;
+    cfg.root_upright_w_stage3 = 0.0;
+
+    // Arm torso separation
+    cfg.use_arm_torso_sep = true;
+
+    // -------- Load Sapiens relative depth and create pairs --------
+    std::vector<RelativeDepthPair> relative_depth_pairs;
+    std::string depth_path = "../../Data/sapiens_depth/courtyard_basketball_01/image_00025_depth.txt";
+    std::ifstream depth_file(depth_path);
+    if (depth_file.is_open()) {
+        // Read depth values for each OpenPose keypoint
+        std::vector<std::pair<int, double>> kp_depths;  // (openpose_idx, depth)
+        int op_idx;
+        double depth_val;
+        while (depth_file >> op_idx >> depth_val) {
+            int smpl_idx = OPENPOSE_TO_SMPL[op_idx];
+            if (smpl_idx >= 0) {
+                kp_depths.push_back({smpl_idx, depth_val});
+            }
+        }
+        depth_file.close();
+
+        // Create relative depth pairs between all valid joints
+        for (size_t i = 0; i < kp_depths.size(); ++i) {
+            for (size_t j = i + 1; j < kp_depths.size(); ++j) {
+                int idx_i = kp_depths[i].first;
+                int idx_j = kp_depths[j].first;
+                double depth_i = kp_depths[i].second;
+                double depth_j = kp_depths[j].second;
+                relative_depth_pairs.push_back({idx_i, idx_j, depth_i, depth_j});
+            }
+        }
+        std::cout << "[Depth] Created " << relative_depth_pairs.size() << " relative depth pairs\n";
+    } else {
+        std::cerr << "[Depth] Failed to open " << depth_path << "\n";
+    }
+
+    if (!relative_depth_pairs.empty()) {
+        cfg.use_relative_depth = true;  // DISABLED for testing
+        cfg.w_relative_depth = 20.0;
+        cfg.relative_depth_pairs = &relative_depth_pairs;
+        std::cout << "[Config] Relative depth DISABLED for testing\n";
+    }
 
     const bool ok = OptimizeSMPL(lms, camera, model, beta, theta, trans, cfg);
     if (!ok) {
@@ -443,6 +474,12 @@ void RunOpenPoseInference(const SmplModel& model) {
     Eigen::Matrix<double, Eigen::Dynamic, 3, Eigen::RowMajor> V_opt;
     SMPLForward<double>(beta, theta, trans, model, V_opt);
     SaveOBJ("mesh_after_opt.obj", V_opt, model.faces);
+
+    // Save camera params for visualization
+    std::ofstream cam_file("camera.txt");
+    cam_file << camera.fx << " " << camera.fy << " " << camera.cx << " " << camera.cy << "\n";
+    cam_file << camera.width << " " << camera.height << "\n";
+    cam_file.close();
 
     std::cout << "[Done] saved mesh_after_opt.obj\n";
 }
@@ -462,6 +499,7 @@ void SaveOBJ(const std::string& filename,
         outfile << "f " << faces(i, 0) + 1 << " " << faces(i, 1) + 1 << " " << faces(i, 2) + 1 << "\n";
     }
 }
+
 
 void RunBatchValidation(const SmplModel& model) {
     std::cout << "\n========== BATCH AMASS VALIDATION (Most Complex Frames) ==========\n";
@@ -530,19 +568,22 @@ int main(int argc, char** argv) {
     SmplModel model;
     model.LoadFromNPZ("../../Data/models/smpl_neutral.npz");
 
+    // Load GMM pose prior
+    g_gmm_prior.LoadFromNPZ("../../Data/models/gmm_08.npz");
+
     if (argc > 1) {
         std::string arg1 = argv[1];
         if (arg1 == "--batch") {
             RunBatchValidation(model);
+        } else if (arg1 == "--openpose") {
+            RunOpenPoseInference(model);
         } else {
             RunAMASSValidation(model, arg1, /*frame_idx=*/100, /*save_mesh=*/true);
         }
     } else {
-        RunBatchValidation(model);
+        // Default: run OpenPose inference
+        RunOpenPoseInference(model);
     }
-
-    // Mode 2: Real Data (Uncomment to run)
-    //RunOpenPoseInference(model);
 
     return 0;
 }

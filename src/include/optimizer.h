@@ -56,7 +56,6 @@ struct GMMPosePrior {
 
     Eigen::Matrix<double, K, 1> weights;                    // (K,)
     Eigen::Matrix<double, K, D, Eigen::RowMajor> means;     // (K, D)
-    // Cholesky of precision matrices for efficient Mahalanobis distance
     std::array<Eigen::Matrix<double, D, D, Eigen::RowMajor>, K> prec_choleskys;
 
     bool loaded = false;
@@ -77,7 +76,7 @@ struct OptimizerConfig {
     double w_depth = 15.0;
     const std::vector<JointDepthData>* depth_data = nullptr;
 
-    // ---------- Relative depth constraint (for Sapiens/monocular) ----------
+    // ---------- Relative depth constraint ----------
     bool use_relative_depth = false;
     double w_relative_depth = 20.0;
     const std::vector<RelativeDepthPair>* relative_depth_pairs = nullptr;
@@ -87,35 +86,63 @@ struct OptimizerConfig {
     double root_upright_w_stage2 = 1.0;
     double root_upright_w_stage3 = 0.0;
 
-    // ---------- GMM pose prior (SMPLify style) ----------
+    // ---------- GMM pose prior ----------
     bool use_gmm_prior = false;
     double w_gmm = 1.0;
     const GMMPosePrior* gmm_prior = nullptr;
 
     // ---------- Angle/hinge priors ----------
-    // Strongly recommended to suppress twist ambiguity of elbows/knees.
     bool use_hinge_priors = true;
-    double w_hinge_perp_knee = 120.0;
+    double w_hinge_perp_knee  = 120.0;
     double w_hinge_range_knee = 60.0;
-    double w_hinge_perp_elbow = 80.0;
+    double w_hinge_perp_elbow  = 80.0;
     double w_hinge_range_elbow = 40.0;
 
-    // Optional hyperextension exp penalty (SMPLify-like E_a)
+    // 统一 hinge range（以前你写死 -2.6~2.6，现在 main 可调）
+    double hinge_min = -2.6;
+    double hinge_max =  2.6;
+
+    // Optional hyperextension exp penalty
     bool use_bend_limits = true;
     double w_bend = 1.0;
+
+    // ---------- Shoulder / Collar / Wrist / Spine soft limits (NEW: main可调) ----------
+    bool use_spine_limits = true;
+    double w_spine = 10.0;
+    double spine_amax = 1.2;   // radians
+    // spine joints ids in your SMPL joint indexing (you之前用 {3,6,9})
+    int spine_j1 = 3;
+    int spine_j2 = 6;
+    int spine_j3 = 9;
+
+    bool use_shoulder_collar_limits = true;
+    double w_shoulder_limit = 60.0;
+    double shoulder_amax = 1.7; // radians
+    double w_collar_limit = 40.0;
+    double collar_amax = 0.8;   // radians
+    // collar joints {13,14}, shoulder joints {16,17} (按你原来的)
+    int collar_L = 13;
+    int collar_R = 14;
+    int shoulder_L = 16;
+    int shoulder_R = 17;
+
+    bool use_wrist_limits = true;
+    double w_wrist_limit = 80.0;
+    double wrist_amax = 0.6;
+    int wrist_L = 20;
+    int wrist_R = 21;
 
     // ------------- Arm–torso separation -----------
     bool use_arm_torso_sep = true;
 
-    // Optional tuning parameters (in meters and weights).
+    // Optional tuning parameters (meters and weights).
     double arm_torso_d_elbow = 0.08;
     double arm_torso_d_wrist = 0.10;
     double arm_torso_w_elbow = 80.0;
     double arm_torso_w_wrist = 120.0;
 
-    int arm_torso_seg_a = 3;  // spine2
-    int arm_torso_seg_b = 12;  // spine3
-
+    int arm_torso_seg_a = 3;   // spine2 (你原来写 spine2)
+    int arm_torso_seg_b = 12;  // spine3 (你原来写 spine3)
 
     // ---------- 3D unit test ----------
     bool amass_unit_test = false;
@@ -132,12 +159,12 @@ struct OptimizerConfig {
 
 // ------------------------------
 // OpenPose -> SMPL mapping
-// IMPORTANT: only declare here, define ONCE in optimizer.cpp
+// declare here, define ONCE in optimizer.cpp
 // ------------------------------
 extern const int OPENPOSE_TO_SMPL[25];
 
 // ============================================================
-// Helper (template): joints from mesh forward (slow but consistent with mesh)
+// Helper (template): joints from mesh forward
 // ============================================================
 template <typename T>
 inline void SMPLJointsFromMeshForward(
@@ -193,9 +220,7 @@ struct PoseRegularizer {
 };
 
 // ------------------------------
-// GMM Pose Prior Residual (SMPLify style)
-// Computes negative log-likelihood of pose under GMM
-// Residual dimension: 69 (one per pose parameter, weighted by GMM)
+// GMM Pose Prior Residual
 // ------------------------------
 struct GMMPosePriorResidual {
     GMMPosePriorResidual(const GMMPosePrior& gmm, double weight)
@@ -203,35 +228,27 @@ struct GMMPosePriorResidual {
 
     template <typename T>
     bool operator()(const T* const theta, T* residuals) const {
-        // theta[0:3] is root, we use theta[3:72] for GMM (69 dims)
         constexpr int D = 69;
         constexpr int K = 8;
 
-        // Find best component (lowest Mahalanobis distance + log weight penalty)
         T min_dist = T(1e10);
         int best_k = 0;
 
         for (int k = 0; k < K; ++k) {
             T dist = T(0);
             for (int i = 0; i < D; ++i) {
-                T diff = theta[3 + i] - T(gmm_.means(k, i));
                 T weighted = T(0);
-                for (int j = 0; j <= i; ++j) {  // Lower triangular
+                for (int j = 0; j <= i; ++j) {
                     weighted += T(gmm_.prec_choleskys[k](i, j)) * (theta[3 + j] - T(gmm_.means(k, j)));
                 }
                 dist += weighted * weighted;
             }
-            // Include log weight penalty
             T log_w = T(std::log(gmm_.weights(k) + 1e-10));
-            T score = dist - T(2.0) * log_w;  // -2*log(w) + d^2
+            T score = dist - T(2.0) * log_w;
 
-            if (score < min_dist) {
-                min_dist = score;
-                best_k = k;
-            }
+            if (score < min_dist) { min_dist = score; best_k = k; }
         }
 
-        // Output residuals using best component
         for (int i = 0; i < D; ++i) {
             T weighted = T(0);
             for (int j = 0; j <= i; ++j) {
@@ -239,7 +256,6 @@ struct GMMPosePriorResidual {
             }
             residuals[i] = T(weight_) * weighted;
         }
-
         return true;
     }
 
@@ -255,14 +271,13 @@ struct RootUprightResidual {
         const T up[3] = {T(0), T(1), T(0)};
         T up_rot[3];
         ceres::AngleAxisRotatePoint(aa, up, up_rot);
-
-        // Encourage body up-vector to align with +Y. Penalize x/z tilt.
         residuals[0] = T(w) * up_rot[0];
         residuals[1] = T(w) * up_rot[2];
         return true;
     }
     double w;
 };
+
 struct ArmSegToTorsoSegFloorResidual {
     ArmSegToTorsoSegFloorResidual(int arm_a, int arm_b,
                                   int torso_a, int torso_b,
@@ -285,7 +300,6 @@ struct ArmSegToTorsoSegFloorResidual {
         const Eigen::Matrix<T,3,1> B0 = J.row(ta).transpose();
         const Eigen::Matrix<T,3,1> B1 = J.row(tb).transpose();
 
-        // torso segment projection helper
         auto dist_point_to_seg = [&](const Eigen::Matrix<T,3,1>& P)->T{
             const Eigen::Matrix<T,3,1> AB = B1 - B0;
             const T ab2 = AB.squaredNorm() + T(1e-12);
@@ -295,14 +309,13 @@ struct ArmSegToTorsoSegFloorResidual {
             return ceres::sqrt((P - Q).squaredNorm() + T(1e-12));
         };
 
-        // sample along arm segment
         const T ts[3] = {T(0.2), T(0.5), T(0.8)};
         T sse = T(0);
         for (int i=0;i<3;++i){
             const Eigen::Matrix<T,3,1> P = A0 + ts[i]*(A1 - A0);
             const T dist = dist_point_to_seg(P);
             const T x = T(dmin) - dist;
-            const T viol = (ceres::abs(x) + x) * T(0.5); // max(0,x)
+            const T viol = (ceres::abs(x) + x) * T(0.5);
             sse += viol * viol;
         }
         residual[0] = T(w) * ceres::sqrt(sse + T(1e-12));
@@ -314,8 +327,6 @@ struct ArmSegToTorsoSegFloorResidual {
     const SmplModel& model;
 };
 
-// Coarse torso collision proxy: distance from a point joint to a torso segment (A-B).
-// Penalize if dist(point, segment) < d_min (hinge).
 struct PointToSegmentDistanceFloorResidual {
     PointToSegmentDistanceFloorResidual(int point_joint,
                                         int seg_a_joint,
@@ -361,8 +372,7 @@ struct PointToSegmentDistanceFloorResidual {
 };
 
 // ------------------------------
-// Hinge axis residual for elbows/knees
-// IMPORTANT FIX: range penalty only activates when outside [min_a, max_a]
+// Hinge axis residual
 // ------------------------------
 struct HingeAxisResidual {
     HingeAxisResidual(int joint_idx,
@@ -384,18 +394,15 @@ struct HingeAxisResidual {
         Eigen::Matrix<T,3,1> r(theta[base+0], theta[base+1], theta[base+2]);
         Eigen::Matrix<T,3,1> u(T(u_.x()), T(u_.y()), T(u_.z()));
 
-        // Project axis-angle vector onto hinge axis (small-angle approximation).
         const T a = u.dot(r);
         Eigen::Matrix<T,3,1> perp = r - u * a;
 
-        // Penalize rotation components orthogonal to hinge axis (suppresses twist-like drift).
         residual[0] = T(w_perp_) * ceres::sqrt(perp.squaredNorm() + T(1e-12));
 
-        // Soft range: penalize only if outside [min_a, max_a]
-        const T low = T(min_a_) - a;
+        const T low  = T(min_a_) - a;
         const T high = a - T(max_a_);
-        const T over_low = (ceres::abs(low) + low) * T(0.5);   // max(0, low)
-        const T over_high = (ceres::abs(high) + high) * T(0.5); // max(0, high)
+        const T over_low  = (ceres::abs(low)  + low)  * T(0.5);
+        const T over_high = (ceres::abs(high) + high) * T(0.5);
         residual[1] = T(w_range_) * (over_low + over_high);
 
         return true;
@@ -419,8 +426,6 @@ struct SoftAngleLimitResidual {
 
         const T ang = ceres::sqrt(rx*rx + ry*ry + rz*rz + T(1e-12));
         const T over = ang - T(amax_);
-
-        // max(0, over)
         const T abs_over = ceres::sqrt(over * over + T(1e-12));
         const T max0 = (abs_over + over) * T(0.5);
 
@@ -432,9 +437,6 @@ struct SoftAngleLimitResidual {
     double amax_, w_;
 };
 
-// ------------------------------
-// SMPLify-like hyperextension penalty (optional)
-// ------------------------------
 struct BendLimitResidual {
     BendLimitResidual(int joint_idx, int axis_idx, double sign, double weight)
         : joint_idx_(joint_idx), axis_idx_(axis_idx), sign_(sign), weight_(weight) {}
@@ -453,7 +455,7 @@ struct BendLimitResidual {
 };
 
 // ------------------------------
-// 2D reprojection residual (vectorized keypoints)
+// 2D reprojection residual
 // ------------------------------
 struct AllKeypointsReprojectionResidual {
     AllKeypointsReprojectionResidual(
@@ -464,9 +466,7 @@ struct AllKeypointsReprojectionResidual {
         bool use_stable_only,
         bool flip_y
     )
-    : camera_(cam),
-      model_(model),
-      flip_y_(flip_y)
+    : camera_(cam), model_(model), flip_y_(flip_y)
     {
         std::array<bool,25> allowed{};
         allowed.fill(true);
@@ -559,7 +559,7 @@ struct Joints3DResidualFast {
 };
 
 // ------------------------------
-// Depth residual (absolute depth in meters)
+// Depth residual (absolute)
 // ------------------------------
 struct DepthResidual {
     DepthResidual(const std::vector<JointDepthData>& depth_data_,
@@ -592,16 +592,13 @@ struct DepthResidual {
 };
 
 // ------------------------------
-// Relative depth residual (for Sapiens/monocular depth estimation)
-// Enforces relative depth ordering between pairs of joints.
-// If joint_a has smaller relative_depth than joint_b, then joint_a
-// should be closer to camera (smaller Z in world coordinates).
+// Relative depth residual
 // ------------------------------
 struct RelativeDepthPair {
     int smpl_joint_a;
     int smpl_joint_b;
-    double rel_depth_a;  // relative depth value at joint_a
-    double rel_depth_b;  // relative depth value at joint_b
+    double rel_depth_a;
+    double rel_depth_b;
 };
 
 struct RelativeDepthResidual {
@@ -620,34 +617,24 @@ struct RelativeDepthResidual {
         Eigen::Matrix<T, Eigen::Dynamic, 3, Eigen::RowMajor> J_pred;
         SMPLJointsForward<T>(beta, theta, trans, model, J_pred);
 
-        // For each pair, enforce depth ordering consistency.
-        // Sapiens depth: LARGER value = FURTHER from camera
-        // SMPL world Z:  LARGER value = FURTHER from camera
-        // So they have the SAME direction!
-        //
-        // If rel_a > rel_b (a further in Sapiens), then z_a > z_b (a further in world)
-        // => rel_diff and z_diff should have the SAME sign
         for (int i = 0; i < NumPairs(); ++i) {
             const int ja = pairs[i].smpl_joint_a;
             const int jb = pairs[i].smpl_joint_b;
 
-           const T z_a = J_pred(ja, 2);
+            const T z_a = J_pred(ja, 2);
             const T z_b = J_pred(jb, 2);
             const T z_diff = z_a - z_b;
 
             const double rel_diff = pairs[i].rel_depth_a - pairs[i].rel_depth_b;
 
-            // ignore ambiguous pairs
-            const double eps = 1e-3;  // 你可以调：1e-3 ~ 1e-2
+            const double eps = 1e-3;
             if (std::abs(rel_diff) < eps) {
                 residuals[i] = T(0);
                 continue;
             }
 
             const T s = T(rel_diff > 0 ? 1.0 : -1.0);
-
-            // penalize ONLY when ordering is wrong: s*z_diff < 0
-            const T violation = s * z_diff;  // >0 means wrong ordering (flipped sign)
+            const T violation = s * z_diff; // >0 => wrong ordering
             residuals[i] = T(w) * (violation > T(0) ? violation : T(0));
         }
         return true;

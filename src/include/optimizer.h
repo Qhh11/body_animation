@@ -132,6 +132,10 @@ struct OptimizerConfig {
     int wrist_L = 20;
     int wrist_R = 21;
 
+    // pelvis-over-ankles
+    bool use_pelvis_over_ankles = true;
+    double w_pelvis_over_ankles   = 10.0;
+
     // ------------- Arm–torso separation -----------
     bool use_arm_torso_sep = true;
 
@@ -380,6 +384,33 @@ struct PointToSegmentDistanceFloorResidual {
     int p, a, b;
     double dmin, w;
     const SmplModel& model;
+};
+
+struct TransZPriorResidual {
+  TransZPriorResidual(double z0_, double w_) : z0(z0_), w(w_) {}
+  template<typename T> bool operator()(const T* const trans, T* r) const {
+    r[0] = T(w) * (trans[2] - T(z0));
+    return true;
+  }
+  double z0, w;
+};
+
+struct PelvisOverAnklesResidual {
+  PelvisOverAnklesResidual(int pelvis_, int lank_, int rank_, double w_, const SmplModel& m)
+    : p(pelvis_), la(lank_), ra(rank_), w(w_), model(m) {}
+  template<typename T>
+  bool operator()(const T* const beta, const T* const theta, const T* const trans, T* r) const {
+    Eigen::Matrix<T,Eigen::Dynamic,3,Eigen::RowMajor> J;
+    SMPLJointsForward<T>(beta, theta, trans, model, J);
+
+    const T midx = (J(la,0) + J(ra,0)) * T(0.5);
+    const T midz = (J(la,2) + J(ra,2)) * T(0.5);
+
+    r[0] = T(w) * (J(p,0) - midx);   // x
+    r[1] = T(w) * (J(p,2) - midz);   // z
+    return true;
+  }
+  int p, la, ra; double w; const SmplModel& model;
 };
 
 // ------------------------------

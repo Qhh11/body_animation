@@ -414,6 +414,7 @@ static void AddPosePriorsUnified(ceres::Problem& problem,
             );
         }
     }
+
 }
 
 static void AddTemporalPriors(ceres::Problem& problem,
@@ -477,7 +478,7 @@ bool OptimizeSMPL(
                                   new ceres::HuberLoss(20.0));
 
         problem.SetParameterBlockConstant(beta);
-
+            
         // Lock all joints except the root (theta[0:3]).
         std::vector<int> const_idx;
         const_idx.reserve(69);
@@ -508,13 +509,18 @@ bool OptimizeSMPL(
                                   beta, theta, trans, cfg,
                                   new ceres::HuberLoss(5.0));
 
+        
         problem.SetParameterBlockConstant(beta);
 
         AddDepthBlock(problem, cfg, model, beta, theta, trans);
         AddRelativeDepthBlock(problem, cfg, model, beta, theta, trans);
 
         AddPosePriorsUnified(problem, cfg, model, beta, theta, trans, PriorStage::Stage2);
-
+        problem.AddResidualBlock(
+        new ceres::AutoDiffCostFunction<PelvisOverAnklesResidual,2,10,72,3>(
+            new PelvisOverAnklesResidual(0, 7, 8, 20.0, model)),
+        nullptr, beta, theta, trans);
+            
         problem.SetParameterLowerBound(trans, 2, 0.5);
         problem.SetParameterUpperBound(trans, 2, 20.0);
 

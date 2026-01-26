@@ -234,8 +234,8 @@ static OptimizerConfig MakeCfgForOpenPose() {
 
     // root upright
     cfg.use_root_upright = true;
-    cfg.root_upright_w_stage2 = 0.5;
-    cfg.root_upright_w_stage3 = 0.0;
+    cfg.root_upright_w_stage2 = 10.0;
+    cfg.root_upright_w_stage3 = 5.0;
 
     // shoulder/collar/wrist/spine 
     cfg.use_shoulder_collar_limits = true;
@@ -252,6 +252,8 @@ static OptimizerConfig MakeCfgForOpenPose() {
     cfg.w_spine     = 10.0;
     cfg.spine_amax  = 1.2;
 
+    cfg.use_pelvis_over_ankles = true;
+    
     // arm-torso sep
     cfg.use_arm_torso_sep = true;
     cfg.arm_torso_seg_a = 3;
@@ -451,7 +453,7 @@ void RunOpenPoseInference(const SmplModel& model) {
 
     // -------- Load Sapiens relative depth and create pairs --------
     std::vector<RelativeDepthPair> relative_depth_pairs;
-    std::string depth_path = "../../Data/sapiens_depth/courtyard_basketball_01/image_00025_depth.txt";
+    std::string depth_path = "../../Data/sapiens_depth/courtyard_basketball_01/image_00024_depth.txt";
     std::ifstream depth_file(depth_path);
     if (depth_file.is_open()) {
         std::vector<std::pair<int, double>> kp_depths;  // (smpl_idx, depth)
@@ -478,9 +480,9 @@ void RunOpenPoseInference(const SmplModel& model) {
         cfg.use_relative_depth = true; 
         cfg.w_relative_depth = 20.0;
         cfg.relative_depth_pairs = &relative_depth_pairs;
-        std::cout << "[Config] Relative depth currently DISABLED\n";
     }
 
+    cfg.use_relative_depth = false; 
     const bool ok = OptimizeSMPL(lms, camera, model, beta, theta, trans, cfg);
     if (!ok) {
         std::cerr << "OptimizeSMPL failed.\n";

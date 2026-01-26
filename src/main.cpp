@@ -149,6 +149,11 @@ static std::string MakeOpenPoseJsonPath(const std::string& dir, int frame) {
     std::snprintf(buf, sizeof(buf), "%s/image_%05d_keypoints.json", dir.c_str(), frame);
     return std::string(buf);
 }
+static std::string MakeOpenPoseDepthPath(const std::string& dir, int frame) {
+    char buf[512];
+    std::snprintf(buf, sizeof(buf), "%s/image_%05d.txt", dir.c_str(), frame);
+    return std::string(buf);
+}
 static std::string MakeOutObj(const std::string& out_dir, int frame) {
     char buf[512];
     std::snprintf(buf, sizeof(buf), "%s/mesh_%05d.obj", out_dir.c_str(), frame);
@@ -451,16 +456,18 @@ void RunOpenPoseInference(const SmplModel& model) {
 
     // -------- Load Sapiens relative depth and create pairs --------
     std::vector<RelativeDepthPair> relative_depth_pairs;
-    std::string depth_path = "../../Data/sapiens_depth/courtyard_basketball_01/image_00025_depth.txt";
+    std::string depth_path = "../../Data/sapiens_depth/courtyard_basketball_01/image_00025.txt";
     std::ifstream depth_file(depth_path);
     if (depth_file.is_open()) {
         std::vector<std::pair<int, double>> kp_depths;  // (smpl_idx, depth)
+        
         int op_idx;
         double depth_val;
         while (depth_file >> op_idx >> depth_val) {
             int smpl_idx = OPENPOSE_TO_SMPL[op_idx];
             if (smpl_idx >= 0) kp_depths.push_back({smpl_idx, depth_val});
         }
+        std::cout << "depth size: " << kp_depths.size() << "\n";
         depth_file.close();
 
         for (size_t i = 0; i < kp_depths.size(); ++i) {
@@ -478,7 +485,7 @@ void RunOpenPoseInference(const SmplModel& model) {
         cfg.use_relative_depth = true; 
         cfg.w_relative_depth = 20.0;
         cfg.relative_depth_pairs = &relative_depth_pairs;
-        std::cout << "[Config] Relative depth currently DISABLED\n";
+        std::cout << "[Config] Relative depth currently ENABLED\n";
     }
 
     const bool ok = OptimizeSMPL(lms, camera, model, beta, theta, trans, cfg);
@@ -500,6 +507,7 @@ void RunOpenPoseSequenceInference(const SmplModel& model) {
     std::cout << "\n=== MODE 3: OpenPose SEQUENCE (0-60) ===\n";
 
     const std::string seq_dir = "../../Data/openpose_output/courtyard_basketball_01";
+    const std::string depth_dir = "../../Data/sapiens_depth/courtyard_basketball_01";
     const std::string out_dir = "./seq_out";
     fs::create_directories(out_dir);
 
@@ -544,6 +552,42 @@ void RunOpenPoseSequenceInference(const SmplModel& model) {
         } else {
             EstimateGlobalTranslationXY(lms, camera, 3.0, trans);
         }
+        
+
+
+        std::vector<RelativeDepthPair> relative_depth_pairs;
+        std::cout << "[Frame " << f << "] Loading depth data...\n";
+        std::string depth_path = MakeOpenPoseDepthPath(depth_dir, f);
+        std::ifstream depth_file(depth_path);
+        if (depth_file.is_open()) {
+            std::vector<std::pair<int, double>> kp_depths;  // (smpl_idx, depth)
+            int op_idx;
+            double depth_val;
+            while (depth_file >> op_idx >> depth_val) {
+                int smpl_idx = OPENPOSE_TO_SMPL[op_idx];
+                if (smpl_idx >= 0) kp_depths.push_back({smpl_idx, depth_val});
+            }
+            depth_file.close();
+
+            for (size_t i = 0; i < kp_depths.size(); ++i) {
+                for (size_t j = i + 1; j < kp_depths.size(); ++j) {
+                    relative_depth_pairs.push_back({kp_depths[i].first, kp_depths[j].first,
+                                                    kp_depths[i].second, kp_depths[j].second});
+                }
+            }
+            std::cout << "[Depth] Created " << relative_depth_pairs.size() << " relative depth pairs\n";
+        } else {
+            std::cerr << "[Depth] Failed to open " << depth_path << "\n";
+        }
+
+        if (!relative_depth_pairs.empty()) {
+            cfg.use_relative_depth = true; 
+            cfg.w_relative_depth = 20.0;
+            cfg.relative_depth_pairs = &relative_depth_pairs;
+            std::cout << "[Config] Relative depth currently DISABLED\n";
+        }
+
+
 
         // 第一帧建议跑完整 OptimizeSMPL（含 Stage3），后续帧建议 tracked（只到 Stage2 或者 Stage3 也可但不推荐）
         bool ok = false;

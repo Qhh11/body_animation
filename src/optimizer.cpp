@@ -572,7 +572,7 @@ bool OptimizeSMPL(
 
         problem.SetParameterLowerBound(trans, 2, 0.5);
         problem.SetParameterUpperBound(trans, 2, 20.0);
-
+        
         ceres::Solver::Options options;
         SetupSolverOptions(options, cfg, cfg.max_iter_stage3);
         ceres::Solver::Summary summary;
@@ -652,6 +652,15 @@ bool OptimizeSMPLTracked(
 
         AddPosePriorsUnified(problem, cfg, model, beta, theta, trans, PriorStage::Stage2);
         AddTemporalPriors(problem, cfg, theta, trans, theta_prev, trans_prev, theta_prev2);
+
+        if (cfg.use_depth || cfg.use_relative_depth) {
+            problem.AddResidualBlock(
+                new ceres::AutoDiffCostFunction<TransZPriorResidual, 1, 3>(
+                    new TransZPriorResidual(trans_prev[2], /*w=*/600.0)),
+                nullptr, trans
+            );
+        }
+
         problem.SetParameterLowerBound(trans, 2, 0.5);
         problem.SetParameterUpperBound(trans, 2, 20.0);
 
@@ -678,6 +687,14 @@ bool OptimizeSMPLTracked(
         AddDepthBlock(problem, cfg, model, beta, theta, trans);
         AddRelativeDepthBlock(problem, cfg, model, beta, theta, trans);
 
+        if (cfg.use_depth || cfg.use_relative_depth) {
+            problem.AddResidualBlock(
+                new ceres::AutoDiffCostFunction<TransZPriorResidual, 1, 3>(
+                    new TransZPriorResidual(trans_prev[2], /*w=*/600.0)),
+                nullptr, trans
+            );
+        }
+
         // shape regularization 
         const double shape_reg_weight = 25.0;
         for (int i = 0; i < 10; ++i) {
@@ -692,12 +709,13 @@ bool OptimizeSMPLTracked(
         AddTemporalPriors(problem, cfg, theta, trans, theta_prev, trans_prev, theta_prev2);
         problem.SetParameterLowerBound(trans, 2, 0.5);
         problem.SetParameterUpperBound(trans, 2, 20.0);
+        problem.SetParameterBlockConstant(beta);
 
         ceres::Solver::Options options;
         SetupSolverOptions(options, cfg, cfg.max_iter_stage3);
         ceres::Solver::Summary summary;
         ceres::Solve(options, &problem, &summary);
-
+        
         if (cfg.verbose) std::cout << "[Final] " << summary.BriefReport() << "\n";
         if (!summary.IsSolutionUsable()) return false;
     }

@@ -527,7 +527,7 @@ void RunOpenPoseSequenceInference(const SmplModel& model) {
     cfg.w_temp_pose  = 40.0; 
     cfg.w_temp_trans = 20.0;
     cfg.use_temporal_acc = false;
-    cfg.max_iter_stage3 = 0;
+    //cfg.max_iter_stage3 = 0;
 
     double beta[10]  = {0.0};
     double theta[72] = {0.0};
@@ -543,10 +543,23 @@ void RunOpenPoseSequenceInference(const SmplModel& model) {
     for (int f = start; f <= end; ++f) {
         std::string json_path = MakeOpenPoseJsonPath(seq_dir, f);
         std::vector<Landmark2D> lms;
+        cfg.use_relative_depth = false;
+        cfg.relative_depth_pairs = nullptr;
+
         if (!LoadLandmarksFromJSON(json_path, lms)) {
             std::cerr << "[Frame " << f << "] failed to load: " << json_path << "\n";
             continue;
         }
+        auto get_conf = [&](int op_id)->double{
+            for (auto& lm: lms) if (lm.joint_id == op_id) return lm.confidence;
+            return 0.0;
+        };
+
+        // OpenPose: 8 midhip, 9/12 hips, 10/13 knees, 11/14 ankles
+        std::cout << "[Frame " << f << "] conf: "
+                << "RHip=" << get_conf(9)  << " RKnee=" << get_conf(10) << " RAnk=" << get_conf(11)
+                << " | LHip=" << get_conf(12) << " LKnee=" << get_conf(13) << " LAnk=" << get_conf(14)
+                << "\n";
 
         if (has_prev) {
             std::memcpy(theta, theta_prev, sizeof(theta));
@@ -555,9 +568,7 @@ void RunOpenPoseSequenceInference(const SmplModel& model) {
             EstimateGlobalTranslationXY(lms, camera, 3.0, trans);
         }
         
-
         std::vector<RelativeDepthPair> relative_depth_pairs;
-        std::cout << "[Frame " << f << "] Loading depth data...\n";
         std::string depth_path = MakeOpenPoseDepthPath(depth_dir, f);
         std::ifstream depth_file(depth_path);
         if (depth_file.is_open()) {
@@ -587,8 +598,6 @@ void RunOpenPoseSequenceInference(const SmplModel& model) {
             cfg.relative_depth_pairs = &relative_depth_pairs;
         }
 
-
-        // 第一帧建议跑完整 OptimizeSMPL（含 Stage3），后续帧建议 tracked（只到 Stage2 或者 Stage3 也可但不推荐）
         bool ok = false;
         if (!has_prev) {
             ok = OptimizeSMPL(lms, camera, model, beta, theta, trans, cfg); 

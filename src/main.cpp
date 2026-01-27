@@ -137,9 +137,7 @@ bool LoadLandmarksFromJSON(
         if (c > 0.05f) landmarks.emplace_back(x, y, c, joint_id);
     }
 
-    std::cout << "[OpenPose] picked person index = " << best_idx
-              << " / " << people.size()
-              << " (score=" << best_score << ")\n";
+    //std::cout << "[OpenPose] picked person index = " << best_idx<< " / " << people.size()<< " (score=" << best_score << ")\n";
 
     return !landmarks.empty();
 }
@@ -150,10 +148,15 @@ static std::string MakeOpenPoseJsonPath(const std::string& dir, int frame) {
     return std::string(buf);
 }
 static std::string MakeOpenPoseDepthPath(const std::string& dir, int frame) {
-    char buf[512];
-    std::snprintf(buf, sizeof(buf), "%s/image_%05d.txt", dir.c_str(), frame);
-    return std::string(buf);
+    char buf1[512], buf2[512];
+    std::snprintf(buf1, sizeof(buf1), "%s/image_%05d_depth.txt", dir.c_str(), frame);
+    std::snprintf(buf2, sizeof(buf2), "%s/image_%05d.txt", dir.c_str(), frame);
+
+    if (fs::exists(buf1)) return std::string(buf1);
+    if (fs::exists(buf2)) return std::string(buf2);
+    return std::string(buf1); 
 }
+
 static std::string MakeOutObj(const std::string& out_dir, int frame) {
     char buf[512];
     std::snprintf(buf, sizeof(buf), "%s/mesh_%05d.obj", out_dir.c_str(), frame);
@@ -239,8 +242,8 @@ static OptimizerConfig MakeCfgForOpenPose() {
 
     // root upright
     cfg.use_root_upright = true;
-    cfg.root_upright_w_stage2 = 10.0;
-    cfg.root_upright_w_stage3 = 5.0;
+    cfg.root_upright_w_stage2 = 5.0;
+    cfg.root_upright_w_stage3 = 1.0;
 
     // shoulder/collar/wrist/spine 
     cfg.use_shoulder_collar_limits = true;
@@ -432,7 +435,7 @@ double RunAMASSValidation(const SmplModel& model, const std::string& amass_path,
 void RunOpenPoseInference(const SmplModel& model) {
     std::cout << "\n=== MODE 2: Running Real OpenPose Data ===\n";
 
-    std::string json_path = "../../Data/openpose_output/courtyard_basketball_01/image_00024_keypoints.json";
+    std::string json_path = "../../Data/openpose_output/courtyard_basketball_01/image_00047_keypoints.json";
     std::vector<Landmark2D> lms;
     if (!LoadLandmarksFromJSON(json_path, lms)) {
         std::cerr << "Failed to load json.\n";
@@ -458,7 +461,7 @@ void RunOpenPoseInference(const SmplModel& model) {
 
     // -------- Load Sapiens relative depth and create pairs --------
     std::vector<RelativeDepthPair> relative_depth_pairs;
-    std::string depth_path = "../../Data/sapiens_depth/courtyard_basketball_01/image_00024_depth.txt";
+    std::string depth_path = "../../Data/sapiens_depth/courtyard_basketball_01/image_00047_depth.txt";
     std::ifstream depth_file(depth_path);
     if (depth_file.is_open()) {
         std::vector<std::pair<int, double>> kp_depths;  // (smpl_idx, depth)
@@ -489,7 +492,6 @@ void RunOpenPoseInference(const SmplModel& model) {
         cfg.relative_depth_pairs = &relative_depth_pairs;
     }
 
-    cfg.use_relative_depth = false; 
     const bool ok = OptimizeSMPL(lms, camera, model, beta, theta, trans, cfg);
     if (!ok) {
         std::cerr << "OptimizeSMPL failed.\n";
@@ -522,16 +524,15 @@ void RunOpenPoseSequenceInference(const SmplModel& model) {
 
     OptimizerConfig cfg = MakeCfgForOpenPose();
     cfg.use_temporal = true;
-    cfg.w_temp_pose  = 12.0;   
-    cfg.w_temp_trans = 2.0;
+    cfg.w_temp_pose  = 40.0; 
+    cfg.w_temp_trans = 20.0;
     cfg.use_temporal_acc = false;
+    cfg.max_iter_stage3 = 0;
 
     double beta[10]  = {0.0};
-
     double theta[72] = {0.0};
     double trans[3]  = {0.0, 0.0, 3.0};
 
-    // 前两帧缓存（用于 temporal）
     double theta_prev[72]  = {0.0};
     double theta_prev2[72] = {0.0};
     double trans_prev[3]   = {0.0, 0.0, 3.0};
@@ -547,7 +548,6 @@ void RunOpenPoseSequenceInference(const SmplModel& model) {
             continue;
         }
 
-        // warm start：默认用上一帧结果
         if (has_prev) {
             std::memcpy(theta, theta_prev, sizeof(theta));
             std::memcpy(trans, trans_prev, sizeof(trans));
@@ -555,7 +555,6 @@ void RunOpenPoseSequenceInference(const SmplModel& model) {
             EstimateGlobalTranslationXY(lms, camera, 3.0, trans);
         }
         
-
 
         std::vector<RelativeDepthPair> relative_depth_pairs;
         std::cout << "[Frame " << f << "] Loading depth data...\n";
@@ -586,9 +585,7 @@ void RunOpenPoseSequenceInference(const SmplModel& model) {
             cfg.use_relative_depth = true; 
             cfg.w_relative_depth = 20.0;
             cfg.relative_depth_pairs = &relative_depth_pairs;
-            std::cout << "[Config] Relative depth currently DISABLED\n";
         }
-
 
 
         // 第一帧建议跑完整 OptimizeSMPL（含 Stage3），后续帧建议 tracked（只到 Stage2 或者 Stage3 也可但不推荐）

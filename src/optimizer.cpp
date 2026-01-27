@@ -403,6 +403,15 @@ static void AddPosePriorsUnified(ceres::Problem& problem,
     // arm-torso separation
     AddArmTorsoSeparation(problem, cfg, model, beta, theta, trans);
 
+    // --- pelvis over ankles ---
+    if (cfg.use_pelvis_over_ankles && cfg.w_pelvis_over_ankles > 0.0) {
+        problem.AddResidualBlock(
+            new ceres::AutoDiffCostFunction<PelvisOverAnklesResidual, 2, 10, 72, 3>(
+                new PelvisOverAnklesResidual(0, 7, 8, cfg.w_pelvis_over_ankles, model)),
+            nullptr, beta, theta, trans
+        );
+    }
+
     // root upright (stage-wise)
     if (cfg.use_root_upright) {
         const double w = (stage == PriorStage::Stage2) ? cfg.root_upright_w_stage2 : cfg.root_upright_w_stage3;
@@ -431,6 +440,12 @@ static void AddTemporalPriors(ceres::Problem& problem,
             new ceres::AutoDiffCostFunction<TemporalPoseResidual, ceres::DYNAMIC, 72>(
                 new TemporalPoseResidual(theta_prev, cfg.w_temp_pose, cfg.temporal_body_only),
                 dim),
+            nullptr, theta
+        );
+        const double w_root = cfg.w_temp_pose; 
+        problem.AddResidualBlock(
+            new ceres::AutoDiffCostFunction<TemporalRootResidual, 3, 72>(
+                new TemporalRootResidual(theta_prev, w_root)),
             nullptr, theta
         );
     }
@@ -516,10 +531,6 @@ bool OptimizeSMPL(
         AddRelativeDepthBlock(problem, cfg, model, beta, theta, trans);
 
         AddPosePriorsUnified(problem, cfg, model, beta, theta, trans, PriorStage::Stage2);
-        problem.AddResidualBlock(
-        new ceres::AutoDiffCostFunction<PelvisOverAnklesResidual,2,10,72,3>(
-            new PelvisOverAnklesResidual(0, 7, 8, 20.0, model)),
-        nullptr, beta, theta, trans);
             
         problem.SetParameterLowerBound(trans, 2, 0.5);
         problem.SetParameterUpperBound(trans, 2, 20.0);
@@ -587,11 +598,12 @@ bool OptimizeSMPLTracked(
     const double* theta_prev2
 ) {
     std::cout << "[Optimizer] Starting 2D Optimization...\n";
+
     // ----------------------------
     // Stage 1: trans + root only
     // ----------------------------
     {
-        if (cfg.verbose) std::cout << "\n>>> Stage 1: trans + full root (3DoF)\n";
+        if (cfg.verbose) std::cout << "\n>>> Stage 1: trans + full root (lightweight) \n";
         ceres::Problem problem;
 
         AddAllKeypointReprojBlock(problem, observed_keypoints, camera, model,
@@ -599,26 +611,29 @@ bool OptimizeSMPLTracked(
                                   new ceres::HuberLoss(20.0));
 
         problem.SetParameterBlockConstant(beta);
-
-        // Lock all joints except the root (theta[0:3]).
+            
         std::vector<int> const_idx;
         const_idx.reserve(69);
         for (int i = 3; i < 72; ++i) const_idx.push_back(i);
+
         problem.SetManifold(theta, new ceres::SubsetManifold(72, const_idx));
 
-        // simple Z bounds
-        problem.SetParameterLowerBound(trans, 2, 0.5);
-        problem.SetParameterUpperBound(trans, 2, 20.0);
+        AddTemporalPriors(problem, cfg, theta, trans, theta_prev, trans_prev, theta_prev2);
 
+        if (cfg.use_depth || cfg.use_relative_depth) {
+            problem.AddResidualBlock(
+                new ceres::AutoDiffCostFunction<TransZPriorResidual, 1, 3>(
+                    new TransZPriorResidual(trans_prev[2], /*w=*/200.0)),
+                nullptr, trans
+            );
+         }
         ceres::Solver::Options options;
         SetupSolverOptions(options, cfg, cfg.max_iter_stage1);
         ceres::Solver::Summary summary;
         ceres::Solve(options, &problem, &summary);
-
         if (cfg.verbose) std::cout << summary.BriefReport() << "\n";
         if (!summary.IsSolutionUsable()) return false;
     }
-
     // ----------------------------
     // Stage 2: full pose (beta fixed)
     // ----------------------------

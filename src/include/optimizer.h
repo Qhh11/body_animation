@@ -555,6 +555,22 @@ struct TemporalAccelPoseResidual {
     bool body_only;
 };
 
+struct TemporalRootResidual {
+    TemporalRootResidual(const double* theta_prev_, double w_)
+        : prev(theta_prev_), w(w_) {}
+
+    template <typename T>
+    bool operator()(const T* const theta, T* residuals) const {
+        residuals[0] = T(w) * (theta[0] - T(prev[0]));
+        residuals[1] = T(w) * (theta[1] - T(prev[1]));
+        residuals[2] = T(w) * (theta[2] - T(prev[2]));
+        return true;
+    }
+    const double* prev;
+    double w;
+};
+
+
 // ------------------------------
 // 2D reprojection residual
 // ------------------------------

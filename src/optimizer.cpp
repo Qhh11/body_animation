@@ -181,8 +181,56 @@ static void AddRelativeDepthBlock(
     problem.AddResidualBlock(cost, nullptr, beta, theta, trans);
 }
 
+static void AddDepthAffineBlock(
+    ceres::Problem& problem,
+    const OptimizerConfig& cfg,
+    const SmplModel& model,
+    double* beta,
+    double* theta,
+    double* trans
+) {
+    if (!cfg.use_depth_affine ||
+        cfg.depth_affine_data == nullptr || cfg.depth_affine_data->empty() ||
+        cfg.depth_affine_params == nullptr) return;
+
+    auto* functor = new DepthAffineResidual(*cfg.depth_affine_data, model,
+                                            cfg.w_depth_affine, cfg.depth_affine_sign);
+
+    auto* cost = new ceres::AutoDiffCostFunction<
+        DepthAffineResidual, ceres::DYNAMIC, 10, 72, 3, 2>(
+            functor, (int)cfg.depth_affine_data->size());
+
+    // robust loss helps a lot (depth can be noisy)
+    ceres::LossFunction* loss = new ceres::CauchyLoss(0.15);
+
+    problem.AddResidualBlock(cost, loss, beta, theta, trans, cfg.depth_affine_params);
+
+    // keep scale positive
+    problem.SetParameterLowerBound(cfg.depth_affine_params, 0, 1e-6);
+    problem.SetParameterUpperBound(cfg.depth_affine_params, 0, 1e6);
+}
+
+static void AddTemporalDepthAffinePrior(
+    ceres::Problem& problem,
+    const OptimizerConfig& cfg
+) {
+    if (!cfg.use_temporal_depth_affine ||
+        cfg.depth_affine_prev == nullptr ||
+        cfg.depth_affine_params == nullptr) return;
+
+    problem.AddResidualBlock(
+        new ceres::AutoDiffCostFunction<TemporalDepthAffineResidual, 2, 2>(
+            new TemporalDepthAffineResidual(cfg.depth_affine_prev,
+                                            cfg.w_temp_depth_scale,
+                                            cfg.w_temp_depth_bias)),
+        nullptr,
+        cfg.depth_affine_params
+    );
+}
+
+
 // -----------------------------------------
-// Priors helpers (统一风格)
+// Priors helpers 
 // -----------------------------------------
 static Eigen::Vector3d AxisBasis(int axis) {
     if (axis == 0) return Eigen::Vector3d(1,0,0);
@@ -368,6 +416,38 @@ static void AddArmTorsoSeparation(ceres::Problem& problem,
     add_point(21, cfg.arm_torso_d_wrist, cfg.arm_torso_w_wrist);
 }
 
+static void ApplyExtremityLocksIfEnabled(
+    ceres::Problem& problem,
+    const OptimizerConfig& cfg,
+    double* theta
+) {
+    std::vector<int> const_idx;
+
+    auto lock_joint = [&](int j){
+        if (j < 0) return;
+        const_idx.push_back(3*j + 0);
+        const_idx.push_back(3*j + 1);
+        const_idx.push_back(3*j + 2);
+    };
+
+    if (cfg.lock_wrists) {
+        lock_joint(cfg.wrist_L); // 20
+        lock_joint(cfg.wrist_R); // 21
+    }
+    if (cfg.lock_hands) {
+        lock_joint(cfg.hand_L);  // 22
+        lock_joint(cfg.hand_R);  // 23
+    }
+    if (cfg.lock_feet) {
+        lock_joint(cfg.foot_L);  // 10
+        lock_joint(cfg.foot_R);  // 11
+    }
+
+    if (!const_idx.empty()) {
+        problem.SetManifold(theta, new ceres::SubsetManifold(72, const_idx));
+    }
+}
+
 enum class PriorStage { Stage2, Stage3 };
 
 static void AddPosePriorsUnified(ceres::Problem& problem,
@@ -423,6 +503,38 @@ static void AddPosePriorsUnified(ceres::Problem& problem,
             );
         }
     }
+
+    // --- foot ground / flat ---
+    if (cfg.use_foot_ground) {
+        // Left foot
+        if (cfg.foot_contact_L > 1e-6) {
+            problem.AddResidualBlock(
+                new ceres::AutoDiffCostFunction<FootGroundFlatResidual, 2, 10, 72, 3>(
+                    new FootGroundFlatResidual(
+                        /*ankle=*/7, /*foot=*/cfg.foot_L,
+                        cfg.ground_y,
+                        cfg.w_foot_ground, cfg.w_foot_flat,
+                        cfg.foot_contact_L,
+                        model)),
+                nullptr, beta, theta, trans
+            );
+        }
+
+        // Right foot
+        if (cfg.foot_contact_R > 1e-6) {
+            problem.AddResidualBlock(
+                new ceres::AutoDiffCostFunction<FootGroundFlatResidual, 2, 10, 72, 3>(
+                    new FootGroundFlatResidual(
+                        /*ankle=*/8, /*foot=*/cfg.foot_R,
+                        cfg.ground_y,
+                        cfg.w_foot_ground, cfg.w_foot_flat,
+                        cfg.foot_contact_R,
+                        model)),
+                nullptr, beta, theta, trans
+            );
+        }
+    }
+
 
 }
 
@@ -526,10 +638,10 @@ bool OptimizeSMPL(
 
         
         problem.SetParameterBlockConstant(beta);
-
+        ApplyExtremityLocksIfEnabled(problem, cfg, theta);
         AddDepthBlock(problem, cfg, model, beta, theta, trans);
         AddRelativeDepthBlock(problem, cfg, model, beta, theta, trans);
-
+        AddDepthAffineBlock(problem, cfg, model, beta, theta, trans);
         AddPosePriorsUnified(problem, cfg, model, beta, theta, trans, PriorStage::Stage2);
             
         problem.SetParameterLowerBound(trans, 2, 0.5);
@@ -557,6 +669,7 @@ bool OptimizeSMPL(
 
         AddDepthBlock(problem, cfg, model, beta, theta, trans);
         AddRelativeDepthBlock(problem, cfg, model, beta, theta, trans);
+        AddDepthAffineBlock(problem, cfg, model, beta, theta, trans);
 
         // shape regularization 
         const double shape_reg_weight = 25.0;
@@ -567,7 +680,7 @@ bool OptimizeSMPL(
                 nullptr, beta
             );
         }
-
+        
         AddPosePriorsUnified(problem, cfg, model, beta, theta, trans, PriorStage::Stage3);
 
         problem.SetParameterLowerBound(trans, 2, 0.5);
@@ -620,7 +733,7 @@ bool OptimizeSMPLTracked(
 
         AddTemporalPriors(problem, cfg, theta, trans, theta_prev, trans_prev, theta_prev2);
 
-        if (cfg.use_depth || cfg.use_relative_depth) {
+        if (cfg.use_depth || cfg.use_relative_depth || cfg.use_depth_affine) {
             problem.AddResidualBlock(
                 new ceres::AutoDiffCostFunction<TransZPriorResidual, 1, 3>(
                     new TransZPriorResidual(trans_prev[2], /*w=*/200.0)),
@@ -646,14 +759,15 @@ bool OptimizeSMPLTracked(
                                   new ceres::HuberLoss(5.0));
 
         problem.SetParameterBlockConstant(beta);
-
+        ApplyExtremityLocksIfEnabled(problem, cfg, theta);
         AddDepthBlock(problem, cfg, model, beta, theta, trans);
         AddRelativeDepthBlock(problem, cfg, model, beta, theta, trans);
-
+        AddDepthAffineBlock(problem, cfg, model, beta, theta, trans);
+        AddTemporalDepthAffinePrior(problem, cfg);
         AddPosePriorsUnified(problem, cfg, model, beta, theta, trans, PriorStage::Stage2);
         AddTemporalPriors(problem, cfg, theta, trans, theta_prev, trans_prev, theta_prev2);
 
-        if (cfg.use_depth || cfg.use_relative_depth) {
+        if (cfg.use_depth || cfg.use_relative_depth || cfg.use_depth_affine) {
             problem.AddResidualBlock(
                 new ceres::AutoDiffCostFunction<TransZPriorResidual, 1, 3>(
                     new TransZPriorResidual(trans_prev[2], /*w=*/600.0)),
@@ -673,6 +787,10 @@ bool OptimizeSMPLTracked(
         if (!summary.IsSolutionUsable()) return false;
     }
 
+    if (cfg.max_iter_stage3 <= 0) {
+    return true; // skip stage3 for speed
+    }
+
     // ----------------------------
     // Stage 3: refine beta + pose + trans
     // ----------------------------
@@ -683,11 +801,14 @@ bool OptimizeSMPLTracked(
         AddAllKeypointReprojBlock(problem, observed_keypoints, camera, model,
                                   beta, theta, trans, cfg,
                                   new ceres::HuberLoss(5.0));
+        ApplyExtremityLocksIfEnabled(problem, cfg, theta);
 
         AddDepthBlock(problem, cfg, model, beta, theta, trans);
         AddRelativeDepthBlock(problem, cfg, model, beta, theta, trans);
+        AddDepthAffineBlock(problem, cfg, model, beta, theta, trans);
+        AddTemporalDepthAffinePrior(problem, cfg);
 
-        if (cfg.use_depth || cfg.use_relative_depth) {
+        if (cfg.use_depth || cfg.use_relative_depth || cfg.use_depth_affine) {
             problem.AddResidualBlock(
                 new ceres::AutoDiffCostFunction<TransZPriorResidual, 1, 3>(
                     new TransZPriorResidual(trans_prev[2], /*w=*/600.0)),

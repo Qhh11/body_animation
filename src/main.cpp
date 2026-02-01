@@ -271,6 +271,13 @@ static OptimizerConfig MakeCfgForOpenPose() {
     cfg.arm_torso_w_elbow = 80.0;
     cfg.arm_torso_w_wrist = 120.0;
 
+    cfg.lock_wrists = true;
+    cfg.lock_hands  = true;
+    cfg.lock_feet   = true;
+
+    // foot constraints: enable in sequence after ground_y known
+    cfg.use_foot_ground = false;
+
     // solver
     cfg.threads = -1;
     cfg.print_progress = false;
@@ -508,26 +515,33 @@ void RunOpenPoseInference(const SmplModel& model) {
 } // namespace
 
 void RunOpenPoseSequenceInference(const SmplModel& model) {
-    std::cout << "\n=== MODE 3: OpenPose SEQUENCE (0-60) ===\n";
+    std::cout << "\n=== MODE 3: OpenPose SEQUENCE ===\n";
 
-    const std::string seq_dir = "../../Data/openpose_output/courtyard_basketball_01";
+    const std::string seq_dir   = "../../Data/openpose_output/courtyard_basketball_01";
     const std::string depth_dir = "../../Data/sapiens_depth/courtyard_basketball_01";
-    const std::string out_dir = "./seq_out";
+    const std::string out_dir   = "./seq_out";
     fs::create_directories(out_dir);
 
     const int start = 0;
-    const int end   = 60;
+    const int end   = 200;
 
     const int img_w = 1080;
     const int img_h = 1920;
     CameraIntrinsics camera(1962.0f, 1969.0f, 540.0f, 960.0f, img_w, img_h);
 
     OptimizerConfig cfg = MakeCfgForOpenPose();
+
     cfg.use_temporal = true;
-    cfg.w_temp_pose  = 40.0; 
-    cfg.w_temp_trans = 20.0;
-    cfg.use_temporal_acc = false;
-    //cfg.max_iter_stage3 = 0;
+    cfg.w_temp_pose  = 12.0;
+    cfg.w_temp_trans = 6.0;
+    cfg.use_temporal_acc = true;
+    cfg.w_temp_acc_pose  = 2.0;
+    cfg.temporal_body_only = true;
+
+    cfg.use_foot_ground = true;
+    cfg.w_foot_ground   = 140.0;   
+    cfg.w_foot_flat     = 80.0;  
+    cfg.ground_y        = 0.0;     
 
     double beta[10]  = {0.0};
     double theta[72] = {0.0};
@@ -537,70 +551,219 @@ void RunOpenPoseSequenceInference(const SmplModel& model) {
     double theta_prev2[72] = {0.0};
     double trans_prev[3]   = {0.0, 0.0, 3.0};
 
-    bool has_prev = false;
+    bool has_prev  = false;
     bool has_prev2 = false;
+
+    double depth_affine[2]      = {1e-3, 3.0};
+    double depth_affine_prev[2] = {1e-3, 3.0};
+
+    static bool kp_ema_init = false;
+    static double kp_x[25], kp_y[25], kp_seen[25];
+
+    auto smooth_landmarks_inplace = [&](std::vector<Landmark2D>& lms) {
+        if (!kp_ema_init) {
+            for (int i=0;i<25;++i){ kp_x[i]=0; kp_y[i]=0; kp_seen[i]=0; }
+            kp_ema_init = true;
+        }
+        for (auto& lm : lms) {
+            int id = lm.joint_id;
+            if (id < 0 || id >= 25) continue;
+            if (lm.confidence < 0.20f) continue;
+
+            // adaptive EMA: higher conf -> more trust current
+            double a = 0.45 + 0.45 * std::min(1.0, std::max(0.0, (double)lm.confidence));
+            if (kp_seen[id] < 0.5) {
+                kp_x[id] = lm.x;
+                kp_y[id] = lm.y;
+                kp_seen[id] = 1.0;
+            } else {
+                kp_x[id] = a * lm.x + (1.0 - a) * kp_x[id];
+                kp_y[id] = a * lm.y + (1.0 - a) * kp_y[id];
+            }
+            lm.x = (float)kp_x[id];
+            lm.y = (float)kp_y[id];
+        }
+    };
+
+    auto get_conf = [&](const std::vector<Landmark2D>& lms, int op_id)->double{
+        for (auto& lm: lms) if (lm.joint_id == op_id) return lm.confidence;
+        return 0.0;
+    };
+
+    auto get_xy = [&](const std::vector<Landmark2D>& lms, int op_id, double& x, double& y)->bool{
+        for (auto& lm: lms) if (lm.joint_id == op_id) { x = lm.x; y = lm.y; return true; }
+        return false;
+    };
+
+    auto is_stable_op = [&](int op_id)->bool{
+        // stable set (no wrists/feet)
+        int ids[] = {1,2,3,4,5,6,7,8,9,10,11,12,13,14};
+        for (int x: ids) if (x == op_id) return true;
+        return false;
+    };
+
+    bool ground_init = false;
+    double ground_y_est = 0.0;
+    bool ankle_prev_valid = false;
+    double prev_LA_x=0, prev_LA_y=0, prev_RA_x=0, prev_RA_y=0;
+
+    auto compute_contact = [&](const std::vector<Landmark2D>& lms, bool is_left)->double{
+        int op_ank = is_left ? 14 : 11;
+        int op_kne = is_left ? 13 : 10; // LKnee / RKnee
+
+        const double cA = get_conf(lms, op_ank);
+        const double cK = get_conf(lms, op_kne);
+        if (cA < 0.35 || cK < 0.35) return 0.0;
+
+        double ax, ay;
+        if (!get_xy(lms, op_ank, ax, ay)) return 0.0;
+
+        // near bottom of image => likely on ground
+        double y_norm = ay / double(img_h); // 0 top, 1 bottom
+        double ground_like = 0.0;
+        if (y_norm > 0.80) ground_like = 1.0;
+        else if (y_norm > 0.72) ground_like = (y_norm - 0.72) / (0.80 - 0.72);
+        else ground_like = 0.0;
+
+        // low 2D speed => likely planted
+        double speed_like = 1.0;
+        if (ankle_prev_valid) {
+            double px = is_left ? prev_LA_x : prev_RA_x;
+            double py = is_left ? prev_LA_y : prev_RA_y;
+            double sp = std::sqrt((ax-px)*(ax-px) + (ay-py)*(ay-py)); // px/frame
+            if (sp > 18.0) speed_like = 0.0;
+            else if (sp > 6.0) speed_like = (18.0 - sp) / (18.0 - 6.0);
+            else speed_like = 1.0;
+        }
+
+        // combine + confidence
+        double conf_like = std::min(1.0, 0.5*(cA+cK));
+        double contact = ground_like * speed_like * conf_like;
+
+        // avoid too binary
+        contact = std::min(1.0, std::max(0.0, contact));
+        return contact;
+    };
 
     for (int f = start; f <= end; ++f) {
         std::string json_path = MakeOpenPoseJsonPath(seq_dir, f);
         std::vector<Landmark2D> lms;
+
+        // reset depth flags per frame
         cfg.use_relative_depth = false;
         cfg.relative_depth_pairs = nullptr;
+
+        cfg.use_depth = false;
+        cfg.depth_data = nullptr;
+
+        cfg.use_depth_affine = false;
+        cfg.depth_affine_data = nullptr;
+        cfg.depth_affine_params = nullptr;
+        cfg.depth_affine_prev = nullptr;
 
         if (!LoadLandmarksFromJSON(json_path, lms)) {
             std::cerr << "[Frame " << f << "] failed to load: " << json_path << "\n";
             continue;
         }
-        auto get_conf = [&](int op_id)->double{
-            for (auto& lm: lms) if (lm.joint_id == op_id) return lm.confidence;
-            return 0.0;
-        };
 
-        // OpenPose: 8 midhip, 9/12 hips, 10/13 knees, 11/14 ankles
-        std::cout << "[Frame " << f << "] conf: "
-                << "RHip=" << get_conf(9)  << " RKnee=" << get_conf(10) << " RAnk=" << get_conf(11)
-                << " | LHip=" << get_conf(12) << " LKnee=" << get_conf(13) << " LAnk=" << get_conf(14)
-                << "\n";
+        // 2D smoothing
+        smooth_landmarks_inplace(lms);
 
         if (has_prev) {
             std::memcpy(theta, theta_prev, sizeof(theta));
             std::memcpy(trans, trans_prev, sizeof(trans));
+            depth_affine[0] = depth_affine_prev[0];
+            depth_affine[1] = depth_affine_prev[1];
         } else {
             EstimateGlobalTranslationXY(lms, camera, 3.0, trans);
+            depth_affine[0] = 1e-3;
+            depth_affine[1] = trans[2];
         }
-        
-        std::vector<RelativeDepthPair> relative_depth_pairs;
+
+        {
+            auto damp_joint = [&](int j, double s){
+                theta[3*j+0] *= s;
+                theta[3*j+1] *= s;
+                theta[3*j+2] *= s;
+            };
+            // s=0 -> fully fixed; s in (0,1) -> gentle damping
+            damp_joint(20, 0.10);
+            damp_joint(21, 0.10);
+        }
+
+
+        std::vector<JointRelDepthData> depth_pts;
         std::string depth_path = MakeOpenPoseDepthPath(depth_dir, f);
         std::ifstream depth_file(depth_path);
+
         if (depth_file.is_open()) {
-            std::vector<std::pair<int, double>> kp_depths;  // (smpl_idx, depth)
             int op_idx;
             double depth_val;
             while (depth_file >> op_idx >> depth_val) {
+                if (op_idx < 0 || op_idx >= 25) continue;
+                if (!is_stable_op(op_idx)) continue;
+
+                const double c2d = get_conf(lms, op_idx);
+                if (c2d < 0.35) continue;
+
                 int smpl_idx = OPENPOSE_TO_SMPL[op_idx];
-                if (smpl_idx >= 0) kp_depths.push_back({smpl_idx, depth_val});
+                if (smpl_idx < 0) continue;
+
+                depth_pts.push_back({smpl_idx, depth_val, c2d});
             }
             depth_file.close();
-
-            for (size_t i = 0; i < kp_depths.size(); ++i) {
-                for (size_t j = i + 1; j < kp_depths.size(); ++j) {
-                    relative_depth_pairs.push_back({kp_depths[i].first, kp_depths[j].first,
-                                                    kp_depths[i].second, kp_depths[j].second});
-                }
-            }
-            std::cout << "[Depth] Created " << relative_depth_pairs.size() << " relative depth pairs\n";
         } else {
-            std::cerr << "[Depth] Failed to open " << depth_path << "\n";
+            // it's ok: depth may be missing for some frames
         }
 
-        if (!relative_depth_pairs.empty()) {
-            cfg.use_relative_depth = true; 
-            cfg.w_relative_depth = 20.0;
-            cfg.relative_depth_pairs = &relative_depth_pairs;
+        if ((int)depth_pts.size() >= 6) {
+            cfg.use_depth_affine = true;
+            cfg.w_depth_affine = 30.0;
+            cfg.depth_affine_sign = -1.0; // larger rel_depth => closer => smaller z
+            cfg.depth_affine_data   = &depth_pts;
+            cfg.depth_affine_params = depth_affine;
+
+            cfg.use_temporal_depth_affine = has_prev;
+            cfg.depth_affine_prev = has_prev ? depth_affine_prev : nullptr;
+            cfg.w_temp_depth_scale = 80.0;
+            cfg.w_temp_depth_bias  = 200.0;
+        }
+
+
+        double LAx=0, LAy=0, RAx=0, RAy=0;
+        bool hasLA = get_xy(lms, 14, LAx, LAy); // LAnkle
+        bool hasRA = get_xy(lms, 11, RAx, RAy); // RAnkle
+
+        // contact in [0,1]
+        cfg.foot_contact_L = compute_contact(lms, /*is_left=*/true);
+        cfg.foot_contact_R = compute_contact(lms, /*is_left=*/false);
+
+  
+        if (hasLA && hasRA) {
+            prev_LA_x = LAx; prev_LA_y = LAy;
+            prev_RA_x = RAx; prev_RA_y = RAy;
+            ankle_prev_valid = true;
+        } else if (hasLA) {
+            prev_LA_x = LAx; prev_LA_y = LAy;
+            ankle_prev_valid = true;
+        } else if (hasRA) {
+            prev_RA_x = RAx; prev_RA_y = RAy;
+            ankle_prev_valid = true;
+        }
+
+        if (has_prev) {
+            cfg.max_iter_stage1 = 20;
+            cfg.max_iter_stage2 = 40;
+            cfg.max_iter_stage3 = 0;   // fast tracking
+        } else {
+            cfg.max_iter_stage1 = 60;
+            cfg.max_iter_stage2 = 120;
+            cfg.max_iter_stage3 = 80;
         }
 
         bool ok = false;
         if (!has_prev) {
-            ok = OptimizeSMPL(lms, camera, model, beta, theta, trans, cfg); 
+            ok = OptimizeSMPL(lms, camera, model, beta, theta, trans, cfg);
         } else {
             ok = OptimizeSMPLTracked(lms, camera, model, beta, theta, trans, cfg,
                                      theta_prev, trans_prev,
@@ -612,10 +775,39 @@ void RunOpenPoseSequenceInference(const SmplModel& model) {
             continue;
         }
 
+        // ---------------------------
+        // update online ground estimate using fitted joints
+        // ---------------------------
+        {
+            Eigen::Matrix<double, Eigen::Dynamic, 3, Eigen::RowMajor> Jw;
+            SMPLJointsForward<double>(beta, theta, trans, model, Jw);
+
+            // use ankles & feet
+            double y_min = 1e9;
+            int ids[] = {7, 8, 10, 11};
+            for (int id : ids) {
+                if (id >= 0 && id < Jw.rows()) y_min = std::min(y_min, Jw(id, 1));
+            }
+
+            if (!ground_init) {
+                ground_y_est = y_min;
+                ground_init = true;
+            } else {
+                // allow downward update faster, upward update slower
+                if (y_min < ground_y_est) {
+                    ground_y_est = 0.7 * y_min + 0.3 * ground_y_est;
+                } else {
+                    ground_y_est = 0.98 * ground_y_est + 0.02 * y_min;
+                }
+            }
+
+            cfg.ground_y = ground_y_est; // for next frame
+        }
         Eigen::Matrix<double, Eigen::Dynamic, 3, Eigen::RowMajor> V;
         SMPLForward<double>(beta, theta, trans, model, V);
         SaveOBJ(MakeOutObj(out_dir, f), V, model.faces);
 
+        // shift prev buffers
         if (has_prev) {
             std::memcpy(theta_prev2, theta_prev, sizeof(theta_prev2));
             has_prev2 = true;
@@ -624,11 +816,21 @@ void RunOpenPoseSequenceInference(const SmplModel& model) {
         std::memcpy(trans_prev, trans, sizeof(trans_prev));
         has_prev = true;
 
-        std::cout << "[Frame " << f << "] done\n";
+        // update affine prev
+        depth_affine_prev[0] = depth_affine[0];
+        depth_affine_prev[1] = depth_affine[1];
+
+        std::cout << "[Frame " << f << "] done | trans=("
+                  << trans[0] << "," << trans[1] << "," << trans[2] << ")"
+                  << " | affine=(" << depth_affine[0] << "," << depth_affine[1] << ")"
+                  << " | ground_y=" << cfg.ground_y
+                  << " | contact(L,R)=(" << cfg.foot_contact_L << "," << cfg.foot_contact_R << ")"
+                  << "\n";
     }
 
     std::cout << "[Done] sequence saved under " << out_dir << "\n";
 }
+
 
 void SaveOBJ(const std::string& filename,
              const Eigen::Matrix<double, Eigen::Dynamic, 3, Eigen::RowMajor>& vertices,

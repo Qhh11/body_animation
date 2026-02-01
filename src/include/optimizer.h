@@ -44,6 +44,13 @@ struct JointDepthData {
     double depth_z;
 };
 
+// Relative depth observation from Sapiens (arbitrary scale)
+struct JointRelDepthData {
+    int smpl_joint_idx;
+    double rel_depth;
+    double weight; // usually confidence (0..1)
+};
+
 // Forward declaration for relative depth (full definition below)
 struct RelativeDepthPair;
 
@@ -81,6 +88,24 @@ struct OptimizerConfig {
     double w_relative_depth = 20.0;
     const std::vector<RelativeDepthPair>* relative_depth_pairs = nullptr;
 
+    // ---------- Affine depth constraint  ----------
+    // Fits SMPL joint z to (bias + sign * scale * rel_depth)
+    bool use_depth_affine = false;
+    double w_depth_affine = 30.0;
+
+    double depth_affine_sign = -1.0;
+
+    const std::vector<JointRelDepthData>* depth_affine_data = nullptr;
+
+    // parameter block of size 2: [0]=scale, [1]=bias
+    double* depth_affine_params = nullptr;
+
+    // temporal prior for affine params
+    bool use_temporal_depth_affine = true;
+    double w_temp_depth_scale = 80.0;
+    double w_temp_depth_bias  = 200.0;
+    const double* depth_affine_prev = nullptr;
+
     // ---------- Root upright regularizer ----------
     bool use_root_upright = true;
     double root_upright_w_stage2 = 1.0;
@@ -98,7 +123,7 @@ struct OptimizerConfig {
     double w_hinge_perp_elbow  = 80.0;
     double w_hinge_range_elbow = 40.0;
 
-    // 统一 hinge range（以前你写死 -2.6~2.6，现在 main 可调）
+    // 统一 hinge range
     double hinge_min = -2.6;
     double hinge_max =  2.6;
 
@@ -106,11 +131,11 @@ struct OptimizerConfig {
     bool use_bend_limits = true;
     double w_bend = 1.0;
 
-    // ---------- Shoulder / Collar / Wrist / Spine soft limits (NEW: main可调) ----------
+    // ---------- Shoulder / Collar / Wrist / Spine soft limits----------
     bool use_spine_limits = true;
     double w_spine = 10.0;
     double spine_amax = 1.2;   // radians
-    // spine joints ids in your SMPL joint indexing (you之前用 {3,6,9})
+    // spine joints ids in your SMPL joint indexing 
     int spine_j1 = 3;
     int spine_j2 = 6;
     int spine_j3 = 9;
@@ -120,7 +145,7 @@ struct OptimizerConfig {
     double shoulder_amax = 1.7; // radians
     double w_collar_limit = 40.0;
     double collar_amax = 0.8;   // radians
-    // collar joints {13,14}, shoulder joints {16,17} (按你原来的)
+    // collar joints {13,14}, shoulder joints {16,17} 
     int collar_L = 13;
     int collar_R = 14;
     int shoulder_L = 16;
@@ -154,14 +179,34 @@ struct OptimizerConfig {
     double w_3d = 1.0;
 
     // ---------- temporal smoothness (tracking) ----------
-    bool use_temporal = false;     // 开关
-    double w_temp_pose = 10.0;     // 一阶：||theta_t - theta_prev||^2 权重
-    double w_temp_trans = 2.0;     // 一阶：||trans_t - trans_prev||^2 权重
-    bool use_temporal_acc = false; // 二阶加速度项
-    double w_temp_acc_pose = 2.0;  // 二阶：||theta_t - 2*theta_{t-1} + theta_{t-2}||^2
-
-    // 只对 body pose 做时序（建议默认 true）：theta[3:71]
+    bool use_temporal = false;     
+    double w_temp_pose = 10.0;    
+    double w_temp_trans = 2.0;    
+    bool use_temporal_acc = false; 
+    double w_temp_acc_pose = 2.0; 
     bool temporal_body_only = true;
+
+    // ---------- extremity locks  ----------
+    bool lock_wrists = true;   // lock joint 20/21 axis-angle
+    bool lock_hands  = true;   // lock joint 22/23 axis-angle (unobserved but deforms mesh)
+    bool lock_feet   = true;   // lock joint 10/11 axis-angle (prevents foot mesh flipping)
+
+    // SMPL joint indices
+    int hand_L = 22;
+    int hand_R = 23;
+    int foot_L = 10;
+    int foot_R = 11;
+
+    // ---------- foot contact / flatness  ----------
+    bool use_foot_ground = false;   // enable after ground_y is known
+    double ground_y = 0.0;          // world up axis is Y in your convention
+
+    // per-frame contact weights (0..1). set from sequence code
+    double foot_contact_L = 0.0;
+    double foot_contact_R = 0.0;
+
+    double w_foot_ground = 400.0;   // y_ankle ~ ground
+    double w_foot_flat   = 200.0;   // y_foot ~ y_ankle (flat-ish)
 
 
     // ---------- speed / solver ----------
@@ -411,6 +456,55 @@ struct PelvisOverAnklesResidual {
     return true;
   }
   int p, la, ra; double w; const SmplModel& model;
+};
+
+// ------------------------------
+struct FootGroundFlatResidual {
+    FootGroundFlatResidual(int ankle_j_, int foot_j_,
+                           double ground_y_,
+                           double w_ground_, double w_flat_,
+                           double contact_w_,
+                           const SmplModel& model_)
+        : ankle_j(ankle_j_), foot_j(foot_j_),
+          ground_y(ground_y_),
+          w_ground(w_ground_), w_flat(w_flat_),
+          contact_w(contact_w_),
+          model(model_) {}
+
+    template <typename T>
+    bool operator()(const T* const beta,
+                    const T* const theta,
+                    const T* const trans,
+                    T* r) const
+    {
+        const T cw = T(contact_w);
+        if (cw < T(1e-6)) {
+            r[0] = T(0); r[1] = T(0);
+            return true;
+        }
+
+        Eigen::Matrix<T, Eigen::Dynamic, 3, Eigen::RowMajor> J;
+        SMPLJointsForward<T>(beta, theta, trans, model, J);
+
+        // guard indices
+        if (ankle_j < 0 || ankle_j >= J.rows() || foot_j < 0 || foot_j >= J.rows()) {
+            r[0] = T(0); r[1] = T(0);
+            return true;
+        }
+
+        const T yA = J(ankle_j, 1);
+        const T yF = J(foot_j,  1);
+
+        r[0] = T(w_ground) * cw * (yA - T(ground_y)); 
+        r[1] = T(w_flat)   * cw * (yF - yA);         
+        return true;
+    }
+
+    int ankle_j, foot_j;
+    double ground_y;
+    double w_ground, w_flat;
+    double contact_w;
+    const SmplModel& model;
 };
 
 // ------------------------------
@@ -760,6 +854,69 @@ struct RelativeDepthResidual {
     std::vector<RelativeDepthPair> pairs;
     const SmplModel& model;
     double w;
+};
+
+// ------------------------------
+// Depth affine residual =
+// z_pred(j) ~= bias + sign * scale * rel_depth(j)
+// ------------------------------
+struct DepthAffineResidual {
+    DepthAffineResidual(const std::vector<JointRelDepthData>& obs_,
+                        const SmplModel& model_,
+                        double w_,
+                        double sign_)
+        : obs(obs_), model(model_), w(w_), sign(sign_) {}
+
+    int NumPoints() const { return static_cast<int>(obs.size()); }
+
+    template <typename T>
+    bool operator()(const T* const beta,
+                    const T* const theta,
+                    const T* const trans,
+                    const T* const affine, // [scale, bias]
+                    T* residuals) const
+    {
+        const T scale = affine[0];
+        const T bias  = affine[1];
+
+        Eigen::Matrix<T, Eigen::Dynamic, 3, Eigen::RowMajor> J_pred;
+        SMPLJointsForward<T>(beta, theta, trans, model, J_pred);
+
+        for (int i = 0; i < NumPoints(); ++i) {
+            const int j = obs[i].smpl_joint_idx;
+            const T z_pred = J_pred(j, 2);
+
+            // bias + sign * scale * rel_depth
+            const T z_tgt = bias + T(sign) * scale * T(obs[i].rel_depth);
+
+            const T wi = ceres::sqrt(T(std::max(1e-6, obs[i].weight)));
+            residuals[i] = T(w) * wi * (z_pred - z_tgt);
+        }
+        return true;
+    }
+
+    std::vector<JointRelDepthData> obs;
+    const SmplModel& model;
+    double w;
+    double sign;
+};
+
+// ------------------------------
+// Temporal prior for affine depth params 
+// ------------------------------
+struct TemporalDepthAffineResidual {
+    TemporalDepthAffineResidual(const double* prev_, double w_s_, double w_b_)
+        : prev(prev_), w_s(w_s_), w_b(w_b_) {}
+
+    template <typename T>
+    bool operator()(const T* const affine, T* r) const {
+        r[0] = T(w_s) * (affine[0] - T(prev[0])); // scale
+        r[1] = T(w_b) * (affine[1] - T(prev[1])); // bias
+        return true;
+    }
+
+    const double* prev;
+    double w_s, w_b;
 };
 
 // ------------------------------

@@ -15,6 +15,7 @@
 #include "smpl_math.h"
 #include "optimizer.h"
 #include "amass_loader.h"
+#include "evaluation.h"
 #include <filesystem>
 namespace fs = std::filesystem;
 
@@ -27,6 +28,48 @@ void SaveOBJ(const std::string& filename,
 
 // Global GMM pose prior
 static GMMPosePrior g_gmm_prior;
+
+// ============================================================
+// 3DPW Ground Truth Loader
+// ============================================================
+struct ThreeDPW_GT {
+    std::vector<Eigen::Matrix<double, 24, 3, Eigen::RowMajor>> joint_positions;  // per-frame GT joints
+    Eigen::Matrix<double, 4, 4> cam_pose_first;  // first frame camera pose for coord transform
+    bool loaded = false;
+    int num_frames = 0;
+
+    bool Load(const std::string& pkl_path) {
+        // We'll load the pre-extracted txt file instead of pkl directly
+        // The pkl needs to be pre-processed by Python script
+        return false;  // Placeholder - use LoadFromTxt instead
+    }
+
+    bool LoadFromTxt(const std::string& txt_path) {
+        std::ifstream f(txt_path);
+        if (!f.is_open()) return false;
+
+        std::string line;
+        while (std::getline(f, line)) {
+            if (line.empty()) continue;
+            std::istringstream iss(line);
+            Eigen::Matrix<double, 24, 3, Eigen::RowMajor> joints;
+            for (int j = 0; j < 24; ++j) {
+                iss >> joints(j, 0) >> joints(j, 1) >> joints(j, 2);
+            }
+            joint_positions.push_back(joints);
+        }
+        num_frames = (int)joint_positions.size();
+        loaded = num_frames > 0;
+        return loaded;
+    }
+
+    // Get GT joints for a specific frame (in camera coordinate system)
+    bool GetJoints(int frame_idx, Eigen::Matrix<double, Eigen::Dynamic, 3, Eigen::RowMajor>& J_gt) const {
+        if (!loaded || frame_idx < 0 || frame_idx >= num_frames) return false;
+        J_gt = joint_positions[frame_idx];
+        return true;
+    }
+};
 
 namespace {
 
@@ -442,7 +485,7 @@ double RunAMASSValidation(const SmplModel& model, const std::string& amass_path,
 void RunOpenPoseInference(const SmplModel& model) {
     std::cout << "\n=== MODE 2: Running Real OpenPose Data ===\n";
 
-    std::string json_path = "../../Data/openpose_output/courtyard_basketball_01/image_00047_keypoints.json";
+    std::string json_path = "../../Data/openpose_output/courtyard_basketball_01/image_00025_keypoints.json";
     std::vector<Landmark2D> lms;
     if (!LoadLandmarksFromJSON(json_path, lms)) {
         std::cerr << "Failed to load json.\n";
@@ -497,6 +540,7 @@ void RunOpenPoseInference(const SmplModel& model) {
         cfg.use_relative_depth = true; 
         cfg.w_relative_depth = 20.0;
         cfg.relative_depth_pairs = &relative_depth_pairs;
+        std::cout << "[Config] Relative depth currently ENABLED\n";
     }
 
     const bool ok = OptimizeSMPL(lms, camera, model, beta, theta, trans, cfg);
@@ -519,8 +563,22 @@ void RunOpenPoseSequenceInference(const SmplModel& model) {
 
     const std::string seq_dir   = "../../Data/openpose_output/courtyard_basketball_01";
     const std::string depth_dir = "../../Data/sapiens_depth/courtyard_basketball_01";
+    const std::string gt_path   = "../../Data/gt_joints_courtyard_basketball_01.txt";
     const std::string out_dir   = "./seq_out";
     fs::create_directories(out_dir);
+
+    // Load 3DPW ground truth for evaluation
+    ThreeDPW_GT gt_data;
+    bool has_gt = gt_data.LoadFromTxt(gt_path);
+    if (has_gt) {
+        std::cout << "[GT] Loaded " << gt_data.num_frames << " frames of ground truth\n";
+    } else {
+        std::cout << "[GT] No ground truth available, skipping evaluation\n";
+    }
+
+    // Evaluation accumulators
+    std::vector<double> all_mpjpe;
+    std::vector<double> all_pa_mpjpe;
 
     const int start = 0;
     const int end   = 200;
@@ -596,8 +654,12 @@ void RunOpenPoseSequenceInference(const SmplModel& model) {
     };
 
     auto is_stable_op = [&](int op_id)->bool{
-        // stable set (no wrists/feet)
-        int ids[] = {1,2,3,4,5,6,7,8,9,10,11,12,13,14};
+        // Torso-only for depth affine (exclude legs for more stable fitting)
+        // 1: Neck, 2: RShoulder, 5: LShoulder, 8: MidHip
+        // Also include elbows: 3: RElbow, 6: LElbow
+        int ids[] = {1, 2, 3, 5, 6, 8};
+        //int ids[] = {1, 2, 3, 5, 6, 8, 9, 10, 11, 12, 13, 14};
+
         for (int x: ids) if (x == op_id) return true;
         return false;
     };
@@ -708,6 +770,12 @@ void RunOpenPoseSequenceInference(const SmplModel& model) {
 
                 int smpl_idx = OPENPOSE_TO_SMPL[op_idx];
                 if (smpl_idx < 0) continue;
+
+                // Downweight leg joints (9-14: Hip, Knee, Ankle)
+                //double weight = c2d;
+                //if (op_idx >= 9 && op_idx <= 14) {
+                //    weight *= 0.3;  // legs get 30% weight
+                //}
 
                 depth_pts.push_back({smpl_idx, depth_val, c2d});
             }
@@ -826,6 +894,69 @@ void RunOpenPoseSequenceInference(const SmplModel& model) {
                   << " | ground_y=" << cfg.ground_y
                   << " | contact(L,R)=(" << cfg.foot_contact_L << "," << cfg.foot_contact_R << ")"
                   << "\n";
+
+        // ---------------------------
+        // Evaluation against GT (silent per-frame)
+        // ---------------------------
+        if (has_gt && f < gt_data.num_frames) {
+            Eigen::Matrix<double, Eigen::Dynamic, 3, Eigen::RowMajor> J_pred;
+            SMPLJointsForward<double>(beta, theta, trans, model, J_pred);
+
+            Eigen::Matrix<double, Eigen::Dynamic, 3, Eigen::RowMajor> J_gt;
+            if (gt_data.GetJoints(f, J_gt)) {
+                all_mpjpe.push_back(ComputeMPJPE(J_pred, J_gt));
+                all_pa_mpjpe.push_back(ComputePAMPJPE(J_pred, J_gt));
+            }
+        }
+
+        std::cout << "[Frame " << f << "] done\n";
+
+        // Print intermediate evaluation every 100 frames
+        if (!all_mpjpe.empty() && all_mpjpe.size() % 100 == 0) {
+            double mean_mpjpe = 0.0, mean_pa_mpjpe = 0.0;
+            for (size_t i = 0; i < all_mpjpe.size(); ++i) {
+                mean_mpjpe += all_mpjpe[i];
+                mean_pa_mpjpe += all_pa_mpjpe[i];
+            }
+            mean_mpjpe /= all_mpjpe.size();
+            mean_pa_mpjpe /= all_pa_mpjpe.size();
+            std::cout << "[Eval @ " << all_mpjpe.size() << " frames] MPJPE="
+                      << mean_mpjpe * 1000.0 << "mm, PA-MPJPE="
+                      << mean_pa_mpjpe * 1000.0 << "mm\n";
+        }
+    }
+
+    // ---------------------------
+    // Print and save evaluation summary
+    // ---------------------------
+    if (!all_mpjpe.empty()) {
+        double mean_mpjpe = 0.0, mean_pa_mpjpe = 0.0;
+        for (size_t i = 0; i < all_mpjpe.size(); ++i) {
+            mean_mpjpe += all_mpjpe[i];
+            mean_pa_mpjpe += all_pa_mpjpe[i];
+        }
+        mean_mpjpe /= all_mpjpe.size();
+        mean_pa_mpjpe /= all_pa_mpjpe.size();
+
+        std::cout << "\n========== EVALUATION SUMMARY ==========\n";
+        std::cout << "  Frames evaluated: " << all_mpjpe.size() << "\n";
+        std::cout << "  Mean MPJPE:    " << mean_mpjpe * 1000.0 << " mm\n";
+        std::cout << "  Mean PA-MPJPE: " << mean_pa_mpjpe * 1000.0 << " mm\n";
+        std::cout << "=========================================\n";
+
+        // Save evaluation results to file
+        std::ofstream eval_file(out_dir + "/evaluation.txt");
+        if (eval_file.is_open()) {
+            eval_file << "Frames evaluated: " << all_mpjpe.size() << "\n";
+            eval_file << "Mean MPJPE (mm): " << mean_mpjpe * 1000.0 << "\n";
+            eval_file << "Mean PA-MPJPE (mm): " << mean_pa_mpjpe * 1000.0 << "\n";
+            eval_file << "\nPer-frame MPJPE (mm):\n";
+            for (size_t i = 0; i < all_mpjpe.size(); ++i) {
+                eval_file << i << " " << all_mpjpe[i] * 1000.0 << " " << all_pa_mpjpe[i] * 1000.0 << "\n";
+            }
+            eval_file.close();
+            std::cout << "[Saved] " << out_dir << "/evaluation.txt\n";
+        }
     }
 
     std::cout << "[Done] sequence saved under " << out_dir << "\n";

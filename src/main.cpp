@@ -480,6 +480,287 @@ double RunAMASSValidation(const SmplModel& model, const std::string& amass_path,
 }
 
 // =========================================================
+// AMASS Sequence Validation - Validate frames 0-50 with full evaluation
+// =========================================================
+void RunAmassValidationSequence(const SmplModel& model, const std::string& pose_file_path) {
+    std::cout << "\n========== AMASS SEQUENCE VALIDATION (Frames 0-50) ==========\n";
+    std::cout << "File: " << pose_file_path << "\n";
+
+    // Extract base filename for naming
+    std::string base_name = fs::path(pose_file_path).stem().string();
+    
+    // Create output directories
+    const std::string mesh_dir = "./meshes/" + base_name;
+    const std::string gt_mesh_dir = mesh_dir + "/gt";
+    const std::string opt_mesh_dir = mesh_dir + "/optimized";
+    
+    fs::create_directories(gt_mesh_dir);
+    fs::create_directories(opt_mesh_dir);
+    
+    std::cout << "Output directories created:\n";
+    std::cout << "  GT meshes:   " << gt_mesh_dir << "\n";
+    std::cout << "  Opt meshes:  " << opt_mesh_dir << "\n";
+
+    // Load all frames from the file
+    std::vector<AmassFrame> amass_frames;
+    if (!AmassLoader::Load(pose_file_path, amass_frames)) {
+        std::cerr << "Failed to load file: " << pose_file_path << "\n";
+        return;
+    }
+
+    if (amass_frames.empty()) {
+        std::cerr << "No frames in file\n";
+        return;
+    }
+
+    std::cout << "Total frames in file: " << amass_frames.size() << "\n";
+
+    // Determine validation range: frames 0-50 (or less if file is shorter)
+    const int start_frame = 0;
+    const int end_frame = std::min(50, static_cast<int>(amass_frames.size()) - 1);
+    const int num_frames = end_frame - start_frame + 1;
+
+    std::cout << "Validating frames " << start_frame << " to " << end_frame 
+              << " (" << num_frames << " frames)\n\n";
+
+    // Setup camera for synthetic landmark generation
+    CameraIntrinsics camera = CreateDefaultCamera(800, 800);
+
+    // Evaluation accumulators
+    std::vector<double> all_mpjpe;
+    std::vector<double> all_pa_mpjpe;
+    std::vector<std::vector<double>> per_joint_errors(24);  // 24 SMPL joints
+
+    all_mpjpe.reserve(num_frames);
+    all_pa_mpjpe.reserve(num_frames);
+
+    // Process each frame
+    int success_count = 0;
+    int fail_count = 0;
+
+    for (int frame_idx = start_frame; frame_idx <= end_frame; ++frame_idx) {
+        std::cout << "[Frame " << frame_idx << "/" << end_frame << "] ";
+
+        // Get ground truth for this frame
+        const AmassFrame& frame_gt = amass_frames[frame_idx];
+
+        double beta_gt[10];
+        double theta_gt[72];
+        double trans_gt[3];
+
+        for (int i = 0; i < 10; ++i) beta_gt[i] = frame_gt.beta[i];
+        for (int i = 0; i < 72; ++i) theta_gt[i] = frame_gt.theta[i];
+        trans_gt[0] = 0.0;
+        trans_gt[1] = 0.0;
+        trans_gt[2] = 3.0;
+
+        // Compute and save ground truth mesh and joints
+        Eigen::Matrix<double, Eigen::Dynamic, 3, Eigen::RowMajor> V_gt;
+        SMPLForward<double>(beta_gt, theta_gt, trans_gt, model, V_gt);
+        
+        Eigen::Matrix<double, Eigen::Dynamic, 3, Eigen::RowMajor> J_gt;
+        SMPLJointsForward<double>(beta_gt, theta_gt, trans_gt, model, J_gt);
+
+        // Save GT mesh
+        char gt_filename[512];
+        std::snprintf(gt_filename, sizeof(gt_filename), "%s/frame_%05d_gt.obj", 
+                     gt_mesh_dir.c_str(), frame_idx);
+        SaveOBJ(gt_filename, V_gt, model.faces);
+
+        // Generate synthetic 2D landmarks from ground truth
+        auto observed_landmarks = GenerateSyntheticLandmarks(model, camera, beta_gt, theta_gt, trans_gt);
+        if (observed_landmarks.empty()) {
+            fail_count++;
+            std::cout << "✗ FAILED (no landmarks)\n";
+            continue;
+        }
+
+        // Create depth ground truth
+        std::vector<JointDepthData> depth_gt;
+        depth_gt.reserve(24);
+        for (int i = 0; i < 24; i++) {
+            depth_gt.push_back({i, J_gt(i, 2)});
+        }
+
+        // Initialize optimization parameters
+        double beta_opt[10]  = {0};
+        double theta_opt[72] = {0};
+        double trans_opt[3]  = {0.0, 0.0, 2.5};
+
+        // Setup optimizer config
+        OptimizerConfig cfg = MakeCfgForAMASS(&depth_gt);
+        cfg.verbose = false;  // Suppress per-frame verbose output
+
+        // Run optimization
+        bool ok = OptimizeSMPL(observed_landmarks, camera, model, beta_opt, theta_opt, trans_opt, cfg);
+
+        if (!ok) {
+            fail_count++;
+            std::cout << "✗ FAILED (optimization)\n";
+            continue;
+        }
+
+        // Compute optimized mesh and joints
+        Eigen::Matrix<double, Eigen::Dynamic, 3, Eigen::RowMajor> V_opt;
+        SMPLForward<double>(beta_opt, theta_opt, trans_opt, model, V_opt);
+        
+        Eigen::Matrix<double, Eigen::Dynamic, 3, Eigen::RowMajor> J_opt;
+        SMPLJointsForward<double>(beta_opt, theta_opt, trans_opt, model, J_opt);
+
+        // Save optimized mesh
+        char opt_filename[512];
+        std::snprintf(opt_filename, sizeof(opt_filename), "%s/frame_%05d_opt.obj", 
+                     opt_mesh_dir.c_str(), frame_idx);
+        SaveOBJ(opt_filename, V_opt, model.faces);
+
+        // Compute evaluation metrics
+        double mpjpe = ComputeMPJPE(J_opt, J_gt);
+        double pa_mpjpe = ComputePAMPJPE(J_opt, J_gt);
+
+        all_mpjpe.push_back(mpjpe);
+        all_pa_mpjpe.push_back(pa_mpjpe);
+
+        // Compute per-joint errors
+        for (int j = 0; j < 24; ++j) {
+            double joint_error = (J_opt.row(j) - J_gt.row(j)).norm();
+            per_joint_errors[j].push_back(joint_error);
+        }
+
+        success_count++;
+        std::cout << "✓ MPJPE=" << mpjpe * 1000.0 << "mm, PA-MPJPE=" 
+                  << pa_mpjpe * 1000.0 << "mm\n";
+    }
+
+    // ========== Print and save evaluation summary ==========
+    if (!all_mpjpe.empty()) {
+        double mean_mpjpe = 0.0, mean_pa_mpjpe = 0.0;
+        for (size_t i = 0; i < all_mpjpe.size(); ++i) {
+            mean_mpjpe += all_mpjpe[i];
+            mean_pa_mpjpe += all_pa_mpjpe[i];
+        }
+        mean_mpjpe /= all_mpjpe.size();
+        mean_pa_mpjpe /= all_pa_mpjpe.size();
+
+        // Compute min/max
+        double min_mpjpe = *std::min_element(all_mpjpe.begin(), all_mpjpe.end());
+        double max_mpjpe = *std::max_element(all_mpjpe.begin(), all_mpjpe.end());
+        double min_pa_mpjpe = *std::min_element(all_pa_mpjpe.begin(), all_pa_mpjpe.end());
+        double max_pa_mpjpe = *std::max_element(all_pa_mpjpe.begin(), all_pa_mpjpe.end());
+
+        // Compute standard deviation
+        double var_mpjpe = 0.0, var_pa_mpjpe = 0.0;
+        for (size_t i = 0; i < all_mpjpe.size(); ++i) {
+            var_mpjpe += (all_mpjpe[i] - mean_mpjpe) * (all_mpjpe[i] - mean_mpjpe);
+            var_pa_mpjpe += (all_pa_mpjpe[i] - mean_pa_mpjpe) * (all_pa_mpjpe[i] - mean_pa_mpjpe);
+        }
+        double std_mpjpe = std::sqrt(var_mpjpe / all_mpjpe.size());
+        double std_pa_mpjpe = std::sqrt(var_pa_mpjpe / all_pa_mpjpe.size());
+
+        std::cout << "\n========================================\n";
+        std::cout << "EVALUATION SUMMARY\n";
+        std::cout << "========================================\n";
+        std::cout << "File: " << base_name << "\n";
+        std::cout << "Frames evaluated: " << all_mpjpe.size() << " (" 
+                  << start_frame << "-" << end_frame << ")\n";
+        std::cout << "Successful: " << success_count << "\n";
+        std::cout << "Failed: " << fail_count << "\n\n";
+
+        std::cout << "=== MPJPE (3D Joint Error) ===\n";
+        std::cout << "  Mean:    " << mean_mpjpe * 1000.0 << " mm\n";
+        std::cout << "  Min:     " << min_mpjpe * 1000.0 << " mm\n";
+        std::cout << "  Max:     " << max_mpjpe * 1000.0 << " mm\n";
+        std::cout << "  Std Dev: " << std_mpjpe * 1000.0 << " mm\n\n";
+
+        std::cout << "=== PA-MPJPE (Procrustes Aligned) ===\n";
+        std::cout << "  Mean:    " << mean_pa_mpjpe * 1000.0 << " mm\n";
+        std::cout << "  Min:     " << min_pa_mpjpe * 1000.0 << " mm\n";
+        std::cout << "  Max:     " << max_pa_mpjpe * 1000.0 << " mm\n";
+        std::cout << "  Std Dev: " << std_pa_mpjpe * 1000.0 << " mm\n";
+
+        // Compute per-joint statistics
+        std::cout << "\n=== Per-Joint Average Error (mm) ===\n";
+        const char* joint_names[24] = {
+            "Pelvis", "L_Hip", "R_Hip", "Spine1", "L_Knee", "R_Knee", "Spine2", "L_Ankle",
+            "R_Ankle", "Spine3", "L_Foot", "R_Foot", "Neck", "L_Collar", "R_Collar", "Head",
+            "L_Shoulder", "R_Shoulder", "L_Elbow", "R_Elbow", "L_Wrist", "R_Wrist", "L_Hand", "R_Hand"
+        };
+
+        for (int j = 0; j < 24; ++j) {
+            if (per_joint_errors[j].empty()) continue;
+            
+            double sum = 0.0;
+            for (double err : per_joint_errors[j]) sum += err;
+            double mean = sum / per_joint_errors[j].size();
+            
+            std::cout << "  Joint " << std::setw(2) << j << " (" 
+                      << std::setw(12) << std::left << joint_names[j] << "): "
+                      << std::fixed << std::setprecision(2) << mean * 1000.0 << " mm\n";
+        }
+        std::cout << std::right;  // Reset alignment
+
+        // Save evaluation results to file
+        std::string eval_file = mesh_dir + "/evaluation.txt";
+        std::ofstream outfile(eval_file);
+        
+        if (outfile.is_open()) {
+            auto now = std::chrono::system_clock::now();
+            auto time = std::chrono::system_clock::to_time_t(now);
+            
+            outfile << "AMASS Sequence Validation Results\n";
+            outfile << "==================================\n";
+            outfile << "File: " << pose_file_path << "\n";
+            outfile << "Date: " << std::ctime(&time);
+            outfile << "Frames evaluated: " << all_mpjpe.size() 
+                   << " (" << start_frame << "-" << end_frame << ")\n";
+            outfile << "Successful: " << success_count << "\n";
+            outfile << "Failed: " << fail_count << "\n\n";
+
+            outfile << "MPJPE (3D Joint Error):\n";
+            outfile << "  Mean (mm): " << mean_mpjpe * 1000.0 << "\n";
+            outfile << "  Min (mm):  " << min_mpjpe * 1000.0 << "\n";
+            outfile << "  Max (mm):  " << max_mpjpe * 1000.0 << "\n";
+            outfile << "  Std (mm):  " << std_mpjpe * 1000.0 << "\n\n";
+
+            outfile << "PA-MPJPE (Procrustes Aligned):\n";
+            outfile << "  Mean (mm): " << mean_pa_mpjpe * 1000.0 << "\n";
+            outfile << "  Min (mm):  " << min_pa_mpjpe * 1000.0 << "\n";
+            outfile << "  Max (mm):  " << max_pa_mpjpe * 1000.0 << "\n";
+            outfile << "  Std (mm):  " << std_pa_mpjpe * 1000.0 << "\n\n";
+
+            outfile << "Per-Joint Average Error (mm):\n";
+            for (int j = 0; j < 24; ++j) {
+                if (per_joint_errors[j].empty()) continue;
+                double sum = 0.0;
+                for (double err : per_joint_errors[j]) sum += err;
+                double mean = sum / per_joint_errors[j].size();
+                outfile << "  Joint " << j << " (" << joint_names[j] << "): " 
+                       << mean * 1000.0 << "\n";
+            }
+
+            outfile << "\nPer-Frame Results:\n";
+            outfile << "Frame\tMPJPE(mm)\tPA-MPJPE(mm)\n";
+            for (size_t i = 0; i < all_mpjpe.size(); ++i) {
+                outfile << (start_frame + i) << "\t" 
+                       << all_mpjpe[i] * 1000.0 << "\t" 
+                       << all_pa_mpjpe[i] * 1000.0 << "\n";
+            }
+
+            outfile.close();
+            std::cout << "\n[Saved] Evaluation results: " << eval_file << "\n";
+        } else {
+            std::cerr << "Warning: Could not save evaluation file\n";
+        }
+
+        std::cout << "========================================\n";
+        std::cout << "\n[Done] Meshes saved to: " << mesh_dir << "\n";
+        std::cout << "  GT meshes:        " << gt_mesh_dir << "\n";
+        std::cout << "  Optimized meshes: " << opt_mesh_dir << "\n";
+    } else {
+        std::cout << "\n[Error] No successful frames to evaluate\n";
+    }
+}
+
+// =========================================================
 // MODE 2: Real OpenPose
 // =========================================================
 void RunOpenPoseInference(const SmplModel& model) {
@@ -1035,9 +1316,16 @@ int main(int argc, char** argv) {
             RunBatchValidation(model);
         } else if (arg1 == "--openpose") {
             RunOpenPoseInference(model);
+        } else if (arg1 == "--seq-val") {
+            if (argc < 3) {
+                std::cerr << "Usage: " << argv[0] << " --seq-val <pose_file.txt>\n";
+                return 1;
+            }
+            RunAmassValidationSequence(model, argv[2]);
         } else {
             RunAMASSValidation(model, arg1, 100, true);
         }
+        
     } else {
         RunOpenPoseSequenceInference(model);
         //RunOpenPoseInference(model);

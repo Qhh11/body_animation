@@ -9,15 +9,16 @@
 #include <algorithm>
 #include <iostream>
 #include <limits>
+#include <cstring>
 
 #include "smpl_model.h"
 #include "smpl_math.h"
 
 using MatX3dRM = Eigen::Matrix<double, Eigen::Dynamic, 3, Eigen::RowMajor>;
 
-// ------------------------------
+// ============================================================
 // Data structs
-// ------------------------------
+// ============================================================
 struct Landmark2D {
     float x, y;
     float confidence;
@@ -40,50 +41,58 @@ struct CameraIntrinsics {
 
 // Camera extrinsics: world-to-camera transform
 // P_cam = R * P_world + t
+//
+// *** IMPORTANT DESIGN NOTE ***
+// Extrinsics are NEVER passed into the optimizer.
+// All optimization happens in CAMERA SPACE.
+// Extrinsics are used ONLY for:
+//   1) Warm-start: transform prev-frame cam-space params → current cam space
+//   2) Temporal prior targets: same transform for prev-frame reference values
+//   3) Evaluation: transform cam-space results → world space for MPJPE/PA-MPJPE
 struct CameraExtrinsics {
-    Eigen::Matrix3d R;  // 3x3 rotation matrix
-    Eigen::Vector3d t;  // 3x1 translation vector
+    Eigen::Matrix3d R;
+    Eigen::Vector3d t;
 
     CameraExtrinsics() : R(Eigen::Matrix3d::Identity()), t(Eigen::Vector3d::Zero()) {}
     CameraExtrinsics(const Eigen::Matrix3d& R_, const Eigen::Vector3d& t_) : R(R_), t(t_) {}
-
-    bool IsIdentity() const {
-        return R.isIdentity(1e-6) && t.isZero(1e-6);
-    }
 };
 
-// Depth constraint data (Z coordinate in the same convention as SMPLJointsForward output)
 struct JointDepthData {
     int smpl_joint_idx;
     double depth_z;
 };
 
-// Relative depth observation from Sapiens (arbitrary scale)
 struct JointRelDepthData {
     int smpl_joint_idx;
     double rel_depth;
-    double weight; // usually confidence (0..1)
+    double weight;
 };
 
-// Forward declaration for relative depth (full definition below)
-struct RelativeDepthPair;
+struct RelativeDepthPair {
+    int smpl_joint_a;
+    int smpl_joint_b;
+    double rel_depth_a;
+    double rel_depth_b;
+};
 
-// ------------------------------
-// GMM Pose Prior (from SMPLify)
-// ------------------------------
+// ============================================================
+// GMM Pose Prior
+// ============================================================
 struct GMMPosePrior {
-    static constexpr int K = 8;    // number of Gaussian components
-    static constexpr int D = 69;   // pose dimension (excluding root)
+    static constexpr int K = 8;
+    static constexpr int D = 69;
 
-    Eigen::Matrix<double, K, 1> weights;                    // (K,)
-    Eigen::Matrix<double, K, D, Eigen::RowMajor> means;     // (K, D)
+    Eigen::Matrix<double, K, 1> weights;
+    Eigen::Matrix<double, K, D, Eigen::RowMajor> means;
     std::array<Eigen::Matrix<double, D, D, Eigen::RowMajor>, K> prec_choleskys;
 
     bool loaded = false;
-
     bool LoadFromNPZ(const std::string& npz_path);
 };
 
+// ============================================================
+// OptimizerConfig — ALL optimization in CAMERA SPACE
+// ============================================================
 struct OptimizerConfig {
     bool verbose = true;
 
@@ -92,38 +101,37 @@ struct OptimizerConfig {
     bool use_stable_joints_only = true;
     bool flip_y_in_projection = true;
 
-    // ---------- Depth constraint (absolute) ----------
+    // ---------- Depth (absolute) ----------
     bool use_depth = false;
     double w_depth = 15.0;
     const std::vector<JointDepthData>* depth_data = nullptr;
 
-    // ---------- Relative depth constraint ----------
+    // ---------- Relative depth ----------
     bool use_relative_depth = false;
     double w_relative_depth = 20.0;
     const std::vector<RelativeDepthPair>* relative_depth_pairs = nullptr;
 
-    // ---------- Affine depth constraint  ----------
-    // Fits SMPL joint z to (bias + sign * scale * rel_depth)
+    // ---------- Affine depth  ----------
     bool use_depth_affine = false;
     double w_depth_affine = 30.0;
-
-    double depth_affine_sign = -1.0;
-
+    double depth_affine_sign = 1.0;
     const std::vector<JointRelDepthData>* depth_affine_data = nullptr;
-
-    // parameter block of size 2: [0]=scale, [1]=bias
     double* depth_affine_params = nullptr;
 
-    // temporal prior for affine params
-    bool use_temporal_depth_affine = true;
+    bool use_temporal_depth_affine = false;
     double w_temp_depth_scale = 80.0;
     double w_temp_depth_bias  = 200.0;
     const double* depth_affine_prev = nullptr;
-
-    // Fix bias=0 for rigid depth constraint (Plan B: suppress drift)
     bool fix_depth_affine_bias = false;
 
-    // ---------- Root upright regularizer ----------
+    // ---------- Camera-space Z prior ----------
+    // Soft prior on trans[2] to prevent Z-drift.
+    // In camera space this is trivial and highly effective.
+    bool use_trans_z_prior = false;
+    double trans_z_prior_target = 3.0;
+    double w_trans_z_prior = 100.0;
+
+    // ---------- Root upright ----------
     bool use_root_upright = true;
     double root_upright_w_stage2 = 1.0;
     double root_upright_w_stage3 = 0.0;
@@ -133,164 +141,221 @@ struct OptimizerConfig {
     double w_gmm = 1.0;
     const GMMPosePrior* gmm_prior = nullptr;
 
-    // ---------- Angle/hinge priors ----------
+    // ---------- Hinge priors ----------
     bool use_hinge_priors = true;
     double w_hinge_perp_knee  = 120.0;
     double w_hinge_range_knee = 60.0;
     double w_hinge_perp_elbow  = 80.0;
     double w_hinge_range_elbow = 40.0;
-
-    // 统一 hinge range
     double hinge_min = -2.6;
     double hinge_max =  2.6;
 
-    // Optional hyperextension exp penalty
     bool use_bend_limits = true;
     double w_bend = 1.0;
 
-    // ---------- Shoulder / Collar / Wrist / Spine soft limits----------
+    // ---------- Spine ----------
     bool use_spine_limits = true;
     double w_spine = 10.0;
-    double spine_amax = 1.2;   // radians
-    // spine joints ids in your SMPL joint indexing
-    int spine_j1 = 3;
-    int spine_j2 = 6;
-    int spine_j3 = 9;
+    double spine_amax = 1.2;
+    int spine_j1 = 3, spine_j2 = 6, spine_j3 = 9;
 
-    // ---------- Neck / Head soft limits ----------
+    // ---------- Neck / Head ----------
     bool use_neck_head_limits = true;
     double w_neck_limit = 40.0;
-    double neck_amax = 0.6;    // radians (~35 degrees)
+    double neck_amax = 0.6;
     double w_head_limit = 40.0;
-    double head_amax = 0.5;    // radians (~30 degrees)
-    int neck_j = 12;
-    int head_j = 15;
+    double head_amax = 0.5;
+    int neck_j = 12, head_j = 15;
 
+    // ---------- Shoulder / Collar ----------
     bool use_shoulder_collar_limits = true;
     double w_shoulder_limit = 60.0;
-    double shoulder_amax = 1.7; // radians
+    double shoulder_amax = 1.7;
     double w_collar_limit = 40.0;
-    double collar_amax = 0.8;   // radians
-    // collar joints {13,14}, shoulder joints {16,17} 
-    int collar_L = 13;
-    int collar_R = 14;
-    int shoulder_L = 16;
-    int shoulder_R = 17;
+    double collar_amax = 0.8;
+    int collar_L = 13, collar_R = 14;
+    int shoulder_L = 16, shoulder_R = 17;
 
+    // ---------- Wrist ----------
     bool use_wrist_limits = true;
     double w_wrist_limit = 80.0;
     double wrist_amax = 0.6;
-    int wrist_L = 20;
-    int wrist_R = 21;
+    int wrist_L = 20, wrist_R = 21;
 
-    // pelvis-over-ankles
+    // ---------- Pelvis over ankles ----------
     bool use_pelvis_over_ankles = true;
-    double w_pelvis_over_ankles   = 10.0;
+    double w_pelvis_over_ankles = 10.0;
 
-    // ------------- Arm–torso separation -----------
+    // ---------- Arm-torso separation ----------
     bool use_arm_torso_sep = true;
-
-    // Optional tuning parameters (meters and weights).
     double arm_torso_d_elbow = 0.08;
     double arm_torso_d_wrist = 0.10;
     double arm_torso_w_elbow = 80.0;
     double arm_torso_w_wrist = 120.0;
-
-    int arm_torso_seg_a = 3;   
-    int arm_torso_seg_b = 12; 
+    int arm_torso_seg_a = 3, arm_torso_seg_b = 12;
 
     // ---------- 3D unit test ----------
     bool amass_unit_test = false;
     bool unit_test_exact = true;
     double w_3d = 1.0;
 
-    // ---------- temporal smoothness (tracking) ----------
+    // ---------- Temporal (camera-space) ----------
     bool use_temporal = false;
-    double w_temp_pose = 10.0;
+    double w_temp_pose  = 10.0;
     double w_temp_trans = 2.0;
     bool use_temporal_acc = false;
     double w_temp_acc_pose = 2.0;
     bool temporal_body_only = true;
 
-    // ---------- Camera-space depth prior (world-coord mode) ----------
-    // Constrains Z_cam to stay close to previous frame, preventing optical axis drift
-    bool use_cam_depth_prior = false;
-    double w_cam_depth_prior = 50.0;  // weight for Z_cam prior
-    double Z_cam_prev  = 3.0;         // previous frame Z_cam
-    double Z_cam_prev2 = 3.0;         // two frames ago Z_cam (for const-vel)
-    bool has_Z_cam_prev2 = false;     // whether Z_cam_prev2 is valid
+    // ---------- Extremity locks ----------
+    bool lock_wrists = true;
+    bool lock_hands  = true;
+    bool lock_feet   = true;
+    int hand_L = 22, hand_R = 23;
+    int foot_L = 10, foot_R = 11;
 
-    // ---------- extremity locks  ----------
-    bool lock_wrists = true;   // lock joint 20/21 axis-angle
-    bool lock_hands  = true;   // lock joint 22/23 axis-angle (unobserved but deforms mesh)
-    bool lock_feet   = true;   // lock joint 10/11 axis-angle (prevents foot mesh flipping)
-
-    // SMPL joint indices
-    int hand_L = 22;
-    int hand_R = 23;
-    int foot_L = 10;
-    int foot_R = 11;
-
-    // ---------- foot contact / flatness  ----------
-    bool use_foot_ground = false;   // enable after ground_y is known
-    double ground_y = 0.0;          // world up axis is Y in your convention
-
-    // per-frame contact weights (0..1). set from sequence code
+    // ---------- Foot ground ----------
+    bool use_foot_ground = false;
+    double ground_y = 0.0;
     double foot_contact_L = 0.0;
     double foot_contact_R = 0.0;
+    double w_foot_ground = 400.0;
+    double w_foot_flat   = 200.0;
 
-    double w_foot_ground = 400.0;   // y_ankle ~ ground
-    double w_foot_flat   = 200.0;   // y_foot ~ y_ankle (flat-ish)
-
-
-    // ---------- speed / solver ----------
-    int threads = -1;                 // -1: auto
-    bool print_progress = false;      // printing is slow
+    // ---------- Solver ----------
+    int threads = -1;
+    bool print_progress = false;
     int max_iter_stage1 = 60;
     int max_iter_stage2 = 200;
     int max_iter_stage3 = 200;
 };
 
-// ------------------------------
+// ============================================================
 // OpenPose -> SMPL mapping
-// declare here, define ONCE in optimizer.cpp
-// ------------------------------
+// ============================================================
 extern const int OPENPOSE_TO_SMPL[25];
 
 // ============================================================
-// Helper (template): joints from mesh forward
+// Camera-space transform helpers for moving cameras
+// ============================================================
+
+// Relative camera transform from frame (t-1) to frame (t).
+// P_cam_t = R_rel * P_cam_{t-1} + t_rel
+inline void ComputeRelativeCameraTransform(
+    const CameraExtrinsics& ext_prev,
+    const CameraExtrinsics& ext_curr,
+    Eigen::Matrix3d& R_rel,
+    Eigen::Vector3d& t_rel)
+{
+    R_rel = ext_curr.R * ext_prev.R.transpose();
+    t_rel = ext_curr.t - R_rel * ext_prev.t;
+}
+
+// Transform previous frame's camera-space SMPL params to current camera space.
+// Body pose theta[3:72] is unchanged (relative rotations are frame-invariant).
+// Root orientation theta[0:3] and translation are transformed.
+inline void TransformPrevParamsToCurrCam(
+    const double* theta_prev_cam,
+    const double* trans_prev_cam,
+    const Eigen::Matrix3d& R_rel,
+    const Eigen::Vector3d& t_rel,
+    double* theta_out,
+    double* trans_out)
+{
+    // Copy all pose params (body pose stays the same)
+    std::memcpy(theta_out, theta_prev_cam, 72 * sizeof(double));
+
+    // Transform root orientation: R_new = R_rel * R_old
+    {
+        double aa[3] = {theta_prev_cam[0], theta_prev_cam[1], theta_prev_cam[2]};
+        double R_arr[9];
+        ceres::AngleAxisToRotationMatrix(aa, R_arr);
+
+        Eigen::Map<const Eigen::Matrix<double, 3, 3, Eigen::ColMajor>> R_old(R_arr);
+        Eigen::Matrix3d R_new = R_rel * R_old;
+
+        double R_new_arr[9];
+        Eigen::Map<Eigen::Matrix<double, 3, 3, Eigen::ColMajor>> R_new_map(R_new_arr);
+        R_new_map = R_new;
+
+        double aa_new[3];
+        ceres::RotationMatrixToAngleAxis(R_new_arr, aa_new);
+        theta_out[0] = aa_new[0];
+        theta_out[1] = aa_new[1];
+        theta_out[2] = aa_new[2];
+    }
+
+    // Transform translation: t_curr = R_rel * t_prev + t_rel
+    Eigen::Vector3d tp(trans_prev_cam[0], trans_prev_cam[1], trans_prev_cam[2]);
+    Eigen::Vector3d tc = R_rel * tp + t_rel;
+    trans_out[0] = tc(0);
+    trans_out[1] = tc(1);
+    trans_out[2] = tc(2);
+}
+
+// Transform camera-space joints to world space for evaluation
+inline void TransformJointsCamToWorld(
+    const MatX3dRM& J_cam,
+    const CameraExtrinsics& ext,
+    MatX3dRM& J_world)
+{
+    const int N = J_cam.rows();
+    J_world.resize(N, 3);
+    for (int i = 0; i < N; ++i) {
+        Eigen::Vector3d p_cam(J_cam(i,0), J_cam(i,1), J_cam(i,2));
+        Eigen::Vector3d p_world = ext.R.transpose() * (p_cam - ext.t);
+        J_world(i,0) = p_world(0);
+        J_world(i,1) = p_world(1);
+        J_world(i,2) = p_world(2);
+    }
+}
+
+// Transform camera-space vertices to world space
+inline void TransformVerticesCamToWorld(
+    const Eigen::Matrix<double, Eigen::Dynamic, 3, Eigen::RowMajor>& V_cam,
+    const CameraExtrinsics& ext,
+    Eigen::Matrix<double, Eigen::Dynamic, 3, Eigen::RowMajor>& V_world)
+{
+    const int N = V_cam.rows();
+    V_world.resize(N, 3);
+    for (int i = 0; i < N; ++i) {
+        Eigen::Vector3d p_cam(V_cam(i,0), V_cam(i,1), V_cam(i,2));
+        Eigen::Vector3d p_world = ext.R.transpose() * (p_cam - ext.t);
+        V_world(i,0) = p_world(0);
+        V_world(i,1) = p_world(1);
+        V_world(i,2) = p_world(2);
+    }
+}
+
+// ============================================================
+// SMPLJointsFromMeshForward
 // ============================================================
 template <typename T>
 inline void SMPLJointsFromMeshForward(
-    const T* beta,
-    const T* theta,
-    const T* trans,
+    const T* beta, const T* theta, const T* trans,
     const SmplModel& model,
-    Eigen::Matrix<T, Eigen::Dynamic, 3, Eigen::RowMajor>& out_joints_world,
-    bool use_pose_blendshapes
-) {
+    Eigen::Matrix<T, Eigen::Dynamic, 3, Eigen::RowMajor>& out_joints,
+    bool use_pose_blendshapes)
+{
     Eigen::Matrix<T, Eigen::Dynamic, 3, Eigen::RowMajor> V;
     SMPLForward<T>(beta, theta, trans, model, V, use_pose_blendshapes);
-
     const int J = model.J;
-    out_joints_world.resize(J, 3);
-    out_joints_world.setZero();
-
+    out_joints.resize(J, 3);
+    out_joints.setZero();
     for (int j = 0; j < J; ++j) {
-        const auto& nz = model.J_regressor_nz[j];
-        for (const auto& it : nz) {
-            const int v = it.first;
+        for (const auto& it : model.J_regressor_nz[j]) {
             const T w = T(it.second);
-            out_joints_world(j,0) += w * V(v,0);
-            out_joints_world(j,1) += w * V(v,1);
-            out_joints_world(j,2) += w * V(v,2);
+            out_joints(j,0) += w * V(it.first,0);
+            out_joints(j,1) += w * V(it.first,1);
+            out_joints(j,2) += w * V(it.first,2);
         }
     }
 }
 
-// ------------------------------
-// Regularizers / constraints
-// ------------------------------
+// ============================================================
+// Residual structs
+// ============================================================
+
 struct ShapeRegularizer {
     ShapeRegularizer(int index, double lambda) : index_(index), lambda_(lambda) {}
     template <typename T>
@@ -298,8 +363,7 @@ struct ShapeRegularizer {
         residual[0] = T(lambda_) * beta[index_];
         return true;
     }
-    int index_;
-    double lambda_;
+    int index_; double lambda_;
 };
 
 struct PoseRegularizer {
@@ -309,62 +373,46 @@ struct PoseRegularizer {
         residual[0] = T(lambda_) * theta[index_];
         return true;
     }
-    int index_;
-    double lambda_;
+    int index_; double lambda_;
 };
 
-// ------------------------------
-// GMM Pose Prior Residual
-// ------------------------------
 struct GMMPosePriorResidual {
     GMMPosePriorResidual(const GMMPosePrior& gmm, double weight)
         : gmm_(gmm), weight_(weight) {}
-
     template <typename T>
     bool operator()(const T* const theta, T* residuals) const {
-        constexpr int D = 69;
-        constexpr int K = 8;
-
+        constexpr int D = 69, K = 8;
         T min_dist = T(1e10);
         int best_k = 0;
-
         for (int k = 0; k < K; ++k) {
             T dist = T(0);
             for (int i = 0; i < D; ++i) {
                 T weighted = T(0);
-                for (int j = 0; j <= i; ++j) {
-                    weighted += T(gmm_.prec_choleskys[k](i, j)) * (theta[3 + j] - T(gmm_.means(k, j)));
-                }
+                for (int j = 0; j <= i; ++j)
+                    weighted += T(gmm_.prec_choleskys[k](i,j)) * (theta[3+j] - T(gmm_.means(k,j)));
                 dist += weighted * weighted;
             }
-            T log_w = T(std::log(gmm_.weights(k) + 1e-10));
-            T score = dist - T(2.0) * log_w;
-
+            T score = dist - T(2.0) * T(std::log(gmm_.weights(k) + 1e-10));
             if (score < min_dist) { min_dist = score; best_k = k; }
         }
-
         for (int i = 0; i < D; ++i) {
             T weighted = T(0);
-            for (int j = 0; j <= i; ++j) {
-                weighted += T(gmm_.prec_choleskys[best_k](i, j)) * (theta[3 + j] - T(gmm_.means(best_k, j)));
-            }
+            for (int j = 0; j <= i; ++j)
+                weighted += T(gmm_.prec_choleskys[best_k](i,j)) * (theta[3+j] - T(gmm_.means(best_k,j)));
             residuals[i] = T(weight_) * weighted;
         }
         return true;
     }
-
-    const GMMPosePrior& gmm_;
-    double weight_;
+    const GMMPosePrior& gmm_; double weight_;
 };
 
 struct RootUprightResidual {
     explicit RootUprightResidual(double w_) : w(w_) {}
     template <typename T>
     bool operator()(const T* const theta, T* residuals) const {
-        const T* aa = theta; // root axis-angle
         const T up[3] = {T(0), T(1), T(0)};
         T up_rot[3];
-        ceres::AngleAxisRotatePoint(aa, up, up_rot);
+        ceres::AngleAxisRotatePoint(theta, up, up_rot);
         residuals[0] = T(w) * up_rot[0];
         residuals[1] = T(w) * up_rot[2];
         return true;
@@ -372,420 +420,189 @@ struct RootUprightResidual {
     double w;
 };
 
-struct ArmSegToTorsoSegFloorResidual {
-    ArmSegToTorsoSegFloorResidual(int arm_a, int arm_b,
-                                  int torso_a, int torso_b,
-                                  double dmin, double w,
-                                  const SmplModel& model_)
-        : aa(arm_a), ab(arm_b), ta(torso_a), tb(torso_b),
-          dmin(dmin), w(w), model(model_) {}
-
-    template <typename T>
-    bool operator()(const T* const beta,
-                    const T* const theta,
-                    const T* const trans,
-                    T* residual) const
-    {
-        Eigen::Matrix<T, Eigen::Dynamic, 3, Eigen::RowMajor> J;
-        SMPLJointsForward<T>(beta, theta, trans, model, J);
-
-        const Eigen::Matrix<T,3,1> A0 = J.row(aa).transpose();
-        const Eigen::Matrix<T,3,1> A1 = J.row(ab).transpose();
-        const Eigen::Matrix<T,3,1> B0 = J.row(ta).transpose();
-        const Eigen::Matrix<T,3,1> B1 = J.row(tb).transpose();
-
-        auto dist_point_to_seg = [&](const Eigen::Matrix<T,3,1>& P)->T{
-            const Eigen::Matrix<T,3,1> AB = B1 - B0;
-            const T ab2 = AB.squaredNorm() + T(1e-12);
-            T t = (P - B0).dot(AB) / ab2;
-            t = ceres::fmin(T(1), ceres::fmax(T(0), t));
-            const Eigen::Matrix<T,3,1> Q = B0 + t * AB;
-            return ceres::sqrt((P - Q).squaredNorm() + T(1e-12));
-        };
-
-        const T ts[3] = {T(0.2), T(0.5), T(0.8)};
-        T sse = T(0);
-        for (int i=0;i<3;++i){
-            const Eigen::Matrix<T,3,1> P = A0 + ts[i]*(A1 - A0);
-            const T dist = dist_point_to_seg(P);
-            const T x = T(dmin) - dist;
-            const T viol = (ceres::abs(x) + x) * T(0.5);
-            sse += viol * viol;
-        }
-        residual[0] = T(w) * ceres::sqrt(sse + T(1e-12));
-        return true;
-    }
-
-    int aa, ab, ta, tb;
-    double dmin, w;
-    const SmplModel& model;
-};
-
 struct PointToSegmentDistanceFloorResidual {
-    PointToSegmentDistanceFloorResidual(int point_joint,
-                                        int seg_a_joint,
-                                        int seg_b_joint,
-                                        double d_min,
-                                        double w,
-                                        const SmplModel& model_)
-        : p(point_joint), a(seg_a_joint), b(seg_b_joint),
-          dmin(d_min), w(w), model(model_) {}
-
+    PointToSegmentDistanceFloorResidual(int point_joint, int seg_a, int seg_b,
+                                        double d_min, double w, const SmplModel& m)
+        : p(point_joint), a(seg_a), b(seg_b), dmin(d_min), w(w), model(m) {}
     template <typename T>
-    bool operator()(const T* const beta,
-                    const T* const theta,
-                    const T* const trans,
-                    T* residual) const
-    {
-        Eigen::Matrix<T, Eigen::Dynamic, 3, Eigen::RowMajor> J;
+    bool operator()(const T* const beta, const T* const theta,
+                    const T* const trans, T* residual) const {
+        Eigen::Matrix<T,Eigen::Dynamic,3,Eigen::RowMajor> J;
         SMPLJointsForward<T>(beta, theta, trans, model, J);
-
         const Eigen::Matrix<T,3,1> P = J.row(p).transpose();
         const Eigen::Matrix<T,3,1> A = J.row(a).transpose();
         const Eigen::Matrix<T,3,1> B = J.row(b).transpose();
-
         const Eigen::Matrix<T,3,1> AB = B - A;
         const T ab2 = AB.squaredNorm() + T(1e-12);
-
-        T t = (P - A).dot(AB) / ab2;
+        T t = (P-A).dot(AB) / ab2;
         t = ceres::fmin(T(1), ceres::fmax(T(0), t));
-
-        const Eigen::Matrix<T,3,1> Q = A + t * AB;
-        const T dist = ceres::sqrt((P - Q).squaredNorm() + T(1e-12));
-
+        const T dist = ceres::sqrt((P - A - t*AB).squaredNorm() + T(1e-12));
         const T x = T(dmin) - dist;
-        const T viol = (ceres::abs(x) + x) * T(0.5);
-
-        residual[0] = T(w) * viol;
+        residual[0] = T(w) * (ceres::abs(x) + x) * T(0.5);
         return true;
     }
-
-    int p, a, b;
-    double dmin, w;
-    const SmplModel& model;
+    int p, a, b; double dmin, w; const SmplModel& model;
 };
 
 struct TransZPriorResidual {
-  TransZPriorResidual(double z0_, double w_) : z0(z0_), w(w_) {}
-  template<typename T> bool operator()(const T* const trans, T* r) const {
-    r[0] = T(w) * (trans[2] - T(z0));
-    return true;
-  }
-  double z0, w;
+    TransZPriorResidual(double z0_, double w_) : z0(z0_), w(w_) {}
+    template<typename T> bool operator()(const T* const trans, T* r) const {
+        r[0] = T(w) * (trans[2] - T(z0));
+        return true;
+    }
+    double z0, w;
 };
 
 struct PelvisOverAnklesResidual {
-  PelvisOverAnklesResidual(int pelvis_, int lank_, int rank_, double w_, const SmplModel& m)
-    : p(pelvis_), la(lank_), ra(rank_), w(w_), model(m) {}
-  template<typename T>
-  bool operator()(const T* const beta, const T* const theta, const T* const trans, T* r) const {
-    Eigen::Matrix<T,Eigen::Dynamic,3,Eigen::RowMajor> J;
-    SMPLJointsForward<T>(beta, theta, trans, model, J);
-
-    const T midx = (J(la,0) + J(ra,0)) * T(0.5);
-    const T midz = (J(la,2) + J(ra,2)) * T(0.5);
-
-    r[0] = T(w) * (J(p,0) - midx);   // x
-    r[1] = T(w) * (J(p,2) - midz);   // z
-    return true;
-  }
-  int p, la, ra; double w; const SmplModel& model;
-};
-
-// ------------------------------
-struct FootGroundFlatResidual {
-    FootGroundFlatResidual(int ankle_j_, int foot_j_,
-                           double ground_y_,
-                           double w_ground_, double w_flat_,
-                           double contact_w_,
-                           const SmplModel& model_)
-        : ankle_j(ankle_j_), foot_j(foot_j_),
-          ground_y(ground_y_),
-          w_ground(w_ground_), w_flat(w_flat_),
-          contact_w(contact_w_),
-          model(model_) {}
-
-    template <typename T>
-    bool operator()(const T* const beta,
-                    const T* const theta,
-                    const T* const trans,
-                    T* r) const
-    {
-        const T cw = T(contact_w);
-        if (cw < T(1e-6)) {
-            r[0] = T(0); r[1] = T(0);
-            return true;
-        }
-
-        Eigen::Matrix<T, Eigen::Dynamic, 3, Eigen::RowMajor> J;
+    PelvisOverAnklesResidual(int pelvis_, int lank_, int rank_, double w_, const SmplModel& m)
+        : p(pelvis_), la(lank_), ra(rank_), w(w_), model(m) {}
+    template<typename T>
+    bool operator()(const T* const beta, const T* const theta,
+                    const T* const trans, T* r) const {
+        Eigen::Matrix<T,Eigen::Dynamic,3,Eigen::RowMajor> J;
         SMPLJointsForward<T>(beta, theta, trans, model, J);
-
-        // guard indices
-        if (ankle_j < 0 || ankle_j >= J.rows() || foot_j < 0 || foot_j >= J.rows()) {
-            r[0] = T(0); r[1] = T(0);
-            return true;
-        }
-
-        const T yA = J(ankle_j, 1);
-        const T yF = J(foot_j,  1);
-
-        r[0] = T(w_ground) * cw * (yA - T(ground_y)); 
-        r[1] = T(w_flat)   * cw * (yF - yA);         
+        r[0] = T(w) * (J(p,0) - (J(la,0)+J(ra,0))*T(0.5));
+        r[1] = T(w) * (J(p,2) - (J(la,2)+J(ra,2))*T(0.5));
         return true;
     }
+    int p, la, ra; double w; const SmplModel& model;
+};
 
-    int ankle_j, foot_j;
-    double ground_y;
-    double w_ground, w_flat;
-    double contact_w;
+struct FootGroundFlatResidual {
+    FootGroundFlatResidual(int ankle_j_, int foot_j_, double ground_y_,
+                           double w_ground_, double w_flat_, double contact_w_,
+                           const SmplModel& m)
+        : ankle_j(ankle_j_), foot_j(foot_j_), ground_y(ground_y_),
+          w_ground(w_ground_), w_flat(w_flat_), contact_w(contact_w_), model(m) {}
+    template <typename T>
+    bool operator()(const T* const beta, const T* const theta,
+                    const T* const trans, T* r) const {
+        const T cw = T(contact_w);
+        if (cw < T(1e-6)) { r[0]=T(0); r[1]=T(0); return true; }
+        Eigen::Matrix<T,Eigen::Dynamic,3,Eigen::RowMajor> J;
+        SMPLJointsForward<T>(beta, theta, trans, model, J);
+        if (ankle_j<0||ankle_j>=J.rows()||foot_j<0||foot_j>=J.rows()) {
+            r[0]=T(0); r[1]=T(0); return true;
+        }
+        r[0] = T(w_ground) * cw * (J(ankle_j,1) - T(ground_y));
+        r[1] = T(w_flat)   * cw * (J(foot_j,1)  - J(ankle_j,1));
+        return true;
+    }
+    int ankle_j, foot_j; double ground_y, w_ground, w_flat, contact_w;
     const SmplModel& model;
 };
 
-// ------------------------------
-// Hinge axis residual
-// ------------------------------
 struct HingeAxisResidual {
-    HingeAxisResidual(int joint_idx,
-                      Eigen::Vector3d axis_unit,
-                      double w_perp,
-                      double w_range,
-                      double min_a,
-                      double max_a)
-        : j_(joint_idx),
-          u_(axis_unit.normalized()),
-          w_perp_(w_perp),
-          w_range_(w_range),
-          min_a_(min_a),
-          max_a_(max_a) {}
-
+    HingeAxisResidual(int joint, Eigen::Vector3d axis, double w_perp, double w_range,
+                      double min_a, double max_a)
+        : j_(joint), u_(axis.normalized()), w_perp_(w_perp), w_range_(w_range),
+          min_a_(min_a), max_a_(max_a) {}
     template <typename T>
     bool operator()(const T* const theta, T* residual) const {
-        const int base = 3 * j_;
-        Eigen::Matrix<T,3,1> r(theta[base+0], theta[base+1], theta[base+2]);
+        const int base = 3*j_;
+        Eigen::Matrix<T,3,1> r(theta[base], theta[base+1], theta[base+2]);
         Eigen::Matrix<T,3,1> u(T(u_.x()), T(u_.y()), T(u_.z()));
-
         const T a = u.dot(r);
-        Eigen::Matrix<T,3,1> perp = r - u * a;
-
-        residual[0] = T(w_perp_) * ceres::sqrt(perp.squaredNorm() + T(1e-12));
-
-        const T low  = T(min_a_) - a;
-        const T high = a - T(max_a_);
-        const T over_low  = (ceres::abs(low)  + low)  * T(0.5);
-        const T over_high = (ceres::abs(high) + high) * T(0.5);
-        residual[1] = T(w_range_) * (over_low + over_high);
-
+        residual[0] = T(w_perp_) * ceres::sqrt((r - u*a).squaredNorm() + T(1e-12));
+        const T low  = T(min_a_)-a, high = a-T(max_a_);
+        residual[1] = T(w_range_) * ((ceres::abs(low)+low + ceres::abs(high)+high) * T(0.5));
         return true;
     }
-
-    int j_;
-    Eigen::Vector3d u_;
-    double w_perp_, w_range_, min_a_, max_a_;
+    int j_; Eigen::Vector3d u_; double w_perp_, w_range_, min_a_, max_a_;
 };
 
 struct SoftAngleLimitResidual {
-    SoftAngleLimitResidual(int joint_idx, double amax, double w)
-        : j_(joint_idx), amax_(amax), w_(w) {}
-
+    SoftAngleLimitResidual(int joint, double amax, double w)
+        : j_(joint), amax_(amax), w_(w) {}
     template <typename T>
     bool operator()(const T* const theta, T* residual) const {
-        const int base = 3 * j_;
-        const T rx = theta[base + 0];
-        const T ry = theta[base + 1];
-        const T rz = theta[base + 2];
-
-        const T ang = ceres::sqrt(rx*rx + ry*ry + rz*rz + T(1e-12));
+        const int b = 3*j_;
+        const T ang = ceres::sqrt(theta[b]*theta[b]+theta[b+1]*theta[b+1]+theta[b+2]*theta[b+2]+T(1e-12));
         const T over = ang - T(amax_);
-        const T abs_over = ceres::sqrt(over * over + T(1e-12));
-        const T max0 = (abs_over + over) * T(0.5);
-
-        residual[0] = T(w_) * max0;
+        residual[0] = T(w_) * (ceres::abs(over)+over) * T(0.5);
         return true;
     }
-
-    int j_;
-    double amax_, w_;
+    int j_; double amax_, w_;
 };
 
 struct BendLimitResidual {
-    BendLimitResidual(int joint_idx, int axis_idx, double sign, double weight)
-        : joint_idx_(joint_idx), axis_idx_(axis_idx), sign_(sign), weight_(weight) {}
-
+    BendLimitResidual(int joint, int axis, double sign, double weight)
+        : joint_(joint), axis_(axis), sign_(sign), w_(weight) {}
     template <typename T>
     bool operator()(const T* const theta, T* residual) const {
-        const int idx = 3 * joint_idx_ + axis_idx_;
-        residual[0] = T(weight_) * ceres::exp(T(sign_) * theta[idx]);
+        residual[0] = T(w_) * ceres::exp(T(sign_) * theta[3*joint_+axis_]);
         return true;
     }
-
-    int joint_idx_;
-    int axis_idx_;
-    double sign_;
-    double weight_;
+    int joint_, axis_; double sign_, w_;
 };
 
 struct TemporalPoseResidual {
-    TemporalPoseResidual(const double* theta_prev_, double w_, bool body_only_)
-        : prev(theta_prev_), w(w_), body_only(body_only_) {}
-
+    TemporalPoseResidual(const double* prev_, double w_, bool body_only_)
+        : prev(prev_), w(w_), body_only(body_only_) {}
     template <typename T>
     bool operator()(const T* const theta, T* residuals) const {
-        int k = 0;
-        if (body_only) {
-            for (int i = 3; i < 72; ++i) residuals[k++] = T(w) * (theta[i] - T(prev[i]));
-        } else {
-            for (int i = 0; i < 72; ++i) residuals[k++] = T(w) * (theta[i] - T(prev[i]));
-        }
+        int k=0; for (int i=(body_only?3:0); i<72; ++i) residuals[k++] = T(w)*(theta[i]-T(prev[i]));
         return true;
     }
-    const double* prev;
-    double w;
-    bool body_only;
+    const double* prev; double w; bool body_only;
 };
 
 struct TemporalTransResidual {
-    TemporalTransResidual(const double* trans_prev_, double w_)
-        : prev(trans_prev_), w(w_) {}
-
+    TemporalTransResidual(const double* prev_, double w_) : prev(prev_), w(w_) {}
     template <typename T>
-    bool operator()(const T* const trans, T* residuals) const {
-        residuals[0] = T(w) * (trans[0] - T(prev[0]));
-        residuals[1] = T(w) * (trans[1] - T(prev[1]));
-        residuals[2] = T(w) * (trans[2] - T(prev[2]));
+    bool operator()(const T* const trans, T* r) const {
+        for (int i=0;i<3;++i) r[i]=T(w)*(trans[i]-T(prev[i]));
         return true;
     }
-    const double* prev;
-    double w;
+    const double* prev; double w;
 };
 
-// ------------------------------
-// Constant-velocity trans prior (better than simple temporal prior)
-// Predicts t_curr from t_prev + (t_prev - t_prevprev), i.e., constant velocity extrapolation
-// This suppresses random-walk drift while allowing smooth motion
-// ------------------------------
 struct TransConstVelPriorResidual {
-    TransConstVelPriorResidual(const double* trans_prev_, const double* trans_prevprev_, double w_)
-        : t_prev(trans_prev_), t_prevprev(trans_prevprev_), w(w_) {}
-
+    TransConstVelPriorResidual(const double* prev_, const double* prevprev_, double w_)
+        : t1(prev_), t2(prevprev_), w(w_) {}
     template <typename T>
-    bool operator()(const T* const trans, T* residuals) const {
-        // pred = t_prev + (t_prev - t_prevprev) = 2*t_prev - t_prevprev
-        const T pred0 = T(2.0) * T(t_prev[0]) - T(t_prevprev[0]);
-        const T pred1 = T(2.0) * T(t_prev[1]) - T(t_prevprev[1]);
-        const T pred2 = T(2.0) * T(t_prev[2]) - T(t_prevprev[2]);
-
-        residuals[0] = T(w) * (trans[0] - pred0);
-        residuals[1] = T(w) * (trans[1] - pred1);
-        residuals[2] = T(w) * (trans[2] - pred2);
+    bool operator()(const T* const trans, T* r) const {
+        for (int i=0;i<3;++i) r[i]=T(w)*(trans[i] - (T(2)*T(t1[i])-T(t2[i])));
         return true;
     }
-    const double* t_prev;
-    const double* t_prevprev;
-    double w;
-};
-
-// Camera-space depth prior for world-coordinate optimization
-// Constrains Z_cam = R[2,:] * trans_world + t[2] to stay close to previous frame
-// This prevents drift along the camera's optical axis
-struct CameraDepthPriorResidual {
-    CameraDepthPriorResidual(const Eigen::Matrix3d& R_cw,
-                             const Eigen::Vector3d& t_cw,
-                             double Z_cam_prev,
-                             double w)
-        : R_cw_(R_cw), t_cw_(t_cw), Z_prev_(Z_cam_prev), w_(w) {}
-
-    template <typename T>
-    bool operator()(const T* const trans_world, T* residuals) const {
-        // Z_cam = R[2,:] * trans_world + t[2]
-        const T Z_cam = T(R_cw_(2,0)) * trans_world[0]
-                      + T(R_cw_(2,1)) * trans_world[1]
-                      + T(R_cw_(2,2)) * trans_world[2]
-                      + T(t_cw_(2));
-        residuals[0] = T(w_) * (Z_cam - T(Z_prev_));
-        return true;
-    }
-
-    Eigen::Matrix3d R_cw_;
-    Eigen::Vector3d t_cw_;
-    double Z_prev_;
-    double w_;
-};
-
-// Constant-velocity version: Z_cam should follow linear extrapolation from prev two frames
-struct CameraDepthConstVelResidual {
-    CameraDepthConstVelResidual(const Eigen::Matrix3d& R_cw,
-                                const Eigen::Vector3d& t_cw,
-                                double Z_cam_prev,
-                                double Z_cam_prev2,
-                                double w)
-        : R_cw_(R_cw), t_cw_(t_cw), Z_prev_(Z_cam_prev), Z_prev2_(Z_cam_prev2), w_(w) {}
-
-    template <typename T>
-    bool operator()(const T* const trans_world, T* residuals) const {
-        // Z_cam = R[2,:] * trans_world + t[2]
-        const T Z_cam = T(R_cw_(2,0)) * trans_world[0]
-                      + T(R_cw_(2,1)) * trans_world[1]
-                      + T(R_cw_(2,2)) * trans_world[2]
-                      + T(t_cw_(2));
-        // Constant velocity: Z_pred = 2*Z_prev - Z_prev2
-        const T Z_pred = T(2.0) * T(Z_prev_) - T(Z_prev2_);
-        residuals[0] = T(w_) * (Z_cam - Z_pred);
-        return true;
-    }
-
-    Eigen::Matrix3d R_cw_;
-    Eigen::Vector3d t_cw_;
-    double Z_prev_;
-    double Z_prev2_;
-    double w_;
-};
-
-struct TemporalAccelPoseResidual {
-    TemporalAccelPoseResidual(const double* theta_prev_, const double* theta_prev2_,
-                              double w_, bool body_only_)
-        : p1(theta_prev_), p2(theta_prev2_), w(w_), body_only(body_only_) {}
-
-    template <typename T>
-    bool operator()(const T* const theta, T* residuals) const {
-        int k = 0;
-        if (body_only) {
-            for (int i = 3; i < 72; ++i) {
-                residuals[k++] = T(w) * (theta[i] - T(2.0)*T(p1[i]) + T(p2[i]));
-            }
-        } else {
-            for (int i = 0; i < 72; ++i) {
-                residuals[k++] = T(w) * (theta[i] - T(2.0)*T(p1[i]) + T(p2[i]));
-            }
-        }
-        return true;
-    }
-    const double* p1;
-    const double* p2;
-    double w;
-    bool body_only;
+    const double* t1; const double* t2; double w;
 };
 
 struct TemporalRootResidual {
-    TemporalRootResidual(const double* theta_prev_, double w_)
-        : prev(theta_prev_), w(w_) {}
-
+    TemporalRootResidual(const double* prev_, double w_) : prev(prev_), w(w_) {}
     template <typename T>
-    bool operator()(const T* const theta, T* residuals) const {
-        residuals[0] = T(w) * (theta[0] - T(prev[0]));
-        residuals[1] = T(w) * (theta[1] - T(prev[1]));
-        residuals[2] = T(w) * (theta[2] - T(prev[2]));
+    bool operator()(const T* const theta, T* r) const {
+        for (int i=0;i<3;++i) r[i]=T(w)*(theta[i]-T(prev[i]));
         return true;
     }
-    const double* prev;
-    double w;
+    const double* prev; double w;
 };
 
+struct TemporalAccelPoseResidual {
+    TemporalAccelPoseResidual(const double* p1_, const double* p2_, double w_, bool body_only_)
+        : p1(p1_), p2(p2_), w(w_), body_only(body_only_) {}
+    template <typename T>
+    bool operator()(const T* const theta, T* residuals) const {
+        int k=0; for (int i=(body_only?3:0); i<72; ++i)
+            residuals[k++] = T(w)*(theta[i]-T(2)*T(p1[i])+T(p2[i]));
+        return true;
+    }
+    const double* p1; const double* p2; double w; bool body_only;
+};
 
-// ------------------------------
-// 2D reprojection residual (supports optional camera extrinsics)
-// When extrinsics is nullptr: assumes camera at origin (fixed camera, original behavior)
-// When extrinsics is provided: transforms SMPL world coords to camera coords before projection
-// ------------------------------
+struct TemporalDepthAffineResidual {
+    TemporalDepthAffineResidual(const double* prev_, double ws_, double wb_)
+        : prev(prev_), w_s(ws_), w_b(wb_) {}
+    template <typename T>
+    bool operator()(const T* const affine, T* r) const {
+        r[0]=T(w_s)*(affine[0]-T(prev[0]));
+        r[1]=T(w_b)*(affine[1]-T(prev[1]));
+        return true;
+    }
+    const double* prev; double w_s, w_b;
+};
+
+// 2D reprojection — CAMERA SPACE ONLY, no extrinsics
 struct AllKeypointsReprojectionResidual {
     AllKeypointsReprojectionResidual(
         const std::vector<Landmark2D>& observed,
@@ -793,338 +610,149 @@ struct AllKeypointsReprojectionResidual {
         const SmplModel& model,
         float min_confidence,
         bool use_stable_only,
-        bool flip_y,
-        const CameraExtrinsics* extrinsics = nullptr  // optional: world-to-camera transform
-    )
-    : camera_(cam), model_(model), flip_y_(flip_y), has_extrinsics_(extrinsics != nullptr)
+        bool flip_y)
+    : camera_(cam), model_(model), flip_y_(flip_y)
     {
-        if (extrinsics) {
-            extrinsics_ = *extrinsics;
-        }
-
         std::array<bool,25> allowed{};
         allowed.fill(true);
         if (use_stable_only) {
             allowed.fill(false);
-            int ids[] = {1,2,3,4,5,6,7,8,9,10,11,12,13,14};
-            for (int id : ids) allowed[id] = true;
+            for (int id : {1,2,3,4,5,6,7,8,9,10,11,12,13,14}) allowed[id]=true;
         }
-
-        lms_.reserve(observed.size());
-        smpl_ids_.reserve(observed.size());
-
         for (const auto& lm : observed) {
             if (lm.confidence < min_confidence) continue;
             if (lm.joint_id < 0 || lm.joint_id >= 25) continue;
             if (!allowed[lm.joint_id]) continue;
-
-            const int sid = OPENPOSE_TO_SMPL[lm.joint_id];
+            int sid = OPENPOSE_TO_SMPL[lm.joint_id];
             if (sid < 0 || sid >= model_.J) continue;
-
             lms_.push_back(lm);
             smpl_ids_.push_back(sid);
         }
     }
 
-    int NumUsedKeypoints() const { return static_cast<int>(lms_.size()); }
+    int NumUsedKeypoints() const { return (int)lms_.size(); }
 
     template <typename T>
-    bool operator()(const T* const beta,
-                    const T* const theta,
-                    const T* const trans,
-                    T* residuals) const
+    bool operator()(const T* const beta, const T* const theta,
+                    const T* const trans, T* residuals) const
     {
-        Eigen::Matrix<T, Eigen::Dynamic, 3, Eigen::RowMajor> Jw;
-        SMPLJointsForward<T>(beta, theta, trans, model_, Jw);
+        Eigen::Matrix<T,Eigen::Dynamic,3,Eigen::RowMajor> J;
+        SMPLJointsForward<T>(beta, theta, trans, model_, J);
 
-        for (int i = 0; i < (int)lms_.size(); ++i) {
-            const int jid = smpl_ids_[i];
-
-            T X, Y, Z;
-
-            if (has_extrinsics_) {
-                // Transform to camera coordinates: p_cam = R * p_world + t
-                T p_world[3] = {Jw(jid, 0), Jw(jid, 1), Jw(jid, 2)};
-                T p_cam[3];
-                for (int k = 0; k < 3; ++k) {
-                    p_cam[k] = T(extrinsics_.t(k));
-                    for (int l = 0; l < 3; ++l) {
-                        p_cam[k] += T(extrinsics_.R(k, l)) * p_world[l];
-                    }
-                }
-                X = p_cam[0];
-                Y = p_cam[1];
-                Z = p_cam[2];
-            } else {
-                // No extrinsics: camera at origin, SMPL already in camera space
-                X = Jw(jid, 0);
-                Y = Jw(jid, 1);
-                Z = Jw(jid, 2);
-            }
-
+        for (int i=0; i<(int)lms_.size(); ++i) {
+            T X=J(smpl_ids_[i],0), Y=J(smpl_ids_[i],1), Z=J(smpl_ids_[i],2);
             if (Z < T(1e-6)) Z = T(1e-6);
-
-            // Pinhole projection
-            // When has_extrinsics_: Y flip is already handled in extrinsics preprocessing
-            // When no extrinsics: use flip_y_ flag for backward compatibility
-            const T u = T(camera_.fx) * (X / Z) + T(camera_.cx);
-            const T v = has_extrinsics_
-                ? T(camera_.fy) * (Y / Z) + T(camera_.cy)
-                : T(camera_.fy) * ((flip_y_ ? -Y : Y) / Z) + T(camera_.cy);
-
-            const float c = std::max(1e-6f, lms_[i].confidence);
-            const T wconf = ceres::sqrt(T(c));
-            residuals[2*i + 0] = wconf * (u - T(lms_[i].x));
-            residuals[2*i + 1] = wconf * (v - T(lms_[i].y));
+            const T u = T(camera_.fx)*(X/Z) + T(camera_.cx);
+            const T v = T(camera_.fy)*((flip_y_?-Y:Y)/Z) + T(camera_.cy);
+            const T wc = ceres::sqrt(T(std::max(1e-6f, lms_[i].confidence)));
+            residuals[2*i]   = wc*(u-T(lms_[i].x));
+            residuals[2*i+1] = wc*(v-T(lms_[i].y));
         }
         return true;
     }
-
 private:
     std::vector<Landmark2D> lms_;
     std::vector<int> smpl_ids_;
     CameraIntrinsics camera_;
-    CameraExtrinsics extrinsics_;
     const SmplModel& model_;
     bool flip_y_;
-    bool has_extrinsics_;
 };
 
-// ------------------------------
-// 3D joints residual (FAST)
-// ------------------------------
 struct Joints3DResidualFast {
-    Joints3DResidualFast(const MatX3dRM& J_obs_, const SmplModel& model_, double w_)
-        : J_obs(J_obs_), model(model_), w(w_) {}
-
+    Joints3DResidualFast(const MatX3dRM& J_obs_, const SmplModel& m, double w_)
+        : J_obs(J_obs_), model(m), w(w_) {}
     template <typename T>
-    bool operator()(const T* const beta,
-                    const T* const theta,
-                    const T* const trans,
-                    T* residuals) const {
-        Eigen::Matrix<T, Eigen::Dynamic, 3, Eigen::RowMajor> J_pred;
-        SMPLJointsForward<T>(beta, theta, trans, model, J_pred);
-
-        for (int i = 0; i < 24; ++i) {
-            residuals[3*i+0] = T(w) * (J_pred(i,0) - T(J_obs(i,0)));
-            residuals[3*i+1] = T(w) * (J_pred(i,1) - T(J_obs(i,1)));
-            residuals[3*i+2] = T(w) * (J_pred(i,2) - T(J_obs(i,2)));
-        }
+    bool operator()(const T* const beta, const T* const theta,
+                    const T* const trans, T* residuals) const {
+        Eigen::Matrix<T,Eigen::Dynamic,3,Eigen::RowMajor> J;
+        SMPLJointsForward<T>(beta, theta, trans, model, J);
+        for (int i=0;i<24;++i) for (int c=0;c<3;++c)
+            residuals[3*i+c]=T(w)*(J(i,c)-T(J_obs(i,c)));
         return true;
     }
-
-    MatX3dRM J_obs;
-    const SmplModel& model;
-    double w;
+    MatX3dRM J_obs; const SmplModel& model; double w;
 };
 
-// ------------------------------
-// Depth residual (absolute)
-// ------------------------------
 struct DepthResidual {
-    DepthResidual(const std::vector<JointDepthData>& depth_data_,
-                  const SmplModel& model_,
-                  double w_)
-        : depth_data(depth_data_), model(model_), w(w_) {}
-
-    int NumDepthPoints() const { return static_cast<int>(depth_data.size()); }
-
+    DepthResidual(const std::vector<JointDepthData>& d, const SmplModel& m, double w_)
+        : data(d), model(m), w(w_) {}
+    int NumDepthPoints() const { return (int)data.size(); }
     template <typename T>
-    bool operator()(const T* const beta,
-                    const T* const theta,
-                    const T* const trans,
-                    T* residuals) const {
-        Eigen::Matrix<T, Eigen::Dynamic, 3, Eigen::RowMajor> J_pred;
-        SMPLJointsForward<T>(beta, theta, trans, model, J_pred);
-
-        for (int i = 0; i < NumDepthPoints(); ++i) {
-            int j = depth_data[i].smpl_joint_idx;
-            const T z_pred = J_pred(j, 2);
-            const T z_gt = T(depth_data[i].depth_z);
-            residuals[i] = T(w) * (z_pred - z_gt);
-        }
+    bool operator()(const T* const beta, const T* const theta,
+                    const T* const trans, T* residuals) const {
+        Eigen::Matrix<T,Eigen::Dynamic,3,Eigen::RowMajor> J;
+        SMPLJointsForward<T>(beta, theta, trans, model, J);
+        for (int i=0;i<(int)data.size();++i)
+            residuals[i]=T(w)*(J(data[i].smpl_joint_idx,2)-T(data[i].depth_z));
         return true;
     }
-
-    std::vector<JointDepthData> depth_data;
-    const SmplModel& model;
-    double w;
-};
-
-// ------------------------------
-// Relative depth residual
-// ------------------------------
-struct RelativeDepthPair {
-    int smpl_joint_a;
-    int smpl_joint_b;
-    double rel_depth_a;
-    double rel_depth_b;
+    std::vector<JointDepthData> data; const SmplModel& model; double w;
 };
 
 struct RelativeDepthResidual {
-    RelativeDepthResidual(const std::vector<RelativeDepthPair>& pairs_,
-                          const SmplModel& model_,
-                          double w_)
-        : pairs(pairs_), model(model_), w(w_) {}
-
-    int NumPairs() const { return static_cast<int>(pairs.size()); }
-
+    RelativeDepthResidual(const std::vector<RelativeDepthPair>& p, const SmplModel& m, double w_)
+        : pairs(p), model(m), w(w_) {}
+    int NumPairs() const { return (int)pairs.size(); }
     template <typename T>
-    bool operator()(const T* const beta,
-                    const T* const theta,
-                    const T* const trans,
-                    T* residuals) const {
-        Eigen::Matrix<T, Eigen::Dynamic, 3, Eigen::RowMajor> J_pred;
-        SMPLJointsForward<T>(beta, theta, trans, model, J_pred);
-
-        for (int i = 0; i < NumPairs(); ++i) {
-            const int ja = pairs[i].smpl_joint_a;
-            const int jb = pairs[i].smpl_joint_b;
-
-            const T z_a = J_pred(ja, 2);
-            const T z_b = J_pred(jb, 2);
-            const T z_diff = z_a - z_b;
-
-            const double rel_diff = pairs[i].rel_depth_a - pairs[i].rel_depth_b;
-
-            const double eps = 1e-3;
-            if (std::abs(rel_diff) < eps) {
-                residuals[i] = T(0);
-                continue;
-            }
-
-            const T s = T(rel_diff > 0 ? 1.0 : -1.0);
-            const T violation = s * z_diff; // >0 => wrong ordering
-            residuals[i] = T(w) * (violation > T(0) ? violation : T(0));
+    bool operator()(const T* const beta, const T* const theta,
+                    const T* const trans, T* residuals) const {
+        Eigen::Matrix<T,Eigen::Dynamic,3,Eigen::RowMajor> J;
+        SMPLJointsForward<T>(beta, theta, trans, model, J);
+        for (int i=0;i<(int)pairs.size();++i) {
+            const T zd = J(pairs[i].smpl_joint_a,2)-J(pairs[i].smpl_joint_b,2);
+            double rd = pairs[i].rel_depth_a-pairs[i].rel_depth_b;
+            if (std::abs(rd)<1e-3) { residuals[i]=T(0); continue; }
+            const T s = T(rd>0?1.0:-1.0);
+            const T v = s*zd;
+            residuals[i]=T(w)*(v>T(0)?v:T(0));
         }
         return true;
     }
-
-    std::vector<RelativeDepthPair> pairs;
-    const SmplModel& model;
-    double w;
+    std::vector<RelativeDepthPair> pairs; const SmplModel& model; double w;
 };
 
-// ------------------------------
-// Affine depth model: Z_tgt = bias + sign * scale * d
-// - d: Sapiens relative depth (larger = farther, range ~0.02 to 1.6+)
-// - scale: slope, optimized parameter
-// - bias: intercept (~Z_min), optimized parameter
-// - sign: +1 (Sapiens: larger d = farther = larger Z)
-// ------------------------------
 struct DepthAffineResidual {
     DepthAffineResidual(const std::vector<JointRelDepthData>& obs_,
-                        const SmplModel& model_,
-                        double w_,
-                        double sign_,
-                        const CameraExtrinsics* extrinsics_ = nullptr)
-        : obs(obs_), model(model_), w(w_), sign(sign_),
-          has_extrinsics(extrinsics_ != nullptr)
-    {
-        if (extrinsics_) extrinsics = *extrinsics_;
-    }
-
-    int NumPoints() const { return static_cast<int>(obs.size()); }
-
+                        const SmplModel& m, double w_, double sign_)
+        : obs(obs_), model(m), w(w_), sign(sign_) {}
+    int NumPoints() const { return (int)obs.size(); }
     template <typename T>
-    bool operator()(const T* const beta,
-                    const T* const theta,
-                    const T* const trans,
-                    const T* const affine, // [scale, bias]
-                    T* residuals) const
-    {
-        const T scale = affine[0];
-        const T bias  = affine[1];
-
-        Eigen::Matrix<T, Eigen::Dynamic, 3, Eigen::RowMajor> J_pred;
-        SMPLJointsForward<T>(beta, theta, trans, model, J_pred);
-
-        for (int i = 0; i < NumPoints(); ++i) {
-            const int j = obs[i].smpl_joint_idx;
-
-            T z_pred;
-            if (has_extrinsics) {
-                // World coordinates: transform to camera space to get depth
-                // p_cam = R * p_world + t, depth = p_cam[2]
-                T p_world[3] = {J_pred(j, 0), J_pred(j, 1), J_pred(j, 2)};
-                z_pred = T(extrinsics.t(2));
-                for (int k = 0; k < 3; ++k) {
-                    z_pred += T(extrinsics.R(2, k)) * p_world[k];
-                }
-            } else {
-                // Camera coordinates: Z is already depth
-                z_pred = J_pred(j, 2);
-            }
-
-            // Affine depth model: Z = bias + sign * scale * d
-            const double d = obs[i].rel_depth;
-            const T z_tgt = bias + T(sign) * scale * T(d);
-
-            const T wi = ceres::sqrt(T(std::max(1e-6, obs[i].weight)));
-            residuals[i] = T(w) * wi * (z_pred - z_tgt);
+    bool operator()(const T* const beta, const T* const theta,
+                    const T* const trans, const T* const affine, T* residuals) const {
+        Eigen::Matrix<T,Eigen::Dynamic,3,Eigen::RowMajor> J;
+        SMPLJointsForward<T>(beta, theta, trans, model, J);
+        for (int i=0;i<(int)obs.size();++i) {
+            const T z_pred = J(obs[i].smpl_joint_idx, 2);  // camera-space Z = depth
+            const T z_tgt = affine[1] + T(sign)*affine[0]*T(obs[i].rel_depth);
+            residuals[i] = T(w)*ceres::sqrt(T(std::max(1e-6,obs[i].weight)))*(z_pred-z_tgt);
         }
         return true;
     }
-
-    std::vector<JointRelDepthData> obs;
-    const SmplModel& model;
-    CameraExtrinsics extrinsics;
-    double w;
-    double sign;
-    bool has_extrinsics;
+    std::vector<JointRelDepthData> obs; const SmplModel& model; double w, sign;
 };
 
-// ------------------------------
-// Temporal prior for affine depth params 
-// ------------------------------
-struct TemporalDepthAffineResidual {
-    TemporalDepthAffineResidual(const double* prev_, double w_s_, double w_b_)
-        : prev(prev_), w_s(w_s_), w_b(w_b_) {}
-
-    template <typename T>
-    bool operator()(const T* const affine, T* r) const {
-        r[0] = T(w_s) * (affine[0] - T(prev[0])); // scale
-        r[1] = T(w_b) * (affine[1] - T(prev[1])); // bias
-        return true;
-    }
-
-    const double* prev;
-    double w_s, w_b;
-};
-
-// ------------------------------
-// APIs
-// ------------------------------
-bool OptimizeSMPL3D(const MatX3dRM& J_obs,
-                    const SmplModel& model,
-                    double* beta,
-                    double* theta,
-                    double* trans,
-                    const OptimizerConfig& config);
-
+// ============================================================
+// API
+// ============================================================
 bool OptimizeSMPL(const std::vector<Landmark2D>& observed_keypoints,
                   const CameraIntrinsics& camera,
                   const SmplModel& model,
-                  double* beta,
-                  double* theta,
-                  double* trans,
-                  const OptimizerConfig& config,
-                  const CameraExtrinsics* extrinsics = nullptr);  // optional extrinsics for world-space optimization
-                  
+                  double* beta, double* theta, double* trans,
+                  const OptimizerConfig& config);
+
 bool OptimizeSMPLTracked(const std::vector<Landmark2D>& observed_keypoints,
                          const CameraIntrinsics& camera,
                          const SmplModel& model,
-                         double* beta,
-                         double* theta,
-                         double* trans,
+                         double* beta, double* theta, double* trans,
                          const OptimizerConfig& cfg,
                          const double* theta_prev,
                          const double* trans_prev,
                          const double* theta_prev2 = nullptr,
-                         const double* trans_prev2 = nullptr,
-                         const CameraExtrinsics* extrinsics = nullptr);  // optional extrinsics
+                         const double* trans_prev2 = nullptr);
 
-// Load camera poses from file (one 3x4 matrix per line, 12 values flattened row-major)
+bool OptimizeSMPL3D(const MatX3dRM& J_obs, const SmplModel& model,
+                    double* beta, double* theta, double* trans,
+                    const OptimizerConfig& config);
+
 std::vector<CameraExtrinsics> LoadCameraPoses(const std::string& path);
-
 CameraIntrinsics CreateDefaultCamera(int image_width, int image_height);

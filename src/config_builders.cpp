@@ -8,7 +8,7 @@ OptimizerConfig MakeCfgForOpenPose(const GMMPosePrior* gmm_prior) {
     OptimizerConfig cfg;
     cfg.verbose = true;
 
-    cfg.min_confidence = 0.20f;
+    cfg.min_confidence = 0.10f;
     cfg.use_stable_joints_only = true;
     cfg.flip_y_in_projection = true;
 
@@ -25,8 +25,8 @@ OptimizerConfig MakeCfgForOpenPose(const GMMPosePrior* gmm_prior) {
     cfg.use_bend_limits  = true;
     cfg.w_bend           = 0.05;
 
-    cfg.w_hinge_perp_elbow  = 40.0;
-    cfg.w_hinge_range_elbow = 20.0;
+    cfg.w_hinge_perp_elbow  = 15.0;
+    cfg.w_hinge_range_elbow = 8.0;
     cfg.w_hinge_perp_knee   = 120.0;
     cfg.w_hinge_range_knee  = 60.0;
     cfg.hinge_min = -2.6;
@@ -58,10 +58,10 @@ OptimizerConfig MakeCfgForOpenPose(const GMMPosePrior* gmm_prior) {
     cfg.use_arm_torso_sep = true;
     cfg.arm_torso_seg_a = 3;
     cfg.arm_torso_seg_b = 12;
-    cfg.arm_torso_d_elbow = 0.08;
-    cfg.arm_torso_d_wrist = 0.10;
-    cfg.arm_torso_w_elbow = 80.0;
-    cfg.arm_torso_w_wrist = 120.0;
+    cfg.arm_torso_d_elbow = 0.035;
+    cfg.arm_torso_d_wrist = 0.045;
+    cfg.arm_torso_w_elbow = 20.0;
+    cfg.arm_torso_w_wrist = 35.0;
 
     cfg.lock_wrists = true;
     cfg.lock_hands  = true;

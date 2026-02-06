@@ -36,15 +36,13 @@ inline std::string NowString() {
 }
 
 inline void EnsureDir(const std::string& /*dir*/) {
-    // header-only: 不强依赖 filesystem。你 main.cpp 已经 create_directories 了。
-    // 如果你想把 create_directories 也塞进来，可在这里加 <filesystem>。
 }
 
 // ------------------------------
-// run meta info (optional, but recommended)
+// run meta info
 // ------------------------------
 struct RunMeta {
-    std::string mode;           // e.g. "AMASS_SEQ", "OPENPOSE_SEQ"
+    std::string mode;
     std::string seq_dir;
     std::string depth_dir;
     std::string gt_dir;
@@ -54,7 +52,7 @@ struct RunMeta {
     bool use_world_coords = false;
     bool has_cam_poses    = false;
 
-    std::map<std::string, std::string> extra; // anything else you want to record
+    std::map<std::string, std::string> extra;
 };
 
 // ------------------------------
@@ -62,15 +60,12 @@ struct RunMeta {
 // ------------------------------
 struct FrameMetrics {
     int frame = -1;
-
-    // 3D
-    double mpjpe      = -1.0;  // meters
-    double pa_mpjpe   = -1.0;  // meters
-    double pve        = -1.0;  // meters
-    double pose_error = -1.0;  // rad (whatever your ComputePoseError returns)
-    double shape_error = -1.0; // scalar
-    // 2D
-    double reproj_2d  = -1.0;  // pixels
+    double mpjpe      = -1.0;
+    double pa_mpjpe   = -1.0;
+    double pve        = -1.0;
+    double pose_error = -1.0;
+    double shape_error = -1.0;
+    double reproj_2d  = -1.0;
 };
 
 // ------------------------------
@@ -86,17 +81,10 @@ struct Stats {
 inline Stats ComputeStats(const std::vector<double>& v) {
     Stats s;
     if (v.empty()) return s;
-
     double sum = 0.0;
-    s.min = v[0];
-    s.max = v[0];
-    for (double x : v) {
-        sum += x;
-        s.min = std::min(s.min, x);
-        s.max = std::max(s.max, x);
-    }
+    s.min = v[0]; s.max = v[0];
+    for (double x : v) { sum += x; s.min = std::min(s.min, x); s.max = std::max(s.max, x); }
     s.mean = sum / (double)v.size();
-
     double var = 0.0;
     for (double x : v) var += (x - s.mean) * (x - s.mean);
     s.std = std::sqrt(var / (double)v.size());
@@ -104,8 +92,7 @@ inline Stats ComputeStats(const std::vector<double>& v) {
 }
 
 // ------------------------------
-// dump OptimizerConfig (only fields you actually use in main)
-// If your OptimizerConfig has MORE fields, you can extend here.
+// dump OptimizerConfig
 // ------------------------------
 inline void DumpOptimizerConfig(std::ostream& os,
                                 const OptimizerConfig& cfg,
@@ -126,9 +113,8 @@ inline void DumpOptimizerConfig(std::ostream& os,
         os << "HasCamPoses:    " << (meta->has_cam_poses ? "true" : "false") << "\n";
         if (!meta->extra.empty()) {
             os << "Extra:\n";
-            for (const auto& kv : meta->extra) {
+            for (const auto& kv : meta->extra)
                 os << "  - " << kv.first << ": " << kv.second << "\n";
-            }
         }
     }
 
@@ -197,7 +183,11 @@ inline void DumpOptimizerConfig(std::ostream& os,
     os << "  use_temporal_depth_affine=" << cfg.use_temporal_depth_affine << "\n";
     os << "  w_temp_depth_scale=" << cfg.w_temp_depth_scale << " w_temp_depth_bias=" << cfg.w_temp_depth_bias << "\n";
     os << "  fix_depth_affine_bias=" << cfg.fix_depth_affine_bias << "\n";
-    os << "  use_cam_depth_prior=" << cfg.use_cam_depth_prior << " w_cam_depth_prior=" << cfg.w_cam_depth_prior << "\n";
+
+    os << "\n[Camera-Space Z Prior]\n";
+    os << "  use_trans_z_prior=" << cfg.use_trans_z_prior << "\n";
+    os << "  trans_z_prior_target=" << cfg.trans_z_prior_target << "\n";
+    os << "  w_trans_z_prior=" << cfg.w_trans_z_prior << "\n";
 
     os << "\n[Temporal]\n";
     os << "  use_temporal=" << cfg.use_temporal << "\n";
@@ -221,7 +211,7 @@ inline void DumpOptimizerConfig(std::ostream& os,
 }
 
 // ------------------------------
-// Accumulator + writer for evaluation.txt
+// EvalLogger
 // ------------------------------
 class EvalLogger {
 public:
@@ -233,16 +223,12 @@ public:
         out_dir_ = out_dir;
         eval_path_ = out_dir_ + "/" + eval_filename;
         cfg_path_  = out_dir_ + "/" + config_filename;
-
         eval_.open(eval_path_, std::ios::out);
         cfg_.open(cfg_path_, std::ios::out);
-
-        if (!eval_.is_open()) return false;
-        if (!cfg_.is_open())  return false;
-        return true;
+        return eval_.is_open() && cfg_.is_open();
     }
 
-    const std::string& EvalPath()  const { return eval_path_; }
+    const std::string& EvalPath()   const { return eval_path_; }
     const std::string& ConfigPath() const { return cfg_path_; }
 
     void WriteConfig(const OptimizerConfig& cfg,
@@ -255,7 +241,6 @@ public:
 
     void WriteEvalHeader(const RunMeta& meta) {
         if (!eval_.is_open()) return;
-
         eval_ << "EVALUATION LOG\n";
         eval_ << "Time: " << NowString() << "\n";
         eval_ << "Mode: " << meta.mode << "\n";
@@ -271,7 +256,6 @@ public:
             eval_ << "Extra:\n";
             for (const auto& kv : meta.extra) eval_ << "  - " << kv.first << ": " << kv.second << "\n";
         }
-
         eval_ << "\n# Per-frame metrics\n";
         eval_ << "# frame  MPJPE(mm)  PA-MPJPE(mm)  PVE(mm)  PoseErr(rad)  ShapeErr  2DReproj(px)\n";
         eval_.flush();
@@ -279,7 +263,6 @@ public:
 
     void LogFrame(const FrameMetrics& m) {
         if (!eval_.is_open()) return;
-
         eval_ << m.frame << " "
               << (m.mpjpe >= 0 ? m.mpjpe * 1000.0 : -1.0) << " "
               << (m.pa_mpjpe >= 0 ? m.pa_mpjpe * 1000.0 : -1.0) << " "
@@ -291,7 +274,6 @@ public:
         eval_.flush();
     }
 
-    // collect + summarize
     void Push(const FrameMetrics& m) {
         frames_.push_back(m);
         if (m.mpjpe >= 0) mpjpe_.push_back(m.mpjpe);
@@ -302,14 +284,10 @@ public:
         if (m.shape_error >= 0) shape_.push_back(m.shape_error);
     }
 
-    void SetSuccessFail(int success, int fail) {
-        success_ = success;
-        fail_ = fail;
-    }
+    void SetSuccessFail(int success, int fail) { success_ = success; fail_ = fail; }
 
     void WriteSummary() {
         if (!eval_.is_open()) return;
-
         auto s_mpjpe = ComputeStats(mpjpe_);
         auto s_pa    = ComputeStats(pa_);
         auto s_pve   = ComputeStats(pve_);
@@ -326,13 +304,12 @@ public:
         auto print_stats = [&](const char* name, const Stats& s, bool mm=false) {
             if (s.mean < 0) return;
             eval_ << name << ":\n";
-            if (mm) {
+            if (mm)
                 eval_ << "  mean=" << s.mean*1000.0 << "  std=" << s.std*1000.0
                       << "  min=" << s.min*1000.0   << "  max=" << s.max*1000.0 << " (mm)\n";
-            } else {
+            else
                 eval_ << "  mean=" << s.mean << "  std=" << s.std
                       << "  min=" << s.min  << "  max=" << s.max << "\n";
-            }
         };
 
         print_stats("MPJPE", s_mpjpe, true);
@@ -347,15 +324,9 @@ public:
     }
 
 private:
-    std::string out_dir_;
-    std::string eval_path_;
-    std::string cfg_path_;
-    std::ofstream eval_;
-    std::ofstream cfg_;
-
-    int success_ = 0;
-    int fail_ = 0;
-
+    std::string out_dir_, eval_path_, cfg_path_;
+    std::ofstream eval_, cfg_;
+    int success_ = 0, fail_ = 0;
     std::vector<FrameMetrics> frames_;
     std::vector<double> mpjpe_, pa_, pve_, pose_, reproj_, shape_;
 };

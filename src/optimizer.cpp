@@ -4,6 +4,7 @@
 
 #include <thread>
 #include <fstream>
+#include <sstream>
 #include <ceres/ceres.h>
 #include <ceres/manifold.h>
 #include <cnpy.h>
@@ -111,7 +112,7 @@ static void SetupSolverOptions(ceres::Solver::Options& options,
 }
 
 // -----------------------------------------
-// Data term adders 
+// Data term adders
 // -----------------------------------------
 static void AddAllKeypointReprojBlock(
     ceres::Problem& problem,
@@ -122,13 +123,15 @@ static void AddAllKeypointReprojBlock(
     double* theta,
     double* trans,
     const OptimizerConfig& cfg,
-    ceres::LossFunction* loss
+    ceres::LossFunction* loss,
+    const CameraExtrinsics* extrinsics = nullptr  // optional: world-to-camera transform
 ) {
     auto* functor = new AllKeypointsReprojectionResidual(
         observed, camera, model,
         cfg.min_confidence,
         cfg.use_stable_joints_only,
-        cfg.flip_y_in_projection
+        cfg.flip_y_in_projection,
+        extrinsics
     );
 
     const int K = functor->NumUsedKeypoints();
@@ -187,14 +190,17 @@ static void AddDepthAffineBlock(
     const SmplModel& model,
     double* beta,
     double* theta,
-    double* trans
+    double* trans,
+    const CameraExtrinsics* extrinsics = nullptr
 ) {
     if (!cfg.use_depth_affine ||
         cfg.depth_affine_data == nullptr || cfg.depth_affine_data->empty() ||
         cfg.depth_affine_params == nullptr) return;
 
+    // Pass extrinsics to DepthAffineResidual for world coordinate support
     auto* functor = new DepthAffineResidual(*cfg.depth_affine_data, model,
-                                            cfg.w_depth_affine, cfg.depth_affine_sign);
+                                            cfg.w_depth_affine, cfg.depth_affine_sign,
+                                            extrinsics);
 
     auto* cost = new ceres::AutoDiffCostFunction<
         DepthAffineResidual, ceres::DYNAMIC, 10, 72, 3, 2>(
@@ -205,9 +211,19 @@ static void AddDepthAffineBlock(
 
     problem.AddResidualBlock(cost, loss, beta, theta, trans, cfg.depth_affine_params);
 
-    // keep scale positive
-    problem.SetParameterLowerBound(cfg.depth_affine_params, 0, 1e-6);
-    problem.SetParameterUpperBound(cfg.depth_affine_params, 0, 1e6);
+    // keep scale positive and reasonable (prevent collapse to 0)
+    problem.SetParameterLowerBound(cfg.depth_affine_params, 0, 0.5);  // scale >= 0.5
+    problem.SetParameterUpperBound(cfg.depth_affine_params, 0, 20.0); // scale <= 20
+
+    // keep bias positive and reasonable
+    problem.SetParameterLowerBound(cfg.depth_affine_params, 1, 0.5);  // bias >= 0.5
+    problem.SetParameterUpperBound(cfg.depth_affine_params, 1, 20.0); // bias <= 20
+
+    // Fix bias=0 to prevent depth drift (Plan B: rigid depth constraint)
+    // Only optimize scale, bias stays at 0
+    if (cfg.fix_depth_affine_bias) {
+        problem.SetManifold(cfg.depth_affine_params, new ceres::SubsetManifold(2, {1}));
+    }
 }
 
 static void AddTemporalDepthAffinePrior(
@@ -480,6 +496,12 @@ static void AddPosePriorsUnified(ceres::Problem& problem,
         AddSoftAngleLimitGroup(problem, theta, {cfg.spine_j1, cfg.spine_j2, cfg.spine_j3}, cfg.spine_amax, cfg.w_spine);
     }
 
+    // neck / head
+    if (cfg.use_neck_head_limits) {
+        AddSoftAngleLimitGroup(problem, theta, {cfg.neck_j}, cfg.neck_amax, cfg.w_neck_limit);
+        AddSoftAngleLimitGroup(problem, theta, {cfg.head_j}, cfg.head_amax, cfg.w_head_limit);
+    }
+
     // arm-torso separation
     AddArmTorsoSeparation(problem, cfg, model, beta, theta, trans);
 
@@ -543,7 +565,8 @@ static void AddTemporalPriors(ceres::Problem& problem,
                               double* theta, double* trans,
                               const double* theta_prev,
                               const double* trans_prev,
-                              const double* theta_prev2) 
+                              const double* theta_prev2,
+                              const double* trans_prev2 = nullptr)
 {
     if (!cfg.use_temporal) return;
     if (theta_prev) {
@@ -554,20 +577,32 @@ static void AddTemporalPriors(ceres::Problem& problem,
                 dim),
             nullptr, theta
         );
-        const double w_root = cfg.w_temp_pose; 
+        const double w_root = cfg.w_temp_pose;
         problem.AddResidualBlock(
             new ceres::AutoDiffCostFunction<TemporalRootResidual, 3, 72>(
                 new TemporalRootResidual(theta_prev, w_root)),
             nullptr, theta
         );
     }
-    if (trans_prev) {
+
+    // Trans temporal prior: use constant-velocity when trans_prev2 is available
+    if (trans_prev && trans_prev2) {
+        // Constant-velocity prior: penalize deviation from linear extrapolation
+        // pred = 2*trans_prev - trans_prev2  (i.e., trans_prev + velocity)
+        problem.AddResidualBlock(
+            new ceres::AutoDiffCostFunction<TransConstVelPriorResidual, 3, 3>(
+                new TransConstVelPriorResidual(trans_prev, trans_prev2, cfg.w_temp_trans)),
+            nullptr, trans
+        );
+    } else if (trans_prev) {
+        // Fallback to simple first-order prior when only trans_prev available
         problem.AddResidualBlock(
             new ceres::AutoDiffCostFunction<TemporalTransResidual, 3, 3>(
                 new TemporalTransResidual(trans_prev, cfg.w_temp_trans)),
             nullptr, trans
         );
     }
+
     if (cfg.use_temporal_acc && theta_prev && theta_prev2) {
         const int dim = cfg.temporal_body_only ? 69 : 72;
         problem.AddResidualBlock(
@@ -575,6 +610,43 @@ static void AddTemporalPriors(ceres::Problem& problem,
                 new TemporalAccelPoseResidual(theta_prev, theta_prev2, cfg.w_temp_acc_pose, cfg.temporal_body_only),
                 dim),
             nullptr, theta
+        );
+    }
+}
+
+// -----------------------------------------
+// Camera-space depth prior (world-coord mode)
+// Constrains Z_cam to prevent drift along optical axis
+// -----------------------------------------
+static void AddCameraDepthPrior(ceres::Problem& problem,
+                                const OptimizerConfig& cfg,
+                                double* trans,
+                                const CameraExtrinsics* extrinsics)
+{
+    // Only applies in world-coordinate mode with camera extrinsics
+    if (!cfg.use_cam_depth_prior || !extrinsics) return;
+
+    if (cfg.has_Z_cam_prev2) {
+        // Constant-velocity prior: Z_cam should follow linear extrapolation
+        problem.AddResidualBlock(
+            new ceres::AutoDiffCostFunction<CameraDepthConstVelResidual, 1, 3>(
+                new CameraDepthConstVelResidual(
+                    extrinsics->R, extrinsics->t,
+                    cfg.Z_cam_prev, cfg.Z_cam_prev2,
+                    cfg.w_cam_depth_prior)),
+            new ceres::HuberLoss(0.5),
+            trans
+        );
+    } else {
+        // First-order prior: Z_cam stays close to previous
+        problem.AddResidualBlock(
+            new ceres::AutoDiffCostFunction<CameraDepthPriorResidual, 1, 3>(
+                new CameraDepthPriorResidual(
+                    extrinsics->R, extrinsics->t,
+                    cfg.Z_cam_prev,
+                    cfg.w_cam_depth_prior)),
+            new ceres::HuberLoss(0.5),
+            trans
         );
     }
 }
@@ -589,9 +661,14 @@ bool OptimizeSMPL(
     double* beta,
     double* theta,
     double* trans,
-    const OptimizerConfig& cfg
+    const OptimizerConfig& cfg,
+    const CameraExtrinsics* extrinsics
 ) {
-    std::cout << "[Optimizer] Starting 2D Optimization...\n";
+    if (extrinsics) {
+        std::cout << "[Optimizer] Starting 2D Optimization (with camera extrinsics, world-space)...\n";
+    } else {
+        std::cout << "[Optimizer] Starting 2D Optimization...\n";
+    }
 
     // ----------------------------
     // Stage 1: trans + root only
@@ -602,19 +679,22 @@ bool OptimizeSMPL(
 
         AddAllKeypointReprojBlock(problem, observed_keypoints, camera, model,
                                   beta, theta, trans, cfg,
-                                  new ceres::HuberLoss(20.0));
+                                  new ceres::HuberLoss(20.0), extrinsics);
 
         problem.SetParameterBlockConstant(beta);
-            
+
         // Lock all joints except the root (theta[0:3]).
         std::vector<int> const_idx;
         const_idx.reserve(69);
         for (int i = 3; i < 72; ++i) const_idx.push_back(i);
         problem.SetManifold(theta, new ceres::SubsetManifold(72, const_idx));
 
-        // simple Z bounds
-        problem.SetParameterLowerBound(trans, 2, 0.5);
-        problem.SetParameterUpperBound(trans, 2, 20.0);
+        // Only set Z bounds when not using extrinsics (camera-space optimization)
+        // In world-space, trans can be any value
+        if (!extrinsics) {
+            problem.SetParameterLowerBound(trans, 2, 0.5);
+            problem.SetParameterUpperBound(trans, 2, 20.0);
+        }
 
         ceres::Solver::Options options;
         SetupSolverOptions(options, cfg, cfg.max_iter_stage1);
@@ -634,18 +714,21 @@ bool OptimizeSMPL(
 
         AddAllKeypointReprojBlock(problem, observed_keypoints, camera, model,
                                   beta, theta, trans, cfg,
-                                  new ceres::HuberLoss(5.0));
+                                  new ceres::HuberLoss(5.0), extrinsics);
 
-        
+
         problem.SetParameterBlockConstant(beta);
         ApplyExtremityLocksIfEnabled(problem, cfg, theta);
         AddDepthBlock(problem, cfg, model, beta, theta, trans);
         AddRelativeDepthBlock(problem, cfg, model, beta, theta, trans);
-        AddDepthAffineBlock(problem, cfg, model, beta, theta, trans);
+        AddDepthAffineBlock(problem, cfg, model, beta, theta, trans, extrinsics);
         AddPosePriorsUnified(problem, cfg, model, beta, theta, trans, PriorStage::Stage2);
-            
-        problem.SetParameterLowerBound(trans, 2, 0.5);
-        problem.SetParameterUpperBound(trans, 2, 20.0);
+
+        // Only set Z bounds when not using extrinsics (camera-space optimization)
+        if (!extrinsics) {
+            problem.SetParameterLowerBound(trans, 2, 0.5);
+            problem.SetParameterUpperBound(trans, 2, 20.0);
+        }
 
         ceres::Solver::Options options;
         SetupSolverOptions(options, cfg, cfg.max_iter_stage2);
@@ -665,13 +748,13 @@ bool OptimizeSMPL(
 
         AddAllKeypointReprojBlock(problem, observed_keypoints, camera, model,
                                   beta, theta, trans, cfg,
-                                  new ceres::HuberLoss(5.0));
+                                  new ceres::HuberLoss(5.0), extrinsics);
 
         AddDepthBlock(problem, cfg, model, beta, theta, trans);
         AddRelativeDepthBlock(problem, cfg, model, beta, theta, trans);
-        AddDepthAffineBlock(problem, cfg, model, beta, theta, trans);
+        AddDepthAffineBlock(problem, cfg, model, beta, theta, trans, extrinsics);
 
-        // shape regularization 
+        // shape regularization
         const double shape_reg_weight = 25.0;
         for (int i = 0; i < 10; ++i) {
             problem.AddResidualBlock(
@@ -680,12 +763,15 @@ bool OptimizeSMPL(
                 nullptr, beta
             );
         }
-        
+
         AddPosePriorsUnified(problem, cfg, model, beta, theta, trans, PriorStage::Stage3);
 
-        problem.SetParameterLowerBound(trans, 2, 0.5);
-        problem.SetParameterUpperBound(trans, 2, 20.0);
-        
+        // Only set Z bounds when not using extrinsics (camera-space optimization)
+        if (!extrinsics) {
+            problem.SetParameterLowerBound(trans, 2, 0.5);
+            problem.SetParameterUpperBound(trans, 2, 20.0);
+        }
+
         ceres::Solver::Options options;
         SetupSolverOptions(options, cfg, cfg.max_iter_stage3);
         ceres::Solver::Summary summary;
@@ -708,9 +794,15 @@ bool OptimizeSMPLTracked(
     const OptimizerConfig& cfg,
     const double* theta_prev,
     const double* trans_prev,
-    const double* theta_prev2
+    const double* theta_prev2,
+    const double* trans_prev2,
+    const CameraExtrinsics* extrinsics
 ) {
-    std::cout << "[Optimizer] Starting 2D Optimization...\n";
+    if (extrinsics) {
+        std::cout << "[Optimizer] Starting 2D Optimization (with camera extrinsics)...\n";
+    } else {
+        std::cout << "[Optimizer] Starting 2D Optimization...\n";
+    }
 
     // ----------------------------
     // Stage 1: trans + root only
@@ -721,25 +813,27 @@ bool OptimizeSMPLTracked(
 
         AddAllKeypointReprojBlock(problem, observed_keypoints, camera, model,
                                   beta, theta, trans, cfg,
-                                  new ceres::HuberLoss(20.0));
+                                  new ceres::HuberLoss(20.0), extrinsics);
 
         problem.SetParameterBlockConstant(beta);
-            
+
         std::vector<int> const_idx;
         const_idx.reserve(69);
         for (int i = 3; i < 72; ++i) const_idx.push_back(i);
 
         problem.SetManifold(theta, new ceres::SubsetManifold(72, const_idx));
 
-        AddTemporalPriors(problem, cfg, theta, trans, theta_prev, trans_prev, theta_prev2);
+        AddTemporalPriors(problem, cfg, theta, trans, theta_prev, trans_prev, theta_prev2, trans_prev2);
+        AddCameraDepthPrior(problem, cfg, trans, extrinsics);
 
-        if (cfg.use_depth || cfg.use_relative_depth || cfg.use_depth_affine) {
+        // TransZ prior: only for camera-space optimization
+        if (!extrinsics && trans_prev && (cfg.use_depth || cfg.use_relative_depth || cfg.use_depth_affine)) {
             problem.AddResidualBlock(
                 new ceres::AutoDiffCostFunction<TransZPriorResidual, 1, 3>(
                     new TransZPriorResidual(trans_prev[2], /*w=*/200.0)),
                 nullptr, trans
             );
-         }
+        }
         ceres::Solver::Options options;
         SetupSolverOptions(options, cfg, cfg.max_iter_stage1);
         ceres::Solver::Summary summary;
@@ -756,18 +850,21 @@ bool OptimizeSMPLTracked(
 
         AddAllKeypointReprojBlock(problem, observed_keypoints, camera, model,
                                   beta, theta, trans, cfg,
-                                  new ceres::HuberLoss(5.0));
+                                  new ceres::HuberLoss(5.0), extrinsics);
 
         problem.SetParameterBlockConstant(beta);
         ApplyExtremityLocksIfEnabled(problem, cfg, theta);
         AddDepthBlock(problem, cfg, model, beta, theta, trans);
         AddRelativeDepthBlock(problem, cfg, model, beta, theta, trans);
-        AddDepthAffineBlock(problem, cfg, model, beta, theta, trans);
+        AddDepthAffineBlock(problem, cfg, model, beta, theta, trans, extrinsics);
         AddTemporalDepthAffinePrior(problem, cfg);
         AddPosePriorsUnified(problem, cfg, model, beta, theta, trans, PriorStage::Stage2);
-        AddTemporalPriors(problem, cfg, theta, trans, theta_prev, trans_prev, theta_prev2);
+        AddTemporalPriors(problem, cfg, theta, trans, theta_prev, trans_prev, theta_prev2, trans_prev2);
+        AddCameraDepthPrior(problem, cfg, trans, extrinsics);
 
-        if (cfg.use_depth || cfg.use_relative_depth || cfg.use_depth_affine) {
+        // TransZ prior: only for camera-space optimization
+        // In world-space, trans[2] is world Z, not depth - CameraDepthPrior handles it
+        if (!extrinsics && trans_prev && (cfg.use_depth || cfg.use_relative_depth || cfg.use_depth_affine)) {
             problem.AddResidualBlock(
                 new ceres::AutoDiffCostFunction<TransZPriorResidual, 1, 3>(
                     new TransZPriorResidual(trans_prev[2], /*w=*/600.0)),
@@ -775,8 +872,12 @@ bool OptimizeSMPLTracked(
             );
         }
 
-        problem.SetParameterLowerBound(trans, 2, 0.5);
-        problem.SetParameterUpperBound(trans, 2, 20.0);
+        // Only set Z bounds when not using extrinsics (camera-space optimization)
+        // In world-space, Z can be any value
+        if (!extrinsics) {
+            problem.SetParameterLowerBound(trans, 2, 0.5);
+            problem.SetParameterUpperBound(trans, 2, 20.0);
+        }
 
         ceres::Solver::Options options;
         SetupSolverOptions(options, cfg, cfg.max_iter_stage2);
@@ -800,15 +901,16 @@ bool OptimizeSMPLTracked(
 
         AddAllKeypointReprojBlock(problem, observed_keypoints, camera, model,
                                   beta, theta, trans, cfg,
-                                  new ceres::HuberLoss(5.0));
+                                  new ceres::HuberLoss(5.0), extrinsics);
         ApplyExtremityLocksIfEnabled(problem, cfg, theta);
 
         AddDepthBlock(problem, cfg, model, beta, theta, trans);
         AddRelativeDepthBlock(problem, cfg, model, beta, theta, trans);
-        AddDepthAffineBlock(problem, cfg, model, beta, theta, trans);
+        AddDepthAffineBlock(problem, cfg, model, beta, theta, trans, extrinsics);
         AddTemporalDepthAffinePrior(problem, cfg);
 
-        if (cfg.use_depth || cfg.use_relative_depth || cfg.use_depth_affine) {
+        // TransZ prior: only for camera-space optimization
+        if (!extrinsics && trans_prev && (cfg.use_depth || cfg.use_relative_depth || cfg.use_depth_affine)) {
             problem.AddResidualBlock(
                 new ceres::AutoDiffCostFunction<TransZPriorResidual, 1, 3>(
                     new TransZPriorResidual(trans_prev[2], /*w=*/600.0)),
@@ -816,7 +918,7 @@ bool OptimizeSMPLTracked(
             );
         }
 
-        // shape regularization 
+        // shape regularization
         const double shape_reg_weight = 25.0;
         for (int i = 0; i < 10; ++i) {
             problem.AddResidualBlock(
@@ -827,16 +929,21 @@ bool OptimizeSMPLTracked(
         }
 
         AddPosePriorsUnified(problem, cfg, model, beta, theta, trans, PriorStage::Stage3);
-        AddTemporalPriors(problem, cfg, theta, trans, theta_prev, trans_prev, theta_prev2);
-        problem.SetParameterLowerBound(trans, 2, 0.5);
-        problem.SetParameterUpperBound(trans, 2, 20.0);
+        AddTemporalPriors(problem, cfg, theta, trans, theta_prev, trans_prev, theta_prev2, trans_prev2);
+        AddCameraDepthPrior(problem, cfg, trans, extrinsics);
+
+        // Only set Z bounds when not using extrinsics (camera-space optimization)
+        if (!extrinsics) {
+            problem.SetParameterLowerBound(trans, 2, 0.5);
+            problem.SetParameterUpperBound(trans, 2, 20.0);
+        }
         problem.SetParameterBlockConstant(beta);
 
         ceres::Solver::Options options;
         SetupSolverOptions(options, cfg, cfg.max_iter_stage3);
         ceres::Solver::Summary summary;
         ceres::Solve(options, &problem, &summary);
-        
+
         if (cfg.verbose) std::cout << "[Final] " << summary.BriefReport() << "\n";
         if (!summary.IsSolutionUsable()) return false;
     }
@@ -914,4 +1021,38 @@ CameraIntrinsics CreateDefaultCamera(int image_width, int image_height) {
     float cx = image_width * 0.5f;
     float cy = image_height * 0.5f;
     return CameraIntrinsics(focal, focal, cx, cy, image_width, image_height);
+}
+
+std::vector<CameraExtrinsics> LoadCameraPoses(const std::string& path) {
+    std::vector<CameraExtrinsics> result;
+    std::ifstream file(path);
+    if (!file.is_open()) {
+        std::cerr << "[LoadCameraPoses] Failed to open: " << path << std::endl;
+        return result;
+    }
+
+    std::string line;
+    while (std::getline(file, line)) {
+        if (line.empty() || line[0] == '#') continue;
+
+        std::istringstream iss(line);
+        double vals[12];
+        for (int i = 0; i < 12; ++i) {
+            if (!(iss >> vals[i])) {
+                std::cerr << "[LoadCameraPoses] Parse error in line: " << line << std::endl;
+                return result;
+            }
+        }
+
+        // Format: R[0,0] R[0,1] R[0,2] t[0] R[1,0] R[1,1] R[1,2] t[1] R[2,0] R[2,1] R[2,2] t[2]
+        CameraExtrinsics extr;
+        extr.R << vals[0], vals[1], vals[2],
+                  vals[4], vals[5], vals[6],
+                  vals[8], vals[9], vals[10];
+        extr.t << vals[3], vals[7], vals[11];
+        result.push_back(extr);
+    }
+
+    std::cout << "[LoadCameraPoses] Loaded " << result.size() << " camera poses from " << path << std::endl;
+    return result;
 }

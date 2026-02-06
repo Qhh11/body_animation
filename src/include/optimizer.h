@@ -38,6 +38,20 @@ struct CameraIntrinsics {
         : fx(fx_), fy(fy_), cx(cx_), cy(cy_), width(w_), height(h_) {}
 };
 
+// Camera extrinsics: world-to-camera transform
+// P_cam = R * P_world + t
+struct CameraExtrinsics {
+    Eigen::Matrix3d R;  // 3x3 rotation matrix
+    Eigen::Vector3d t;  // 3x1 translation vector
+
+    CameraExtrinsics() : R(Eigen::Matrix3d::Identity()), t(Eigen::Vector3d::Zero()) {}
+    CameraExtrinsics(const Eigen::Matrix3d& R_, const Eigen::Vector3d& t_) : R(R_), t(t_) {}
+
+    bool IsIdentity() const {
+        return R.isIdentity(1e-6) && t.isZero(1e-6);
+    }
+};
+
 // Depth constraint data (Z coordinate in the same convention as SMPLJointsForward output)
 struct JointDepthData {
     int smpl_joint_idx;
@@ -106,6 +120,9 @@ struct OptimizerConfig {
     double w_temp_depth_bias  = 200.0;
     const double* depth_affine_prev = nullptr;
 
+    // Fix bias=0 for rigid depth constraint (Plan B: suppress drift)
+    bool fix_depth_affine_bias = false;
+
     // ---------- Root upright regularizer ----------
     bool use_root_upright = true;
     double root_upright_w_stage2 = 1.0;
@@ -135,10 +152,19 @@ struct OptimizerConfig {
     bool use_spine_limits = true;
     double w_spine = 10.0;
     double spine_amax = 1.2;   // radians
-    // spine joints ids in your SMPL joint indexing 
+    // spine joints ids in your SMPL joint indexing
     int spine_j1 = 3;
     int spine_j2 = 6;
     int spine_j3 = 9;
+
+    // ---------- Neck / Head soft limits ----------
+    bool use_neck_head_limits = true;
+    double w_neck_limit = 40.0;
+    double neck_amax = 0.6;    // radians (~35 degrees)
+    double w_head_limit = 40.0;
+    double head_amax = 0.5;    // radians (~30 degrees)
+    int neck_j = 12;
+    int head_j = 15;
 
     bool use_shoulder_collar_limits = true;
     double w_shoulder_limit = 60.0;
@@ -179,12 +205,20 @@ struct OptimizerConfig {
     double w_3d = 1.0;
 
     // ---------- temporal smoothness (tracking) ----------
-    bool use_temporal = false;     
-    double w_temp_pose = 10.0;    
-    double w_temp_trans = 2.0;    
-    bool use_temporal_acc = false; 
-    double w_temp_acc_pose = 2.0; 
+    bool use_temporal = false;
+    double w_temp_pose = 10.0;
+    double w_temp_trans = 2.0;
+    bool use_temporal_acc = false;
+    double w_temp_acc_pose = 2.0;
     bool temporal_body_only = true;
+
+    // ---------- Camera-space depth prior (world-coord mode) ----------
+    // Constrains Z_cam to stay close to previous frame, preventing optical axis drift
+    bool use_cam_depth_prior = false;
+    double w_cam_depth_prior = 50.0;  // weight for Z_cam prior
+    double Z_cam_prev  = 3.0;         // previous frame Z_cam
+    double Z_cam_prev2 = 3.0;         // two frames ago Z_cam (for const-vel)
+    bool has_Z_cam_prev2 = false;     // whether Z_cam_prev2 is valid
 
     // ---------- extremity locks  ----------
     bool lock_wrists = true;   // lock joint 20/21 axis-angle
@@ -624,6 +658,88 @@ struct TemporalTransResidual {
     double w;
 };
 
+// ------------------------------
+// Constant-velocity trans prior (better than simple temporal prior)
+// Predicts t_curr from t_prev + (t_prev - t_prevprev), i.e., constant velocity extrapolation
+// This suppresses random-walk drift while allowing smooth motion
+// ------------------------------
+struct TransConstVelPriorResidual {
+    TransConstVelPriorResidual(const double* trans_prev_, const double* trans_prevprev_, double w_)
+        : t_prev(trans_prev_), t_prevprev(trans_prevprev_), w(w_) {}
+
+    template <typename T>
+    bool operator()(const T* const trans, T* residuals) const {
+        // pred = t_prev + (t_prev - t_prevprev) = 2*t_prev - t_prevprev
+        const T pred0 = T(2.0) * T(t_prev[0]) - T(t_prevprev[0]);
+        const T pred1 = T(2.0) * T(t_prev[1]) - T(t_prevprev[1]);
+        const T pred2 = T(2.0) * T(t_prev[2]) - T(t_prevprev[2]);
+
+        residuals[0] = T(w) * (trans[0] - pred0);
+        residuals[1] = T(w) * (trans[1] - pred1);
+        residuals[2] = T(w) * (trans[2] - pred2);
+        return true;
+    }
+    const double* t_prev;
+    const double* t_prevprev;
+    double w;
+};
+
+// Camera-space depth prior for world-coordinate optimization
+// Constrains Z_cam = R[2,:] * trans_world + t[2] to stay close to previous frame
+// This prevents drift along the camera's optical axis
+struct CameraDepthPriorResidual {
+    CameraDepthPriorResidual(const Eigen::Matrix3d& R_cw,
+                             const Eigen::Vector3d& t_cw,
+                             double Z_cam_prev,
+                             double w)
+        : R_cw_(R_cw), t_cw_(t_cw), Z_prev_(Z_cam_prev), w_(w) {}
+
+    template <typename T>
+    bool operator()(const T* const trans_world, T* residuals) const {
+        // Z_cam = R[2,:] * trans_world + t[2]
+        const T Z_cam = T(R_cw_(2,0)) * trans_world[0]
+                      + T(R_cw_(2,1)) * trans_world[1]
+                      + T(R_cw_(2,2)) * trans_world[2]
+                      + T(t_cw_(2));
+        residuals[0] = T(w_) * (Z_cam - T(Z_prev_));
+        return true;
+    }
+
+    Eigen::Matrix3d R_cw_;
+    Eigen::Vector3d t_cw_;
+    double Z_prev_;
+    double w_;
+};
+
+// Constant-velocity version: Z_cam should follow linear extrapolation from prev two frames
+struct CameraDepthConstVelResidual {
+    CameraDepthConstVelResidual(const Eigen::Matrix3d& R_cw,
+                                const Eigen::Vector3d& t_cw,
+                                double Z_cam_prev,
+                                double Z_cam_prev2,
+                                double w)
+        : R_cw_(R_cw), t_cw_(t_cw), Z_prev_(Z_cam_prev), Z_prev2_(Z_cam_prev2), w_(w) {}
+
+    template <typename T>
+    bool operator()(const T* const trans_world, T* residuals) const {
+        // Z_cam = R[2,:] * trans_world + t[2]
+        const T Z_cam = T(R_cw_(2,0)) * trans_world[0]
+                      + T(R_cw_(2,1)) * trans_world[1]
+                      + T(R_cw_(2,2)) * trans_world[2]
+                      + T(t_cw_(2));
+        // Constant velocity: Z_pred = 2*Z_prev - Z_prev2
+        const T Z_pred = T(2.0) * T(Z_prev_) - T(Z_prev2_);
+        residuals[0] = T(w_) * (Z_cam - Z_pred);
+        return true;
+    }
+
+    Eigen::Matrix3d R_cw_;
+    Eigen::Vector3d t_cw_;
+    double Z_prev_;
+    double Z_prev2_;
+    double w_;
+};
+
 struct TemporalAccelPoseResidual {
     TemporalAccelPoseResidual(const double* theta_prev_, const double* theta_prev2_,
                               double w_, bool body_only_)
@@ -666,7 +782,9 @@ struct TemporalRootResidual {
 
 
 // ------------------------------
-// 2D reprojection residual
+// 2D reprojection residual (supports optional camera extrinsics)
+// When extrinsics is nullptr: assumes camera at origin (fixed camera, original behavior)
+// When extrinsics is provided: transforms SMPL world coords to camera coords before projection
 // ------------------------------
 struct AllKeypointsReprojectionResidual {
     AllKeypointsReprojectionResidual(
@@ -675,10 +793,15 @@ struct AllKeypointsReprojectionResidual {
         const SmplModel& model,
         float min_confidence,
         bool use_stable_only,
-        bool flip_y
+        bool flip_y,
+        const CameraExtrinsics* extrinsics = nullptr  // optional: world-to-camera transform
     )
-    : camera_(cam), model_(model), flip_y_(flip_y)
+    : camera_(cam), model_(model), flip_y_(flip_y), has_extrinsics_(extrinsics != nullptr)
     {
+        if (extrinsics) {
+            extrinsics_ = *extrinsics;
+        }
+
         std::array<bool,25> allowed{};
         allowed.fill(true);
         if (use_stable_only) {
@@ -717,13 +840,37 @@ struct AllKeypointsReprojectionResidual {
         for (int i = 0; i < (int)lms_.size(); ++i) {
             const int jid = smpl_ids_[i];
 
-            const T X = Jw(jid, 0);
-            const T Y = Jw(jid, 1);
-            T       Z = Jw(jid, 2);
+            T X, Y, Z;
+
+            if (has_extrinsics_) {
+                // Transform to camera coordinates: p_cam = R * p_world + t
+                T p_world[3] = {Jw(jid, 0), Jw(jid, 1), Jw(jid, 2)};
+                T p_cam[3];
+                for (int k = 0; k < 3; ++k) {
+                    p_cam[k] = T(extrinsics_.t(k));
+                    for (int l = 0; l < 3; ++l) {
+                        p_cam[k] += T(extrinsics_.R(k, l)) * p_world[l];
+                    }
+                }
+                X = p_cam[0];
+                Y = p_cam[1];
+                Z = p_cam[2];
+            } else {
+                // No extrinsics: camera at origin, SMPL already in camera space
+                X = Jw(jid, 0);
+                Y = Jw(jid, 1);
+                Z = Jw(jid, 2);
+            }
+
             if (Z < T(1e-6)) Z = T(1e-6);
 
+            // Pinhole projection
+            // When has_extrinsics_: Y flip is already handled in extrinsics preprocessing
+            // When no extrinsics: use flip_y_ flag for backward compatibility
             const T u = T(camera_.fx) * (X / Z) + T(camera_.cx);
-            const T v = T(camera_.fy) * ((flip_y_ ? -Y : Y) / Z) + T(camera_.cy);
+            const T v = has_extrinsics_
+                ? T(camera_.fy) * (Y / Z) + T(camera_.cy)
+                : T(camera_.fy) * ((flip_y_ ? -Y : Y) / Z) + T(camera_.cy);
 
             const float c = std::max(1e-6f, lms_[i].confidence);
             const T wconf = ceres::sqrt(T(c));
@@ -737,8 +884,10 @@ private:
     std::vector<Landmark2D> lms_;
     std::vector<int> smpl_ids_;
     CameraIntrinsics camera_;
+    CameraExtrinsics extrinsics_;
     const SmplModel& model_;
     bool flip_y_;
+    bool has_extrinsics_;
 };
 
 // ------------------------------
@@ -857,15 +1006,23 @@ struct RelativeDepthResidual {
 };
 
 // ------------------------------
-// Depth affine residual =
-// z_pred(j) ~= bias + sign * scale * rel_depth(j)
+// Affine depth model: Z_tgt = bias + sign * scale * d
+// - d: Sapiens relative depth (larger = farther, range ~0.02 to 1.6+)
+// - scale: slope, optimized parameter
+// - bias: intercept (~Z_min), optimized parameter
+// - sign: +1 (Sapiens: larger d = farther = larger Z)
 // ------------------------------
 struct DepthAffineResidual {
     DepthAffineResidual(const std::vector<JointRelDepthData>& obs_,
                         const SmplModel& model_,
                         double w_,
-                        double sign_)
-        : obs(obs_), model(model_), w(w_), sign(sign_) {}
+                        double sign_,
+                        const CameraExtrinsics* extrinsics_ = nullptr)
+        : obs(obs_), model(model_), w(w_), sign(sign_),
+          has_extrinsics(extrinsics_ != nullptr)
+    {
+        if (extrinsics_) extrinsics = *extrinsics_;
+    }
 
     int NumPoints() const { return static_cast<int>(obs.size()); }
 
@@ -884,10 +1041,24 @@ struct DepthAffineResidual {
 
         for (int i = 0; i < NumPoints(); ++i) {
             const int j = obs[i].smpl_joint_idx;
-            const T z_pred = J_pred(j, 2);
 
-            // bias + sign * scale * rel_depth
-            const T z_tgt = bias + T(sign) * scale * T(obs[i].rel_depth);
+            T z_pred;
+            if (has_extrinsics) {
+                // World coordinates: transform to camera space to get depth
+                // p_cam = R * p_world + t, depth = p_cam[2]
+                T p_world[3] = {J_pred(j, 0), J_pred(j, 1), J_pred(j, 2)};
+                z_pred = T(extrinsics.t(2));
+                for (int k = 0; k < 3; ++k) {
+                    z_pred += T(extrinsics.R(2, k)) * p_world[k];
+                }
+            } else {
+                // Camera coordinates: Z is already depth
+                z_pred = J_pred(j, 2);
+            }
+
+            // Affine depth model: Z = bias + sign * scale * d
+            const double d = obs[i].rel_depth;
+            const T z_tgt = bias + T(sign) * scale * T(d);
 
             const T wi = ceres::sqrt(T(std::max(1e-6, obs[i].weight)));
             residuals[i] = T(w) * wi * (z_pred - z_tgt);
@@ -897,8 +1068,10 @@ struct DepthAffineResidual {
 
     std::vector<JointRelDepthData> obs;
     const SmplModel& model;
+    CameraExtrinsics extrinsics;
     double w;
     double sign;
+    bool has_extrinsics;
 };
 
 // ------------------------------
@@ -935,7 +1108,8 @@ bool OptimizeSMPL(const std::vector<Landmark2D>& observed_keypoints,
                   double* beta,
                   double* theta,
                   double* trans,
-                  const OptimizerConfig& config);
+                  const OptimizerConfig& config,
+                  const CameraExtrinsics* extrinsics = nullptr);  // optional extrinsics for world-space optimization
                   
 bool OptimizeSMPLTracked(const std::vector<Landmark2D>& observed_keypoints,
                          const CameraIntrinsics& camera,
@@ -946,6 +1120,11 @@ bool OptimizeSMPLTracked(const std::vector<Landmark2D>& observed_keypoints,
                          const OptimizerConfig& cfg,
                          const double* theta_prev,
                          const double* trans_prev,
-                         const double* theta_prev2 = nullptr);
+                         const double* theta_prev2 = nullptr,
+                         const double* trans_prev2 = nullptr,
+                         const CameraExtrinsics* extrinsics = nullptr);  // optional extrinsics
+
+// Load camera poses from file (one 3x4 matrix per line, 12 values flattened row-major)
+std::vector<CameraExtrinsics> LoadCameraPoses(const std::string& path);
 
 CameraIntrinsics CreateDefaultCamera(int image_width, int image_height);

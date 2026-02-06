@@ -1,6 +1,7 @@
 #include <algorithm>
 #include <fstream>
 #include <iostream>
+#include <iomanip>
 #include <vector>
 #include <array>
 #include <cmath>
@@ -30,19 +31,22 @@ void SaveOBJ(const std::string& filename,
 static GMMPosePrior g_gmm_prior;
 
 // ============================================================
-// 3DPW Ground Truth Loader
+// 3DPW Ground Truth Loader (Full version with poses, betas, vertices)
 // ============================================================
 struct ThreeDPW_GT {
-    std::vector<Eigen::Matrix<double, 24, 3, Eigen::RowMajor>> joint_positions;  // per-frame GT joints
-    Eigen::Matrix<double, 4, 4> cam_pose_first;  // first frame camera pose for coord transform
+    std::vector<Eigen::Matrix<double, 24, 3, Eigen::RowMajor>> joint_positions;  // per-frame GT joints (camera space)
+    std::vector<Eigen::Matrix<double, 24, 3, Eigen::RowMajor>> joint_positions_world;  // per-frame GT joints (world space)
+    std::vector<Eigen::Matrix<double, 72, 1>> poses;   // per-frame GT theta (72 params, camera space)
+    std::vector<Eigen::Matrix<double, 72, 1>> poses_world;   // per-frame GT theta (world space)
+    std::vector<Eigen::Vector3d> trans_world;  // per-frame GT translation (world space)
+    std::vector<Eigen::Matrix<double, Eigen::Dynamic, 3, Eigen::RowMajor>> vertices;  // per-frame GT vertices (dynamic to avoid stack overflow)
+    Eigen::Matrix<double, 10, 1> betas;  // shared shape params
+    bool has_poses = false;
+    bool has_betas = false;
+    bool has_vertices = false;
+    bool has_world_data = false;  // true if world-space data is loaded
     bool loaded = false;
     int num_frames = 0;
-
-    bool Load(const std::string& pkl_path) {
-        // We'll load the pre-extracted txt file instead of pkl directly
-        // The pkl needs to be pre-processed by Python script
-        return false;  // Placeholder - use LoadFromTxt instead
-    }
 
     bool LoadFromTxt(const std::string& txt_path) {
         std::ifstream f(txt_path);
@@ -63,10 +67,163 @@ struct ThreeDPW_GT {
         return loaded;
     }
 
-    // Get GT joints for a specific frame (in camera coordinate system)
+    // Load full GT from directory (joints, poses, betas, vertices)
+    bool LoadFromDir(const std::string& gt_dir) {
+        // Load joints (required)
+        std::string joints_path = gt_dir + "/gt_joints.txt";
+        if (!LoadFromTxt(joints_path)) {
+            // Fallback to single file path
+            if (!LoadFromTxt(gt_dir)) return false;
+        }
+
+        // Load world-space joints (for world coordinate optimization)
+        std::string joints_world_path = gt_dir + "/gt_joints_world.txt";
+        std::ifstream jwf(joints_world_path);
+        if (jwf.is_open()) {
+            std::string line;
+            while (std::getline(jwf, line)) {
+                if (line.empty()) continue;
+                std::istringstream iss(line);
+                Eigen::Matrix<double, 24, 3, Eigen::RowMajor> joints;
+                for (int j = 0; j < 24; ++j) {
+                    iss >> joints(j, 0) >> joints(j, 1) >> joints(j, 2);
+                }
+                joint_positions_world.push_back(joints);
+            }
+            if (joint_positions_world.size() == (size_t)num_frames) {
+                has_world_data = true;
+                std::cout << "[GT] Loaded world-space joints\n";
+            }
+        }
+
+        // Load poses (optional)
+        std::string poses_path = gt_dir + "/gt_poses.txt";
+        std::ifstream pf(poses_path);
+        if (pf.is_open()) {
+            std::string line;
+            while (std::getline(pf, line)) {
+                if (line.empty()) continue;
+                std::istringstream iss(line);
+                Eigen::Matrix<double, 72, 1> pose;
+                for (int i = 0; i < 72; ++i) iss >> pose(i);
+                poses.push_back(pose);
+            }
+            has_poses = (poses.size() == (size_t)num_frames);
+            if (has_poses) std::cout << "[GT] Loaded poses\n";
+        }
+
+        // Load world-space poses (optional)
+        std::string poses_world_path = gt_dir + "/gt_poses_world.txt";
+        std::ifstream pwf(poses_world_path);
+        if (pwf.is_open()) {
+            std::string line;
+            while (std::getline(pwf, line)) {
+                if (line.empty()) continue;
+                std::istringstream iss(line);
+                Eigen::Matrix<double, 72, 1> pose;
+                for (int i = 0; i < 72; ++i) iss >> pose(i);
+                poses_world.push_back(pose);
+            }
+            if (poses_world.size() == (size_t)num_frames) {
+                std::cout << "[GT] Loaded world-space poses\n";
+            }
+        }
+
+        // Load world-space translation (optional)
+        std::string trans_world_path = gt_dir + "/gt_trans_world.txt";
+        std::ifstream twf(trans_world_path);
+        if (twf.is_open()) {
+            std::string line;
+            while (std::getline(twf, line)) {
+                if (line.empty()) continue;
+                std::istringstream iss(line);
+                Eigen::Vector3d t;
+                iss >> t(0) >> t(1) >> t(2);
+                trans_world.push_back(t);
+            }
+            if (trans_world.size() == (size_t)num_frames) {
+                std::cout << "[GT] Loaded world-space translation\n";
+            }
+        }
+
+        // Load betas (optional)
+        std::string betas_path = gt_dir + "/gt_betas.txt";
+        std::ifstream bf(betas_path);
+        if (bf.is_open()) {
+            for (int i = 0; i < 10; ++i) bf >> betas(i);
+            has_betas = true;
+            std::cout << "[GT] Loaded betas\n";
+        }
+
+        // Load vertices (optional, can be large)
+        std::string verts_path = gt_dir + "/gt_vertices.txt";
+        std::ifstream vf(verts_path);
+        if (vf.is_open()) {
+            std::string line;
+            while (std::getline(vf, line)) {
+                if (line.empty()) continue;
+                std::istringstream iss(line);
+                Eigen::Matrix<double, Eigen::Dynamic, 3, Eigen::RowMajor> verts(6890, 3);
+                for (int i = 0; i < 6890; ++i) {
+                    iss >> verts(i, 0) >> verts(i, 1) >> verts(i, 2);
+                }
+                vertices.push_back(std::move(verts));
+            }
+            has_vertices = (vertices.size() == (size_t)num_frames);
+            if (has_vertices) std::cout << "[GT] Loaded vertices\n";
+        }
+
+        return loaded;
+    }
+
+    // Get GT joints for a specific frame
     bool GetJoints(int frame_idx, Eigen::Matrix<double, Eigen::Dynamic, 3, Eigen::RowMajor>& J_gt) const {
         if (!loaded || frame_idx < 0 || frame_idx >= num_frames) return false;
         J_gt = joint_positions[frame_idx];
+        return true;
+    }
+
+    // Get GT pose for a specific frame
+    bool GetPose(int frame_idx, double* theta_gt) const {
+        if (!has_poses || frame_idx < 0 || frame_idx >= (int)poses.size()) return false;
+        for (int i = 0; i < 72; ++i) theta_gt[i] = poses[frame_idx](i);
+        return true;
+    }
+
+    // Get GT betas
+    bool GetBetas(double* beta_gt) const {
+        if (!has_betas) return false;
+        for (int i = 0; i < 10; ++i) beta_gt[i] = betas(i);
+        return true;
+    }
+
+    // Get GT vertices for a specific frame
+    bool GetVertices(int frame_idx, Eigen::Matrix<double, Eigen::Dynamic, 3, Eigen::RowMajor>& V_gt) const {
+        if (!has_vertices || frame_idx < 0 || frame_idx >= (int)vertices.size()) return false;
+        V_gt = vertices[frame_idx];
+        return true;
+    }
+
+    // Get GT joints in world space for a specific frame
+    bool GetJointsWorld(int frame_idx, Eigen::Matrix<double, Eigen::Dynamic, 3, Eigen::RowMajor>& J_gt) const {
+        if (!has_world_data || frame_idx < 0 || frame_idx >= (int)joint_positions_world.size()) return false;
+        J_gt = joint_positions_world[frame_idx];
+        return true;
+    }
+
+    // Get GT pose in world space for a specific frame
+    bool GetPoseWorld(int frame_idx, double* theta_gt) const {
+        if (frame_idx < 0 || frame_idx >= (int)poses_world.size()) return false;
+        for (int i = 0; i < 72; ++i) theta_gt[i] = poses_world[frame_idx](i);
+        return true;
+    }
+
+    // Get GT translation in world space for a specific frame
+    bool GetTransWorld(int frame_idx, double* trans_gt) const {
+        if (frame_idx < 0 || frame_idx >= (int)trans_world.size()) return false;
+        trans_gt[0] = trans_world[frame_idx](0);
+        trans_gt[1] = trans_world[frame_idx](1);
+        trans_gt[2] = trans_world[frame_idx](2);
         return true;
     }
 };
@@ -337,7 +494,11 @@ static OptimizerConfig MakeCfgForAMASS(const std::vector<JointDepthData>* depth_
     cfg.amass_unit_test = true;
     cfg.unit_test_exact = true;
 
-    // depth (
+    // For AMASS synthetic data, use all joints (including head)
+    // since the synthetic landmarks are accurate
+    cfg.use_stable_joints_only = false;
+
+    // depth
     cfg.use_depth = true;
     cfg.w_depth = 50.0;
     cfg.depth_data = depth_gt;
@@ -380,8 +541,20 @@ static OptimizerConfig MakeCfgForAMASS(const std::vector<JointDepthData>* depth_
     cfg.w_spine    = 5.0;
     cfg.spine_amax = 1.5;
 
+    // neck/head limits - prevent backward head tilt
+    cfg.use_neck_head_limits = true;
+    cfg.w_neck_limit = 40.0;
+    cfg.neck_amax = 0.5;     // ~30 degrees
+    cfg.w_head_limit = 50.0;
+    cfg.head_amax = 0.4;     // ~23 degrees
+
     // arm-torso sep
     cfg.use_arm_torso_sep = true;
+
+    // Lock extremities (same as OpenPose config)
+    cfg.lock_wrists = true;
+    cfg.lock_hands  = true;
+    cfg.lock_feet   = true;
 
     return cfg;
 }
@@ -529,10 +702,18 @@ void RunAmassValidationSequence(const SmplModel& model, const std::string& pose_
     // Evaluation accumulators
     std::vector<double> all_mpjpe;
     std::vector<double> all_pa_mpjpe;
+    std::vector<double> all_pve;         // Per Vertex Error
+    std::vector<double> all_pose_error;  // Pose parameter error
+    std::vector<double> all_shape_error; // Shape parameter error
+    std::vector<double> all_reproj_2d;   // 2D reprojection error
     std::vector<std::vector<double>> per_joint_errors(24);  // 24 SMPL joints
 
     all_mpjpe.reserve(num_frames);
     all_pa_mpjpe.reserve(num_frames);
+    all_pve.reserve(num_frames);
+    all_pose_error.reserve(num_frames);
+    all_shape_error.reserve(num_frames);
+    all_reproj_2d.reserve(num_frames);
 
     // Process each frame
     int success_count = 0;
@@ -620,6 +801,43 @@ void RunAmassValidationSequence(const SmplModel& model, const std::string& pose_
         all_mpjpe.push_back(mpjpe);
         all_pa_mpjpe.push_back(pa_mpjpe);
 
+        // PVE (Per Vertex Error) - compare vertices directly
+        double pve = ComputePVE(V_opt, V_gt);
+        all_pve.push_back(pve);
+
+        // Pose Error (theta parameters, excluding root)
+        double pose_error = ComputePoseError(theta_opt, theta_gt, false);
+        all_pose_error.push_back(pose_error);
+
+        // Shape Error (beta parameters)
+        double shape_error = ComputeShapeError(beta_opt, beta_gt);
+        all_shape_error.push_back(shape_error);
+
+        // 2D Reprojection Error - project optimized joints and compare with input landmarks
+        double reproj_err = 0.0;
+        int reproj_count = 0;
+        for (const auto& lm : observed_landmarks) {
+            if (lm.confidence < 0.3f) continue;
+            int op_idx = lm.joint_id;  // OpenPose joint ID
+            if (op_idx < 0 || op_idx >= 25) continue;
+            int smpl_idx = OPENPOSE_TO_SMPL[op_idx];  // Convert to SMPL ID
+            if (smpl_idx < 0 || smpl_idx >= J_opt.rows()) continue;
+
+            Eigen::Vector3d p = J_opt.row(smpl_idx).transpose();
+            if (p(2) <= 0) continue;
+
+            double u_pred = camera.fx * p(0) / p(2) + camera.cx;
+            double v_pred = camera.fy * (-p(1)) / p(2) + camera.cy;
+
+            double err = std::sqrt((u_pred - lm.x) * (u_pred - lm.x) +
+                                   (v_pred - lm.y) * (v_pred - lm.y));
+            reproj_err += err;
+            reproj_count++;
+        }
+        if (reproj_count > 0) {
+            all_reproj_2d.push_back(reproj_err / reproj_count);
+        }
+
         // Compute per-joint errors
         for (int j = 0; j < 24; ++j) {
             double joint_error = (J_opt.row(j) - J_gt.row(j)).norm();
@@ -627,19 +845,26 @@ void RunAmassValidationSequence(const SmplModel& model, const std::string& pose_
         }
 
         success_count++;
-        std::cout << "✓ MPJPE=" << mpjpe * 1000.0 << "mm, PA-MPJPE=" 
-                  << pa_mpjpe * 1000.0 << "mm\n";
+        std::cout << "✓ MPJPE=" << mpjpe * 1000.0 << "mm, PA-MPJPE="
+                  << pa_mpjpe * 1000.0 << "mm, PVE=" << pve * 1000.0 << "mm\n";
     }
 
     // ========== Print and save evaluation summary ==========
     if (!all_mpjpe.empty()) {
-        double mean_mpjpe = 0.0, mean_pa_mpjpe = 0.0;
-        for (size_t i = 0; i < all_mpjpe.size(); ++i) {
-            mean_mpjpe += all_mpjpe[i];
-            mean_pa_mpjpe += all_pa_mpjpe[i];
-        }
-        mean_mpjpe /= all_mpjpe.size();
-        mean_pa_mpjpe /= all_pa_mpjpe.size();
+        // Helper to compute mean
+        auto compute_mean = [](const std::vector<double>& v) -> double {
+            if (v.empty()) return -1.0;
+            double sum = 0.0;
+            for (double x : v) sum += x;
+            return sum / v.size();
+        };
+
+        double mean_mpjpe = compute_mean(all_mpjpe);
+        double mean_pa_mpjpe = compute_mean(all_pa_mpjpe);
+        double mean_pve = compute_mean(all_pve);
+        double mean_pose_error = compute_mean(all_pose_error);
+        double mean_shape_error = compute_mean(all_shape_error);
+        double mean_reproj_2d = compute_mean(all_reproj_2d);
 
         // Compute min/max
         double min_mpjpe = *std::min_element(all_mpjpe.begin(), all_mpjpe.end());
@@ -660,7 +885,7 @@ void RunAmassValidationSequence(const SmplModel& model, const std::string& pose_
         std::cout << "EVALUATION SUMMARY\n";
         std::cout << "========================================\n";
         std::cout << "File: " << base_name << "\n";
-        std::cout << "Frames evaluated: " << all_mpjpe.size() << " (" 
+        std::cout << "Frames evaluated: " << all_mpjpe.size() << " ("
                   << start_frame << "-" << end_frame << ")\n";
         std::cout << "Successful: " << success_count << "\n";
         std::cout << "Failed: " << fail_count << "\n\n";
@@ -675,7 +900,19 @@ void RunAmassValidationSequence(const SmplModel& model, const std::string& pose_
         std::cout << "  Mean:    " << mean_pa_mpjpe * 1000.0 << " mm\n";
         std::cout << "  Min:     " << min_pa_mpjpe * 1000.0 << " mm\n";
         std::cout << "  Max:     " << max_pa_mpjpe * 1000.0 << " mm\n";
-        std::cout << "  Std Dev: " << std_pa_mpjpe * 1000.0 << " mm\n";
+        std::cout << "  Std Dev: " << std_pa_mpjpe * 1000.0 << " mm\n\n";
+
+        std::cout << "=== PVE (Per Vertex Error) ===\n";
+        std::cout << "  Mean:    " << mean_pve * 1000.0 << " mm\n\n";
+
+        std::cout << "=== Pose Error (theta) ===\n";
+        std::cout << "  Mean:    " << mean_pose_error << " rad\n\n";
+
+        std::cout << "=== Shape Error (beta) ===\n";
+        std::cout << "  Mean:    " << mean_shape_error << "\n\n";
+
+        std::cout << "=== 2D Reprojection Error ===\n";
+        std::cout << "  Mean:    " << mean_reproj_2d << " px\n";
 
         // Compute per-joint statistics
         std::cout << "\n=== Per-Joint Average Error (mm) ===\n";
@@ -727,22 +964,38 @@ void RunAmassValidationSequence(const SmplModel& model, const std::string& pose_
             outfile << "  Max (mm):  " << max_pa_mpjpe * 1000.0 << "\n";
             outfile << "  Std (mm):  " << std_pa_mpjpe * 1000.0 << "\n\n";
 
+            outfile << "PVE (Per Vertex Error):\n";
+            outfile << "  Mean (mm): " << mean_pve * 1000.0 << "\n\n";
+
+            outfile << "Pose Error (theta):\n";
+            outfile << "  Mean (rad): " << mean_pose_error << "\n\n";
+
+            outfile << "Shape Error (beta):\n";
+            outfile << "  Mean: " << mean_shape_error << "\n\n";
+
+            outfile << "2D Reprojection Error:\n";
+            outfile << "  Mean (px): " << mean_reproj_2d << "\n\n";
+
             outfile << "Per-Joint Average Error (mm):\n";
             for (int j = 0; j < 24; ++j) {
                 if (per_joint_errors[j].empty()) continue;
                 double sum = 0.0;
                 for (double err : per_joint_errors[j]) sum += err;
                 double mean = sum / per_joint_errors[j].size();
-                outfile << "  Joint " << j << " (" << joint_names[j] << "): " 
+                outfile << "  Joint " << j << " (" << joint_names[j] << "): "
                        << mean * 1000.0 << "\n";
             }
 
             outfile << "\nPer-Frame Results:\n";
-            outfile << "Frame\tMPJPE(mm)\tPA-MPJPE(mm)\n";
+            outfile << "Frame\tMPJPE(mm)\tPA-MPJPE(mm)\tPVE(mm)\tPoseErr(rad)\tShapeErr\t2DReproj(px)\n";
             for (size_t i = 0; i < all_mpjpe.size(); ++i) {
-                outfile << (start_frame + i) << "\t" 
-                       << all_mpjpe[i] * 1000.0 << "\t" 
-                       << all_pa_mpjpe[i] * 1000.0 << "\n";
+                outfile << (start_frame + i) << "\t"
+                       << all_mpjpe[i] * 1000.0 << "\t"
+                       << all_pa_mpjpe[i] * 1000.0 << "\t"
+                       << (i < all_pve.size() ? all_pve[i] * 1000.0 : -1.0) << "\t"
+                       << (i < all_pose_error.size() ? all_pose_error[i] : -1.0) << "\t"
+                       << (i < all_shape_error.size() ? all_shape_error[i] : -1.0) << "\t"
+                       << (i < all_reproj_2d.size() ? all_reproj_2d[i] : -1.0) << "\n";
             }
 
             outfile.close();
@@ -844,25 +1097,54 @@ void RunOpenPoseSequenceInference(const SmplModel& model) {
 
     const std::string seq_dir   = "../../Data/openpose_output/courtyard_basketball_01";
     const std::string depth_dir = "../../Data/sapiens_depth/courtyard_basketball_01";
-    const std::string gt_path   = "../../Data/gt_joints_courtyard_basketball_01.txt";
+    const std::string gt_dir    = "../../Data/3dpw_gt/courtyard_basketball_01";
     const std::string out_dir   = "./seq_out";
     fs::create_directories(out_dir);
 
     // Load 3DPW ground truth for evaluation
     ThreeDPW_GT gt_data;
-    bool has_gt = gt_data.LoadFromTxt(gt_path);
+    bool has_gt = gt_data.LoadFromDir(gt_dir);
     if (has_gt) {
         std::cout << "[GT] Loaded " << gt_data.num_frames << " frames of ground truth\n";
+        if (gt_data.has_poses) std::cout << "[GT] Has pose parameters (theta)\n";
+        if (gt_data.has_betas) std::cout << "[GT] Has shape parameters (beta)\n";
     } else {
         std::cout << "[GT] No ground truth available, skipping evaluation\n";
     }
 
+    // Load camera extrinsics (per-frame world-to-camera transforms)
+    std::vector<CameraExtrinsics> cam_poses = LoadCameraPoses(gt_dir + "/cam_poses.txt");
+    bool has_cam_poses = !cam_poses.empty();
+    if (has_cam_poses) {
+        std::cout << "[Camera] Loaded " << cam_poses.size() << " camera poses (moving camera)\n";
+    } else {
+        std::cout << "[Camera] No camera poses found, assuming fixed camera at origin\n";
+    }
+
+    // World coordinate optimization mode
+    // When enabled: optimize trans/theta in world coordinates, use extrinsics for reprojection
+    const bool use_world_coords = has_cam_poses;
+    if (use_world_coords) {
+        std::cout << "[World] World-coordinate optimization ENABLED\n";
+    } else {
+        std::cout << "[World] Camera-coordinate optimization (no extrinsics)\n";
+    }
+
+    // Helper: convert camera-space point to world-space using inverse extrinsics
+    // p_cam = R * p_world + t  =>  p_world = R^T * (p_cam - t)
+    auto cam_to_world = [](const Eigen::Vector3d& p_cam, const CameraExtrinsics& ext) -> Eigen::Vector3d {
+        return ext.R.transpose() * (p_cam - ext.t);
+    };
+
     // Evaluation accumulators
     std::vector<double> all_mpjpe;
     std::vector<double> all_pa_mpjpe;
+    std::vector<double> all_pve;
+    std::vector<double> all_pose_error;
+    std::vector<double> all_reproj_2d;
 
     const int start = 0;
-    const int end   = 200;
+    const int end   = 957;
 
     const int img_w = 1080;
     const int img_h = 1920;
@@ -872,7 +1154,7 @@ void RunOpenPoseSequenceInference(const SmplModel& model) {
 
     cfg.use_temporal = true;
     cfg.w_temp_pose  = 12.0;
-    cfg.w_temp_trans = 6.0;
+    cfg.w_temp_trans = 30.0;
     cfg.use_temporal_acc = true;
     cfg.w_temp_acc_pose  = 2.0;
     cfg.temporal_body_only = true;
@@ -889,12 +1171,21 @@ void RunOpenPoseSequenceInference(const SmplModel& model) {
     double theta_prev[72]  = {0.0};
     double theta_prev2[72] = {0.0};
     double trans_prev[3]   = {0.0, 0.0, 3.0};
+    double trans_prev2[3]  = {0.0, 0.0, 3.0};  // will be properly set when has_prev2=true
 
     bool has_prev  = false;
     bool has_prev2 = false;
 
-    double depth_affine[2]      = {1e-3, 3.0};
-    double depth_affine_prev[2] = {1e-3, 3.0};
+    // Affine depth model: Z = bias + sign * scale * d
+    // Sapiens depth: larger d = farther from camera (sign = +1)
+    // scale ~ slope, bias ~ Z_min (~3m)
+    double depth_affine[2]      = {3.0, 3.0};  // [scale, bias]
+    double depth_affine_prev[2] = {3.0, 3.0};
+
+    // Camera-space depth tracking for world-coordinate optimization
+    // Z_cam = R[2,:] * trans_world + t[2]
+    double Z_cam_prev  = 3.0;
+    double Z_cam_prev2 = 3.0;
 
     static bool kp_ema_init = false;
     static double kp_x[25], kp_y[25], kp_seen[25];
@@ -1018,9 +1309,28 @@ void RunOpenPoseSequenceInference(const SmplModel& model) {
             depth_affine[0] = depth_affine_prev[0];
             depth_affine[1] = depth_affine_prev[1];
         } else {
-            EstimateGlobalTranslationXY(lms, camera, 3.0, trans);
-            depth_affine[0] = 1e-3;
-            depth_affine[1] = trans[2];
+            // First frame: estimate initial translation
+            // 1. Estimate trans in camera space from 2D bbox
+            double trans_cam[3];
+            EstimateGlobalTranslationXY(lms, camera, 3.0, trans_cam);
+
+            if (use_world_coords && f < (int)cam_poses.size()) {
+                // Convert camera-space trans to world-space: p_world = R^T * (p_cam - t)
+                Eigen::Vector3d p_cam(trans_cam[0], trans_cam[1], trans_cam[2]);
+                Eigen::Vector3d p_world = cam_to_world(p_cam, cam_poses[f]);
+                trans[0] = p_world(0);
+                trans[1] = p_world(1);
+                trans[2] = p_world(2);
+                std::cout << "[Init] trans_world = (" << trans[0] << ", " << trans[1] << ", " << trans[2] << ")\n";
+            } else {
+                trans[0] = trans_cam[0];
+                trans[1] = trans_cam[1];
+                trans[2] = trans_cam[2];
+            }
+            // Affine depth model: Z = bias + sign * scale * d
+            // bias ~ Z_min, scale ~ slope
+            depth_affine[0] = 3.0;           // scale (slope)
+            depth_affine[1] = trans_cam[2];  // bias ~ Z_min
         }
 
         {
@@ -1067,17 +1377,27 @@ void RunOpenPoseSequenceInference(const SmplModel& model) {
 
         if ((int)depth_pts.size() >= 6) {
             cfg.use_depth_affine = true;
-            cfg.w_depth_affine = 30.0;
-            cfg.depth_affine_sign = -1.0; // larger rel_depth => closer => smaller z
+            cfg.w_depth_affine = 60.0;
+            cfg.depth_affine_sign = 1.0;  // Sapiens: larger d = farther = larger Z
             cfg.depth_affine_data   = &depth_pts;
             cfg.depth_affine_params = depth_affine;
 
             cfg.use_temporal_depth_affine = has_prev;
             cfg.depth_affine_prev = has_prev ? depth_affine_prev : nullptr;
-            cfg.w_temp_depth_scale = 80.0;
-            cfg.w_temp_depth_bias  = 200.0;
+            cfg.w_temp_depth_scale = 20.0;
+            cfg.w_temp_depth_bias  = 50.0;
+
+            cfg.fix_depth_affine_bias = has_prev;  // lock bias after first frame to prevent drift
         }
 
+        // Camera-space depth prior (world-coord mode): prevent drift along optical axis
+        if (use_world_coords && has_prev) {
+            cfg.use_cam_depth_prior = true;
+            cfg.w_cam_depth_prior = 200.0;
+            cfg.Z_cam_prev = Z_cam_prev;
+            cfg.Z_cam_prev2 = Z_cam_prev2;
+            cfg.has_Z_cam_prev2 = has_prev2;
+        }
 
         double LAx=0, LAy=0, RAx=0, RAy=0;
         bool hasLA = get_xy(lms, 14, LAx, LAy); // LAnkle
@@ -1110,13 +1430,62 @@ void RunOpenPoseSequenceInference(const SmplModel& model) {
             cfg.max_iter_stage3 = 80;
         }
 
+        // Get camera extrinsics for this frame (if using world coordinate optimization)
+        const CameraExtrinsics* frame_extrinsics = nullptr;
+        if (use_world_coords && f < (int)cam_poses.size()) {
+            frame_extrinsics = &cam_poses[f];
+        }
+
+        // Debug: print depth_affine BEFORE optimization
+        double affine_before[2] = {depth_affine[0], depth_affine[1]};
+
         bool ok = false;
         if (!has_prev) {
-            ok = OptimizeSMPL(lms, camera, model, beta, theta, trans, cfg);
+            ok = OptimizeSMPL(lms, camera, model, beta, theta, trans, cfg, frame_extrinsics);
         } else {
             ok = OptimizeSMPLTracked(lms, camera, model, beta, theta, trans, cfg,
                                      theta_prev, trans_prev,
-                                     has_prev2 ? theta_prev2 : nullptr);
+                                     has_prev2 ? theta_prev2 : nullptr,
+                                     has_prev2 ? trans_prev2 : nullptr,
+                                     frame_extrinsics);
+        }
+
+        // Debug: depth constraint statistics
+        if (cfg.use_depth_affine) {
+            Eigen::Matrix<double, Eigen::Dynamic, 3, Eigen::RowMajor> J_debug;
+            SMPLJointsForward<double>(beta, theta, trans, model, J_debug);
+
+            // Compute depth residual stats
+            double sum_abs_err = 0.0;
+            int count = 0;
+            for (const auto& pt : depth_pts) {
+                int j = pt.smpl_joint_idx;
+                double d = pt.rel_depth;
+
+                double Z_pred;
+                if (frame_extrinsics) {
+                    Z_pred = frame_extrinsics->t(2);
+                    for (int k = 0; k < 3; ++k) {
+                        Z_pred += frame_extrinsics->R(2, k) * J_debug(j, k);
+                    }
+                } else {
+                    Z_pred = J_debug(j, 2);
+                }
+
+                // Affine model: Z = bias + sign * scale * d
+                double Z_tgt = depth_affine[1] + cfg.depth_affine_sign * depth_affine[0] * d;
+                sum_abs_err += std::abs(Z_pred - Z_tgt);
+                count++;
+            }
+            double mean_depth_err = count > 0 ? sum_abs_err / count : 0.0;
+
+            // Compute trans_z delta
+            double delta_trans_z = has_prev ? (trans[2] - trans_prev[2]) : 0.0;
+
+            // Print compact stats every frame
+            std::cout << "[F" << f << "] scale=" << depth_affine[0]
+                      << " | mean|Z_err|=" << mean_depth_err
+                      << " | Δtrans_z=" << delta_trans_z << "\n";
         }
 
         if (!ok) {
@@ -1141,7 +1510,9 @@ void RunOpenPoseSequenceInference(const SmplModel& model) {
             if (!ground_init) {
                 ground_y_est = y_min;
                 ground_init = true;
-            } else {
+            } else if (!use_world_coords) {
+                // Only update ground_y in camera coordinate mode
+                // In world coordinates, ground is fixed (doesn't move with camera)
                 // allow downward update faster, upward update slower
                 if (y_min < ground_y_est) {
                     ground_y_est = 0.7 * y_min + 0.3 * ground_y_est;
@@ -1149,6 +1520,7 @@ void RunOpenPoseSequenceInference(const SmplModel& model) {
                     ground_y_est = 0.98 * ground_y_est + 0.02 * y_min;
                 }
             }
+            // In world coords, ground_y_est stays fixed from frame 0
 
             cfg.ground_y = ground_y_est; // for next frame
         }
@@ -1159,6 +1531,7 @@ void RunOpenPoseSequenceInference(const SmplModel& model) {
         // shift prev buffers
         if (has_prev) {
             std::memcpy(theta_prev2, theta_prev, sizeof(theta_prev2));
+            std::memcpy(trans_prev2, trans_prev, sizeof(trans_prev2));
             has_prev2 = true;
         }
         std::memcpy(theta_prev, theta, sizeof(theta_prev));
@@ -1169,11 +1542,34 @@ void RunOpenPoseSequenceInference(const SmplModel& model) {
         depth_affine_prev[0] = depth_affine[0];
         depth_affine_prev[1] = depth_affine[1];
 
-        std::cout << "[Frame " << f << "] done | trans=("
-                  << trans[0] << "," << trans[1] << "," << trans[2] << ")"
-                  << " | affine=(" << depth_affine[0] << "," << depth_affine[1] << ")"
-                  << " | ground_y=" << cfg.ground_y
-                  << " | contact(L,R)=(" << cfg.foot_contact_L << "," << cfg.foot_contact_R << ")"
+        // Update Z_cam for camera-space depth prior (world-coord mode)
+        if (use_world_coords && f < (int)cam_poses.size()) {
+            const auto& ext = cam_poses[f];
+            double Z_cam_cur = ext.R(2,0)*trans[0] + ext.R(2,1)*trans[1] + ext.R(2,2)*trans[2] + ext.t(2);
+            Z_cam_prev2 = Z_cam_prev;
+            Z_cam_prev = Z_cam_cur;
+        }
+
+        // Compute Z_cam for drift monitoring
+        double Z_cam_cur = 0.0;
+        if (use_world_coords && f < (int)cam_poses.size()) {
+            const auto& ext = cam_poses[f];
+            Z_cam_cur = ext.R(2,0)*trans[0] + ext.R(2,1)*trans[1] + ext.R(2,2)*trans[2] + ext.t(2);
+        } else {
+            Z_cam_cur = trans[2];
+        }
+
+        // Key drift indicators:
+        // - ΔZ_cam: change in camera-space depth (should be small for static person)
+        // - Z_cam: absolute depth (should stay ~3m for typical scene)
+        static double Z_cam_first = 0.0;
+        if (f == start) Z_cam_first = Z_cam_cur;
+        double Z_cam_drift = Z_cam_cur - Z_cam_first;  // accumulated drift from first frame
+
+        std::cout << "[F" << f << "] Z_cam=" << std::fixed << std::setprecision(3) << Z_cam_cur
+                  << " | ΔZ_cam=" << std::showpos << (Z_cam_cur - Z_cam_prev) << std::noshowpos
+                  << " | drift=" << std::showpos << Z_cam_drift << std::noshowpos
+                  << " | scale=" << depth_affine[0]
                   << "\n";
 
         // ---------------------------
@@ -1183,17 +1579,98 @@ void RunOpenPoseSequenceInference(const SmplModel& model) {
             Eigen::Matrix<double, Eigen::Dynamic, 3, Eigen::RowMajor> J_pred;
             SMPLJointsForward<double>(beta, theta, trans, model, J_pred);
 
+            // Choose appropriate GT based on coordinate system:
+            // - World coords: J_pred is in world space, compare with gt_joints_world.txt
+            // - Camera coords: J_pred is in camera space, compare with gt_joints.txt
             Eigen::Matrix<double, Eigen::Dynamic, 3, Eigen::RowMajor> J_gt;
-            if (gt_data.GetJoints(f, J_gt)) {
-                all_mpjpe.push_back(ComputeMPJPE(J_pred, J_gt));
-                all_pa_mpjpe.push_back(ComputePAMPJPE(J_pred, J_gt));
+            bool got_gt = false;
+            if (use_world_coords && gt_data.has_world_data) {
+                got_gt = gt_data.GetJointsWorld(f, J_gt);
+            } else {
+                got_gt = gt_data.GetJoints(f, J_gt);
+            }
+
+            if (got_gt) {
+                double mpjpe = ComputeMPJPE(J_pred, J_gt);
+                double pa_mpjpe = ComputePAMPJPE(J_pred, J_gt);
+                all_mpjpe.push_back(mpjpe);
+                all_pa_mpjpe.push_back(pa_mpjpe);
+
+                // Debug: print joint comparison every 10 frames
+                if (f % 10 == 0) {
+                    std::cout << "\n=== DEBUG: Joint comparison (frame " << f << ", "
+                              << (use_world_coords ? "world" : "camera") << " coords) ===\n";
+                    std::cout << "trans: (" << trans[0] << ", " << trans[1] << ", " << trans[2] << ")\n";
+                    std::cout << "Joint 0 (pelvis): pred=(" << J_pred(0,0) << ", " << J_pred(0,1) << ", " << J_pred(0,2)
+                              << ") gt=(" << J_gt(0,0) << ", " << J_gt(0,1) << ", " << J_gt(0,2) << ")\n";
+                    std::cout << "Joint 12 (neck): pred=(" << J_pred(12,0) << ", " << J_pred(12,1) << ", " << J_pred(12,2)
+                              << ") gt=(" << J_gt(12,0) << ", " << J_gt(12,1) << ", " << J_gt(12,2) << ")\n";
+                    std::cout << "MPJPE=" << mpjpe*1000 << "mm, PA-MPJPE=" << pa_mpjpe*1000 << "mm\n";
+                    std::cout << "===========================================\n\n";
+                }
+            }
+
+            // PVE: 3DPW doesn't have GT vertices, skip PVE computation
+            // (would need to run SMPL forward with GT theta/beta to get GT vertices)
+
+            // Pose Error (theta parameters) - use world-space pose if available
+            double theta_gt[72];
+            bool got_pose = false;
+            if (use_world_coords && !gt_data.poses_world.empty()) {
+                got_pose = gt_data.GetPoseWorld(f, theta_gt);
+            } else {
+                got_pose = gt_data.GetPose(f, theta_gt);
+            }
+            if (got_pose) {
+                all_pose_error.push_back(ComputePoseError(theta, theta_gt, false));
+            }
+
+            // 2D Reprojection Error - project joints and compare with 2D keypoints
+            // For world-space optimization, need to transform to camera space first
+            double reproj_err = 0.0;
+            int reproj_count = 0;
+            for (const auto& lm : lms) {
+                if (lm.confidence < 0.3f) continue;
+                int op_idx = lm.joint_id;  // OpenPose joint ID
+                if (op_idx < 0 || op_idx >= 25) continue;
+                int smpl_idx = OPENPOSE_TO_SMPL[op_idx];  // Convert to SMPL ID
+                if (smpl_idx < 0 || smpl_idx >= J_pred.rows()) continue;
+
+                double px, py, pz;
+                if (use_world_coords && f < (int)cam_poses.size()) {
+                    // Transform world to camera: p_cam = R * p_world + t
+                    Eigen::Vector3d p_world(J_pred(smpl_idx, 0), J_pred(smpl_idx, 1), J_pred(smpl_idx, 2));
+                    Eigen::Vector3d p_cam = cam_poses[f].R * p_world + cam_poses[f].t;
+                    px = p_cam(0);
+                    py = p_cam(1);
+                    pz = p_cam(2);
+                } else {
+                    // Already in camera space
+                    px = J_pred(smpl_idx, 0);
+                    py = J_pred(smpl_idx, 1);
+                    pz = J_pred(smpl_idx, 2);
+                }
+                if (pz <= 0) continue;
+
+                // Note: 3DPW camera has Y+ down, so no flip needed after transform
+                // But our preprocessing flipped Y in gt_joints.txt, so we need to be consistent
+                double u_pred = camera.fx * px / pz + camera.cx;
+                double v_pred = camera.fy * py / pz + camera.cy;  // 3DPW camera Y+ down, no flip
+
+                double err = std::sqrt((u_pred - lm.x) * (u_pred - lm.x) +
+                                       (v_pred - lm.y) * (v_pred - lm.y));
+                reproj_err += err;
+                reproj_count++;
+            }
+            if (reproj_count > 0) {
+                all_reproj_2d.push_back(reproj_err / reproj_count);
             }
         }
 
         std::cout << "[Frame " << f << "] done\n";
 
-        // Print intermediate evaluation every 100 frames
-        if (!all_mpjpe.empty() && all_mpjpe.size() % 100 == 0) {
+        // Print intermediate evaluation every 10 frames
+        if (!all_mpjpe.empty() && all_mpjpe.size() % 10 == 0) {
             double mean_mpjpe = 0.0, mean_pa_mpjpe = 0.0;
             for (size_t i = 0; i < all_mpjpe.size(); ++i) {
                 mean_mpjpe += all_mpjpe[i];
@@ -1211,29 +1688,70 @@ void RunOpenPoseSequenceInference(const SmplModel& model) {
     // Print and save evaluation summary
     // ---------------------------
     if (!all_mpjpe.empty()) {
-        double mean_mpjpe = 0.0, mean_pa_mpjpe = 0.0;
-        for (size_t i = 0; i < all_mpjpe.size(); ++i) {
-            mean_mpjpe += all_mpjpe[i];
-            mean_pa_mpjpe += all_pa_mpjpe[i];
+        // Compute means
+        auto compute_mean = [](const std::vector<double>& v) -> double {
+            if (v.empty()) return -1.0;
+            double sum = 0.0;
+            for (double x : v) sum += x;
+            return sum / v.size();
+        };
+
+        double mean_mpjpe = compute_mean(all_mpjpe);
+        double mean_pa_mpjpe = compute_mean(all_pa_mpjpe);
+        double mean_pve = compute_mean(all_pve);
+        double mean_pose_error = compute_mean(all_pose_error);
+        double mean_reproj_2d = compute_mean(all_reproj_2d);
+
+        // Also compute shape error (single value across all frames)
+        double shape_error = -1.0;
+        if (gt_data.has_betas) {
+            double beta_gt[10];
+            if (gt_data.GetBetas(beta_gt)) {
+                shape_error = ComputeShapeError(beta, beta_gt);
+            }
         }
-        mean_mpjpe /= all_mpjpe.size();
-        mean_pa_mpjpe /= all_pa_mpjpe.size();
 
         std::cout << "\n========== EVALUATION SUMMARY ==========\n";
         std::cout << "  Frames evaluated: " << all_mpjpe.size() << "\n";
-        std::cout << "  Mean MPJPE:    " << mean_mpjpe * 1000.0 << " mm\n";
-        std::cout << "  Mean PA-MPJPE: " << mean_pa_mpjpe * 1000.0 << " mm\n";
+        std::cout << "  Mean MPJPE:       " << mean_mpjpe * 1000.0 << " mm\n";
+        std::cout << "  Mean PA-MPJPE:    " << mean_pa_mpjpe * 1000.0 << " mm\n";
+        if (mean_pve >= 0)
+            std::cout << "  Mean PVE:         " << mean_pve * 1000.0 << " mm\n";
+        if (mean_pose_error >= 0)
+            std::cout << "  Mean Pose Error:  " << mean_pose_error << " rad\n";
+        if (shape_error >= 0)
+            std::cout << "  Shape Error:      " << shape_error << "\n";
+        if (mean_reproj_2d >= 0)
+            std::cout << "  Mean 2D Reproj:   " << mean_reproj_2d << " px\n";
         std::cout << "=========================================\n";
 
         // Save evaluation results to file
         std::ofstream eval_file(out_dir + "/evaluation.txt");
         if (eval_file.is_open()) {
-            eval_file << "Frames evaluated: " << all_mpjpe.size() << "\n";
+            eval_file << "# Evaluation Summary\n";
+            eval_file << "Frames evaluated: " << all_mpjpe.size() << "\n\n";
+
+            eval_file << "# Mean Metrics\n";
             eval_file << "Mean MPJPE (mm): " << mean_mpjpe * 1000.0 << "\n";
             eval_file << "Mean PA-MPJPE (mm): " << mean_pa_mpjpe * 1000.0 << "\n";
-            eval_file << "\nPer-frame MPJPE (mm):\n";
+            if (mean_pve >= 0)
+                eval_file << "Mean PVE (mm): " << mean_pve * 1000.0 << "\n";
+            if (mean_pose_error >= 0)
+                eval_file << "Mean Pose Error (rad): " << mean_pose_error << "\n";
+            if (shape_error >= 0)
+                eval_file << "Shape Error: " << shape_error << "\n";
+            if (mean_reproj_2d >= 0)
+                eval_file << "Mean 2D Reprojection (px): " << mean_reproj_2d << "\n";
+
+            eval_file << "\n# Per-frame Metrics\n";
+            eval_file << "# frame_idx MPJPE(mm) PA-MPJPE(mm) PVE(mm) PoseErr(rad) 2DReproj(px)\n";
             for (size_t i = 0; i < all_mpjpe.size(); ++i) {
-                eval_file << i << " " << all_mpjpe[i] * 1000.0 << " " << all_pa_mpjpe[i] * 1000.0 << "\n";
+                eval_file << i << " "
+                          << all_mpjpe[i] * 1000.0 << " "
+                          << all_pa_mpjpe[i] * 1000.0 << " "
+                          << (i < all_pve.size() ? all_pve[i] * 1000.0 : -1.0) << " "
+                          << (i < all_pose_error.size() ? all_pose_error[i] : -1.0) << " "
+                          << (i < all_reproj_2d.size() ? all_reproj_2d[i] : -1.0) << "\n";
             }
             eval_file.close();
             std::cout << "[Saved] " << out_dir << "/evaluation.txt\n";

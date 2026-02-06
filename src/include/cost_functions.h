@@ -26,32 +26,6 @@ struct CameraIntrinsics {
         : fx(fx_), fy(fy_), cx(cx_), cy(cy_), width(w), height(h) {}
 };
 
-// Camera extrinsics: world-to-camera transform
-// P_cam = R * P_world + t
-struct CameraExtrinsics {
-    Eigen::Matrix3d R;  // 3x3 rotation matrix
-    Eigen::Vector3d t;  // 3x1 translation vector
-
-    CameraExtrinsics() : R(Eigen::Matrix3d::Identity()), t(Eigen::Vector3d::Zero()) {}
-    CameraExtrinsics(const Eigen::Matrix3d& R_, const Eigen::Vector3d& t_) : R(R_), t(t_) {}
-
-    // Transform a point from world to camera coordinates
-    template<typename T>
-    void TransformPoint(const T* p_world, T* p_cam) const {
-        // p_cam = R * p_world + t
-        for (int i = 0; i < 3; ++i) {
-            p_cam[i] = T(t(i));
-            for (int j = 0; j < 3; ++j) {
-                p_cam[i] += T(R(i, j)) * p_world[j];
-            }
-        }
-    }
-
-    bool IsIdentity() const {
-        return R.isIdentity(1e-6) && t.isZero(1e-6);
-    }
-};
-
 
 
 // Cost Function 1: 2D Reprojection Error
@@ -115,82 +89,6 @@ private:
     Landmark2D observed_landmark_;
     int smpl_joint_id_;
     CameraIntrinsics camera_;
-    const SmplModel& model_;
-};
-
-// Cost Function 1b: 2D Reprojection Error with Camera Extrinsics
-// SMPL body is in WORLD coordinates, camera extrinsics transform to camera space
-struct ReprojectionResidualWithExtrinsics {
-    ReprojectionResidualWithExtrinsics(
-        const Landmark2D& observed,
-        int smpl_joint_id,
-        const CameraIntrinsics& camera,
-        const CameraExtrinsics& extrinsics,
-        const SmplModel& model
-    ) : observed_landmark_(observed),
-        smpl_joint_id_(smpl_joint_id),
-        camera_(camera),
-        extrinsics_(extrinsics),
-        model_(model) {}
-
-    template <typename T>
-    bool operator()(
-        const T* beta,   // [10]
-        const T* theta,  // [72]
-        const T* trans,  // [3] - translation in WORLD coordinates
-        T* residual      // [2]
-    ) const {
-
-        Eigen::Matrix<T, Eigen::Dynamic, 3, Eigen::RowMajor> vertices;
-        SMPLForward<T>(beta, theta, trans, model_, vertices);
-
-        // Step 2: 计算3D关节位置 (J_regressor × vertices) - in WORLD coordinates
-        T joint_world[3] = {T(0.0), T(0.0), T(0.0)};
-
-        for (int v = 0; v < model_.N; ++v) {
-            T weight = T(model_.J_regressor(smpl_joint_id_, v));
-            if (weight > T(1e-5)) {
-                joint_world[0] += weight * vertices(v, 0);
-                joint_world[1] += weight * vertices(v, 1);
-                joint_world[2] += weight * vertices(v, 2);
-            }
-        }
-
-        // Step 3: Transform from WORLD to CAMERA coordinates
-        // P_cam = R * P_world + t
-        T joint_cam[3];
-        for (int i = 0; i < 3; ++i) {
-            joint_cam[i] = T(extrinsics_.t(i));
-            for (int j = 0; j < 3; ++j) {
-                joint_cam[i] += T(extrinsics_.R(i, j)) * joint_world[j];
-            }
-        }
-
-        // Step 4: 3D → 2D 投影 (pinhole camera model)
-        // Note: 3DPW camera has Y+ down, but we flipped Y in extrinsics
-        T X = joint_cam[0];
-        T Y = joint_cam[1];
-        T Z = joint_cam[2];
-
-        if (ceres::abs(Z) < T(1e-6)) {
-            Z = T(1e-6);
-        }
-
-        T projected_x = T(camera_.fx) * (X / Z) + T(camera_.cx);
-        T projected_y = T(camera_.fy) * (Y / Z) + T(camera_.cy);
-
-        // Step 5: 计算残差 = 预测 - 观测
-        residual[0] = projected_x - T(observed_landmark_.x);
-        residual[1] = projected_y - T(observed_landmark_.y);
-
-        return true;
-    }
-
-private:
-    Landmark2D observed_landmark_;
-    int smpl_joint_id_;
-    CameraIntrinsics camera_;
-    CameraExtrinsics extrinsics_;
     const SmplModel& model_;
 };
 

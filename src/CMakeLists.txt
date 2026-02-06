@@ -3,16 +3,21 @@ project(SMPL_Project)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
-set(CMAKE_BUILD_TYPE Debug)
+
+# ---- Paths ----
+# If this CMakeLists.txt sits in .../Exercises/src, then:
+set(PROJ_ROOT ${CMAKE_CURRENT_SOURCE_DIR})
 
 # 1. Include Paths
-include_directories(include)
-include_directories("../Libs/cnpy")
-include_directories("../Libs/Eigen") 
-include_directories("../Libs") 
+
+include_directories(${PROJ_ROOT}/include)
+include_directories(${PROJ_ROOT}/../Libs/cnpy)
+include_directories(${PROJ_ROOT}/../Libs/Eigen)
+include_directories(${PROJ_ROOT}/../Libs)
 
 # 2. Find Packages
 find_package(Eigen3 REQUIRED)
+# Prefer imported target if available; still keep include for compatibility
 include_directories(${EIGEN3_INCLUDE_DIR})
 
 find_package(Ceres REQUIRED)
@@ -20,22 +25,33 @@ include_directories(${CERES_INCLUDE_DIRS})
 
 find_package(ZLIB REQUIRED)
 
-find_package(nlohmann_json 3.2.0 REQUIRED)
-
 # 3. Executable
-# Removed render.cpp, added optimizer.cpp
 add_executable(main
-    main.cpp
-    smpl_model.cpp
-    optimizer.cpp
-    ../Libs/cnpy/cnpy.cpp 
+    ${PROJ_ROOT}/main.cpp
+    ${PROJ_ROOT}/smpl_model.cpp
+    ${PROJ_ROOT}/optimizer.cpp
+    ${PROJ_ROOT}/../Libs/cnpy/cnpy.cpp
+)
+
+# Extra sources (NOTE: NO "src/" prefix)
+target_sources(main PRIVATE
+  ${PROJ_ROOT}/io_utils.cpp
+  ${PROJ_ROOT}/openpose_io.cpp
+  ${PROJ_ROOT}/init_utils.cpp
+  ${PROJ_ROOT}/config_builders.cpp
+  ${PROJ_ROOT}/threedpw_gt.cpp
+  ${PROJ_ROOT}/amass_runners.cpp
+  ${PROJ_ROOT}/openpose_runners.cpp
 )
 
 # 4. Linking
 target_link_libraries(main
     ${CERES_LIBRARIES}
     ZLIB::ZLIB
-    nlohmann_json::nlohmann_json
+)
+
+target_include_directories(main PRIVATE
+  ${PROJ_ROOT}/include
 )
 
 add_definitions(-DEIGEN_NO_DEBUG)

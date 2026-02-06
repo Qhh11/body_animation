@@ -34,19 +34,19 @@ OptimizerConfig MakeCfgForOpenPose(const GMMPosePrior* gmm_prior) {
 
     // root upright
     cfg.use_root_upright = true;
-    cfg.root_upright_w_stage2 = 5.0;
-    cfg.root_upright_w_stage3 = 1.0;
+    cfg.root_upright_w_stage2 = 20.0;
+    cfg.root_upright_w_stage3 = 10.0;
 
     // shoulder/collar/wrist/spine
     cfg.use_shoulder_collar_limits = true;
-    cfg.w_collar_limit = 30.0;
-    cfg.collar_amax    = 1.2;     // was 0.8 — clavicle contributes to arm raise
-    cfg.w_shoulder_limit = 40.0;  // was 60 — softer to allow more range
-    cfg.shoulder_amax    = 2.8;   // was 1.7 (97°) — need ~160° for full lateral raise
+    cfg.w_collar_limit = 20.0;
+    cfg.collar_amax    = 1.2;    
+    cfg.w_shoulder_limit = 20.0;
+    cfg.shoulder_amax    = 2.8;  
 
     cfg.use_wrist_limits = true;
-    cfg.w_wrist_limit = 50.0;     // was 80 — softer
-    cfg.wrist_amax    = 1.0;      // was 0.6 — allow more wrist articulation
+    cfg.w_wrist_limit = 50.0;     
+    cfg.wrist_amax    = 1.0;     
 
     cfg.use_spine_limits = true;
     cfg.w_spine     = 10.0;
@@ -102,12 +102,12 @@ OptimizerConfig MakeCfgForOpenPoseSequence(const GMMPosePrior* gmm_prior) {
     cfg.temporal_arm_scale = 0.3;
 
     // Sequence-specific: reduce elbow hinge priors (temporal already regularizes)
-    cfg.w_hinge_perp_elbow  = 8.0;   // was 15 in single-frame
-    cfg.w_hinge_range_elbow = 4.0;   // was 8
+    cfg.w_hinge_perp_elbow  = 8.0;   
+    cfg.w_hinge_range_elbow = 4.0;   
 
     // Reduce arm-torso separation for arm-closing motions
-    cfg.arm_torso_w_elbow = 10.0;    // was 20
-    cfg.arm_torso_w_wrist = 15.0;    // was 35
+    cfg.arm_torso_w_elbow = 10.0;    
+    cfg.arm_torso_w_wrist = 15.0;   
 
     // ---------- Foot contact ----------
     cfg.use_foot_ground = true;

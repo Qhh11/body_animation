@@ -96,25 +96,7 @@ void RunOpenPoseInference(const SmplModel& model,
     std::cout << "[Done] saved mesh_after_opt.obj\n";
 }
 
-// =========================================================
-// MODE 3: OpenPose SEQUENCE — CAMERA-SPACE OPTIMIZATION
-//
-// Architecture (SOTA approach):
-//   1. ALWAYS optimize in camera space (like SMPLify, SPIN, etc.)
-//   2. Moving camera handling:
-//      - Store prev frame results in their own camera space
-//      - Before optimization: transform prev results to current
-//        camera space using relative camera transform
-//      - This gives correct warm-start AND temporal prior targets
-//   3. Evaluation:
-//      - Transform camera-space results → world space using extrinsics
-//      - Compare with world-space ground truth
-//
-// Why this works and world-space optimization doesn't:
-//   - 2D reprojection directly constrains camera-space XY/Z ratio
-//   - Camera-space Z is directly observable (bounded [0.3, 25])
-//   - World-space Z has no direct 2D constraint → drifts freely
-// =========================================================
+
 void RunOpenPoseSequenceInference(const SmplModel& model,
                                   const GMMPosePrior* gmm_prior) {
     std::cout << "\n=== MODE 3: OpenPose SEQUENCE (Camera-Space) ===\n";
@@ -122,7 +104,7 @@ void RunOpenPoseSequenceInference(const SmplModel& model,
     const std::string seq_dir   = "../../Data/openpose_output/courtyard_bodyScannerMotions_00";
     const std::string depth_dir = "../../Data/sapiens_depth/courtyard_bodyScannerMotions_00";
     const std::string gt_dir    = "../../Data/3dpw_gt/courtyard_bodyScannerMotions_00";
-    const std::string out_dir   = "./seq_out_test3";
+    const std::string out_dir   = "./seq_out_zhengmian3";
     fs::create_directories(out_dir);
 
     // ---------------------------
@@ -139,13 +121,6 @@ void RunOpenPoseSequenceInference(const SmplModel& model,
         std::cout << "[GT] No ground truth, metrics will be -1\n";
     }
 
-    // ---------------------------
-    // Load camera extrinsics
-    // Used ONLY for:
-    //   (a) Computing relative transform for warm-start
-    //   (b) Transforming results to world space for evaluation
-    // NEVER passed into the optimizer.
-    // ---------------------------
     std::vector<CameraExtrinsics> cam_poses = LoadCameraPoses(gt_dir + "/cam_poses.txt");
     const bool has_cam_poses = !cam_poses.empty();
     if (has_cam_poses)
@@ -159,22 +134,15 @@ void RunOpenPoseSequenceInference(const SmplModel& model,
     // ---------------------------
     std::vector<double> all_mpjpe, all_pa_mpjpe, all_pve, all_pose_error, all_reproj_2d;
     std::vector<double> all_mpjpe_rootrel;
-
-    // Camera-space diagnostics (bypass world transform to isolate issues)
     std::vector<double> all_cam_rootrel, all_cam_pa;
 
-    const int start = 70;
-    const int end   = 200;
+    const int start = 0;
+    const int end   = 140;
     const int img_w = 1080;
     const int img_h = 1920;
     CameraIntrinsics camera(1962.0f, 1969.0f, 540.0f, 960.0f, img_w, img_h);
 
     OptimizerConfig cfg = MakeCfgForOpenPoseSequence(gmm_prior);
-
-    // Camera-space Z prior — THE key constraint preventing Z drift
-    // (target updated per-frame in the loop below)
-    // cfg.w_trans_z_prior already set by builder
-
     // ---------------------------
     // Logger
     // ---------------------------
@@ -201,19 +169,17 @@ void RunOpenPoseSequenceInference(const SmplModel& model,
 
     // ---------------------------
     // Camera-space parameters
-    // theta/trans are always in the CURRENT frame's camera space
     // ---------------------------
     double beta[10]  = {0.0};
     double theta[72] = {0.0};
     double trans[3]  = {0.0, 0.0, 3.0};
+    //theta[1] = M_PI * -0.5;   ENABLE ONLY IF SIDE INIT  
 
-    // Previous frame params stored in THEIR OWN camera space
     double theta_prev_raw[72]  = {0.0};
     double trans_prev_raw[3]   = {0.0, 0.0, 3.0};
     double theta_prev2_raw[72] = {0.0};
     double trans_prev2_raw[3]  = {0.0, 0.0, 3.0};
 
-    // Transformed to current cam space (temporal prior targets + warm start)
     double theta_prev_curr[72]  = {0.0};
     double trans_prev_curr[3]   = {0.0, 0.0, 3.0};
     double theta_prev2_curr[72] = {0.0};
@@ -296,6 +262,97 @@ void RunOpenPoseSequenceInference(const SmplModel& model,
         return std::clamp(ground_like * speed_like * std::min(1.0, 0.5*(cA+cK)), 0.0, 1.0);
     };
 
+    auto ComputeReproj2DScore = [&](const std::vector<Landmark2D>& lms,
+                                const double beta_[10],
+                                const double theta_[72],
+                                const double trans_[3],
+                                const OptimizerConfig& cfg_)->double
+    {
+        MatX3dRM J;
+        SMPLJointsForward<double>(beta_, theta_, trans_, model, J);
+
+        double err = 0.0;
+        int cnt = 0;
+        for (const auto& lm : lms) {
+            if (lm.confidence < cfg_.min_confidence) continue;
+            int op_idx = lm.joint_id;
+            if (op_idx < 0 || op_idx >= 25) continue;
+            int smpl_idx = OPENPOSE_TO_SMPL[op_idx];
+            if (smpl_idx < 0 || smpl_idx >= J.rows()) continue;
+
+            double X = J(smpl_idx, 0);
+            double Y = J(smpl_idx, 1);
+            double Z = J(smpl_idx, 2);
+            if (Z <= 1e-6) continue;
+
+            double u = camera.fx * X / Z + camera.cx;
+            double v = camera.fy * (cfg_.flip_y_in_projection ? -Y : Y) / Z + camera.cy;
+
+            double du = u - lm.x;
+            double dv = v - lm.y;
+            err += std::sqrt(du*du + dv*dv);
+            cnt++;
+        }
+        return (cnt > 0) ? (err / cnt) : 1e18;
+    };
+
+    auto InitFirstFrameYawByMultiStart = [&](const std::vector<Landmark2D>& lms,
+                                         double beta_[10],
+                                         double theta_[72],
+                                         double trans_[3],
+                                         OptimizerConfig cfg_base)
+    {
+        // 只跑很少迭代，快速选 yaw basin
+        cfg_base.use_temporal = false;
+        cfg_base.use_temporal_acc = false;
+        cfg_base.max_iter_stage1 = 25;
+        cfg_base.max_iter_stage2 = 0;
+        cfg_base.max_iter_stage3 = 0;
+        cfg_base.print_progress = false;
+
+        // 第一帧：建议先弱化 arm-torso sep，避免把手推到身后
+        if (cfg_base.use_arm_torso_sep) {
+            cfg_base.arm_torso_w_elbow = 6.0;
+            cfg_base.arm_torso_w_wrist = 10.0;
+        }
+
+        // 可选：第一帧先别锁死手（否则更容易走奇怪解）
+         cfg_base.lock_hands = false; // 你现在 lock_hands=true，可以先注释试试
+
+        const double degs[] = {-120,-90,-60,-30,0,30,60,90,120};
+        double best_score = 1e18;
+        double best_theta[72];
+        double best_trans[3];
+
+        for (double d : degs) {
+            double theta_try[72]; std::memcpy(theta_try, theta_, sizeof(theta_try));
+            double trans_try[3];  std::memcpy(trans_try, trans_, sizeof(trans_try));
+            double beta_try[10];  std::memcpy(beta_try,  beta_,  sizeof(beta_try));
+
+            theta_try[1] = d * M_PI / 180.0;
+
+            bool ok = OptimizeSMPL(lms, camera, model, beta_try, theta_try, trans_try, cfg_base);
+            if (!ok) continue;
+
+            double s = ComputeReproj2DScore(lms, beta_try, theta_try, trans_try, cfg_base);
+            if (s < best_score) {
+                best_score = s;
+                std::memcpy(best_theta, theta_try, sizeof(best_theta));
+                std::memcpy(best_trans, trans_try, sizeof(best_trans));
+            }
+        }
+
+        if (best_score < 1e17) {
+            std::memcpy(theta_, best_theta, sizeof(best_theta));
+            std::memcpy(trans_, best_trans, sizeof(best_trans));
+            cfg.trans_z_prior_target = trans_[2];
+            std::cout << "[InitYaw] best reproj=" << best_score
+                    << " px, yaw(rad)=" << theta_[1] << "\n";
+        } else {
+            std::cout << "[InitYaw] failed, keep default yaw\n";
+        }
+    };
+
     int success_count = 0, fail_count = 0;
 
     for (int f = start; f <= end; ++f) {
@@ -317,6 +374,15 @@ void RunOpenPoseSequenceInference(const SmplModel& model,
             fail_count++;
             continue;
         }
+
+        double sep_scale = 0.0;
+        if (f == start) sep_scale = 0.0;
+        else if (f < start + 10) sep_scale = (f - start) / 10.0;   // 0→1
+        else sep_scale = 1.0;
+
+        cfg.use_arm_torso_sep = (sep_scale > 1e-6);
+        cfg.arm_torso_w_elbow = 10.0 * sep_scale;   
+        cfg.arm_torso_w_wrist = 15.0 * sep_scale;
 
         smooth_landmarks_inplace(lms);
 
@@ -354,6 +420,26 @@ void RunOpenPoseSequenceInference(const SmplModel& model,
                 std::memcpy(trans_prev_curr, trans_prev_raw, sizeof(trans_prev_curr));
                 std::memcpy(theta_prev2_curr, theta_prev2_raw, sizeof(theta_prev2_curr));
                 std::memcpy(trans_prev2_curr, trans_prev2_raw, sizeof(trans_prev2_curr));
+                 
+                //init beta for first frame
+                EstimateGlobalTranslationXY(lms, camera, 3.0, trans);
+                cfg.trans_z_prior_target = trans[2];
+
+                InitFirstFrameYawByMultiStart(lms, beta, theta, trans, cfg);
+
+                OptimizerConfig cfg_first = cfg;
+                cfg_first.use_temporal = false;
+                cfg_first.use_temporal_acc = false;
+
+                cfg_first.max_iter_stage1 = 80;
+                cfg_first.max_iter_stage2 = 200;
+                cfg_first.max_iter_stage3 = 120;     
+                cfg_first.lock_hands  = false;
+                cfg_first.lock_wrists = false;
+                cfg_first.use_arm_torso_sep = false; 
+
+                bool ok0 = OptimizeSMPL(lms, camera, model, beta, theta, trans, cfg_first);
+                if (!ok0) { std::cout << "not ok init beta\n";}
             }
 
             // Initialize current frame from transformed previous
@@ -364,13 +450,17 @@ void RunOpenPoseSequenceInference(const SmplModel& model,
 
             // Z prior target = prev frame's Z in current cam space
             cfg.trans_z_prior_target = trans_prev_curr[2];
-        } else {
-            // First frame: 2D-based initialization (already camera space)
-            EstimateGlobalTranslationXY(lms, camera, 3.0, trans);
-            depth_affine[0] = 3.0;
-            depth_affine[1] = trans[2];
-            cfg.trans_z_prior_target = trans[2];
-        }
+    } else {
+        // First frame: 2D init
+        EstimateGlobalTranslationXY(lms, camera, 3.0, trans);
+        cfg.trans_z_prior_target = trans[2];
+
+        InitFirstFrameYawByMultiStart(lms, beta, theta, trans, cfg);
+
+        depth_affine[0] = 3.0;
+        depth_affine[1] = trans[2];
+    }
+
 
         // Damp hands
         {
@@ -391,7 +481,9 @@ void RunOpenPoseSequenceInference(const SmplModel& model,
                 while (df >> op_idx >> depth_val) {
                     if (op_idx < 0 || op_idx >= 25) continue;
                     if (!is_stable_op(op_idx)) continue;
+                    double conf_thr = (f == start) ? 0.20 : 0.35; 
                     double c2d = get_conf(lms, op_idx);
+                    if (c2d < conf_thr) continue;
                     if (c2d < 0.35) continue;
                     int smpl_idx = OPENPOSE_TO_SMPL[op_idx];
                     if (smpl_idx < 0) continue;
@@ -402,6 +494,7 @@ void RunOpenPoseSequenceInference(const SmplModel& model,
 
         if ((int)depth_pts.size() >= 6) {
             cfg.use_depth_affine    = true;
+            if (f == start) cfg.w_depth_affine = 90.0;  
             cfg.w_depth_affine      = 60.0;
             cfg.depth_affine_sign   = 1.0;
             cfg.depth_affine_data   = &depth_pts;

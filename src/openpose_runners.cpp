@@ -57,11 +57,7 @@ void RunOpenPoseInference(const SmplModel& model,
     SaveOBJ("mesh_before_opt.obj", V_init, model.faces);
 
     OptimizerConfig cfg = MakeCfgForOpenPose(gmm_prior);
-
-    // Camera-space Z prior for first frame
-    cfg.use_trans_z_prior = true;
-    cfg.trans_z_prior_target = trans[2];
-    cfg.w_trans_z_prior = 80.0;
+    cfg.trans_z_prior_target = trans[2];  // anchor to initial estimate
 
     // -------- Load Sapiens relative depth and create pairs --------
     std::vector<RelativeDepthPair> relative_depth_pairs;
@@ -102,6 +98,22 @@ void RunOpenPoseInference(const SmplModel& model,
 
 // =========================================================
 // MODE 3: OpenPose SEQUENCE — CAMERA-SPACE OPTIMIZATION
+//
+// Architecture (SOTA approach):
+//   1. ALWAYS optimize in camera space (like SMPLify, SPIN, etc.)
+//   2. Moving camera handling:
+//      - Store prev frame results in their own camera space
+//      - Before optimization: transform prev results to current
+//        camera space using relative camera transform
+//      - This gives correct warm-start AND temporal prior targets
+//   3. Evaluation:
+//      - Transform camera-space results → world space using extrinsics
+//      - Compare with world-space ground truth
+//
+// Why this works and world-space optimization doesn't:
+//   - 2D reprojection directly constrains camera-space XY/Z ratio
+//   - Camera-space Z is directly observable (bounded [0.3, 25])
+//   - World-space Z has no direct 2D constraint → drifts freely
 // =========================================================
 void RunOpenPoseSequenceInference(const SmplModel& model,
                                   const GMMPosePrior* gmm_prior) {
@@ -132,6 +144,7 @@ void RunOpenPoseSequenceInference(const SmplModel& model,
     // Used ONLY for:
     //   (a) Computing relative transform for warm-start
     //   (b) Transforming results to world space for evaluation
+    // NEVER passed into the optimizer.
     // ---------------------------
     std::vector<CameraExtrinsics> cam_poses = LoadCameraPoses(gt_dir + "/cam_poses.txt");
     const bool has_cam_poses = !cam_poses.empty();
@@ -145,6 +158,10 @@ void RunOpenPoseSequenceInference(const SmplModel& model,
     // Evaluation accumulators
     // ---------------------------
     std::vector<double> all_mpjpe, all_pa_mpjpe, all_pve, all_pose_error, all_reproj_2d;
+    std::vector<double> all_mpjpe_rootrel;
+
+    // Camera-space diagnostics (bypass world transform to isolate issues)
+    std::vector<double> all_cam_rootrel, all_cam_pa;
 
     const int start = 70;
     const int end   = 200;
@@ -152,23 +169,11 @@ void RunOpenPoseSequenceInference(const SmplModel& model,
     const int img_h = 1920;
     CameraIntrinsics camera(1962.0f, 1969.0f, 540.0f, 960.0f, img_w, img_h);
 
-    OptimizerConfig cfg = MakeCfgForOpenPose(gmm_prior);
-
-    cfg.use_temporal = true;
-    cfg.w_temp_pose  = 4.0;
-    cfg.w_temp_trans = 6.0;
-    cfg.use_temporal_acc = true;
-    cfg.w_temp_acc_pose  = 2.0;
-    cfg.temporal_body_only = true;
-
-    cfg.use_foot_ground = true;
-    cfg.w_foot_ground   = 140.0;
-    cfg.w_foot_flat     = 80.0;
-    cfg.ground_y        = 0.0;
+    OptimizerConfig cfg = MakeCfgForOpenPoseSequence(gmm_prior);
 
     // Camera-space Z prior — THE key constraint preventing Z drift
-    cfg.use_trans_z_prior = true;
-    cfg.w_trans_z_prior = 120.0;
+    // (target updated per-frame in the loop below)
+    // cfg.w_trans_z_prior already set by builder
 
     // ---------------------------
     // Logger
@@ -258,7 +263,8 @@ void RunOpenPoseSequenceInference(const SmplModel& model,
     };
 
     auto is_stable_op = [&](int op_id)->bool{
-        for (int x : {1, 2, 3, 5, 6, 8}) if (x == op_id) return true;
+        // Torso + arm chain: include wrists (4,7) for depth signal on arms
+        for (int x : {1, 2, 3, 4, 5, 6, 7, 8}) if (x == op_id) return true;
         return false;
     };
 
@@ -421,8 +427,8 @@ void RunOpenPoseSequenceInference(const SmplModel& model,
 
         // Iteration counts
         if (has_prev) {
-            cfg.max_iter_stage1 = 20;
-            cfg.max_iter_stage2 = 40;
+            cfg.max_iter_stage1 = 30;
+            cfg.max_iter_stage2 = 100;   // was 40 — arms need more iters to move
             cfg.max_iter_stage3 = 0;
         } else {
             cfg.max_iter_stage1 = 60;
@@ -532,6 +538,54 @@ void RunOpenPoseSequenceInference(const SmplModel& model,
                 pa_mpjpe_frame = ComputePAMPJPE(J_eval, J_gt);
                 all_mpjpe.push_back(mpjpe_frame);
                 all_pa_mpjpe.push_back(pa_mpjpe_frame);
+
+                // Root-relative MPJPE in world space
+                MatX3dRM J_eval_rr = J_eval, J_gt_rr = J_gt;
+                for (int i = 0; i < J_eval_rr.rows(); ++i)
+                    J_eval_rr.row(i) -= J_eval.row(0);
+                for (int i = 0; i < J_gt_rr.rows(); ++i)
+                    J_gt_rr.row(i) -= J_gt.row(0);
+                double mpjpe_rr = ComputeMPJPE(J_eval_rr, J_gt_rr);
+                all_mpjpe_rootrel.push_back(mpjpe_rr);
+
+                // ---------- First-frame diagnostic ----------
+                if (f == start) {
+                    std::cout << "\n===== FIRST FRAME DIAGNOSTIC =====\n";
+                    std::cout << "eval_in_world=" << eval_in_world << "\n";
+                    std::cout << "Pred pelvis: " << J_eval.row(0) << "\n";
+                    std::cout << "GT   pelvis: " << J_gt.row(0) << "\n";
+                    std::cout << "Offset:      " << (J_eval.row(0)-J_gt.row(0)) << "\n";
+                    std::cout << "Offset norm: " << (J_eval.row(0)-J_gt.row(0)).norm()*1000.0 << " mm\n";
+                    // Bone length check: left hip (1) to left knee (4)
+                    if (J_eval.rows() > 5 && J_gt.rows() > 5) {
+                        double bone_pred = (J_eval.row(1) - J_eval.row(4)).norm();
+                        double bone_gt   = (J_gt.row(1) - J_gt.row(4)).norm();
+                        std::cout << "Pred L-thigh: " << bone_pred*1000.0 << " mm\n";
+                        std::cout << "GT   L-thigh: " << bone_gt*1000.0 << " mm\n";
+                        std::cout << "Scale ratio:  " << bone_pred / std::max(bone_gt, 1e-6) << "\n";
+                    }
+                    // Cam-space pred pelvis
+                    std::cout << "Cam  pelvis: " << J_cam.row(0) << "\n";
+                    std::cout << "trans[2] (depth): " << trans[2] << "\n";
+                    std::cout << "J_eval rows=" << J_eval.rows() << " J_gt rows=" << J_gt.rows() << "\n";
+                    std::cout << "===================================\n\n";
+                }
+            }
+
+            // Camera-space diagnostic: compare J_cam directly with cam-space GT
+            // This bypasses the world transform entirely — if these are much better,
+            // the world transform is wrong.
+            {
+                MatX3dRM J_gt_cam;
+                bool got_cam_gt = gt_data.GetJoints(f, J_gt_cam);
+                if (got_cam_gt && J_gt_cam.rows() == J_cam.rows()) {
+                    // Root-relative in camera space
+                    MatX3dRM Jc_rr = J_cam, Jg_rr = J_gt_cam;
+                    for (int i = 0; i < Jc_rr.rows(); ++i) Jc_rr.row(i) -= J_cam.row(0);
+                    for (int i = 0; i < Jg_rr.rows(); ++i) Jg_rr.row(i) -= J_gt_cam.row(0);
+                    all_cam_rootrel.push_back(ComputeMPJPE(Jc_rr, Jg_rr));
+                    all_cam_pa.push_back(ComputePAMPJPE(J_cam, J_gt_cam));
+                }
             }
 
             // Pose error
@@ -544,7 +598,7 @@ void RunOpenPoseSequenceInference(const SmplModel& model,
                 all_pose_error.push_back(pose_err_frame);
             }
 
-            // 2D reprojection (always camera-space, direct)
+            // 2D reprojection (camera-space, must match optimizer's flip_y)
             double reproj_err = 0.0;
             int reproj_count = 0;
             for (const auto& lm : lms) {
@@ -560,7 +614,8 @@ void RunOpenPoseSequenceInference(const SmplModel& model,
                 if (pz <= 0) continue;
 
                 double u = camera.fx * px / pz + camera.cx;
-                double v = camera.fy * py / pz + camera.cy;
+                // flip_y: optimizer uses -Y for projection, must match here
+                double v = camera.fy * (cfg.flip_y_in_projection ? -py : py) / pz + camera.cy;
                 double err = std::sqrt((u-lm.x)*(u-lm.x) + (v-lm.y)*(v-lm.y));
                 reproj_err += err;
                 reproj_count++;
@@ -598,8 +653,13 @@ void RunOpenPoseSequenceInference(const SmplModel& model,
         };
         std::cout << "\n========== EVALUATION SUMMARY ==========\n"
                   << "  Frames: "      << all_mpjpe.size() << "\n"
-                  << "  MPJPE:    "    << mean(all_mpjpe)*1000.0 << " mm\n"
-                  << "  PA-MPJPE: "    << mean(all_pa_mpjpe)*1000.0 << " mm\n";
+                  << "--- World-space metrics ---\n"
+                  << "  MPJPE:          " << mean(all_mpjpe)*1000.0 << " mm\n"
+                  << "  MPJPE(root-rel):" << mean(all_mpjpe_rootrel)*1000.0 << " mm\n"
+                  << "  PA-MPJPE:       " << mean(all_pa_mpjpe)*1000.0 << " mm\n"
+                  << "--- Camera-space diagnostics ---\n"
+                  << "  Cam root-rel:   " << mean(all_cam_rootrel)*1000.0 << " mm\n"
+                  << "  Cam PA-MPJPE:   " << mean(all_cam_pa)*1000.0 << " mm\n";
         if (mean(all_pose_error)>=0) std::cout << "  Pose Err: " << mean(all_pose_error) << " rad\n";
         if (mean(all_reproj_2d)>=0)  std::cout << "  2D Reproj: " << mean(all_reproj_2d) << " px\n";
         std::cout << "========================================\n";

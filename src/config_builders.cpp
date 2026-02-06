@@ -8,8 +8,8 @@ OptimizerConfig MakeCfgForOpenPose(const GMMPosePrior* gmm_prior) {
     OptimizerConfig cfg;
     cfg.verbose = true;
 
-    cfg.min_confidence = 0.10f;
-    cfg.use_stable_joints_only = true;
+    cfg.min_confidence = 0.25f;
+    cfg.use_stable_joints_only = false;   // use all keypoints for better arm fitting
     cfg.flip_y_in_projection = true;
 
     // GMM
@@ -39,14 +39,14 @@ OptimizerConfig MakeCfgForOpenPose(const GMMPosePrior* gmm_prior) {
 
     // shoulder/collar/wrist/spine
     cfg.use_shoulder_collar_limits = true;
-    cfg.w_collar_limit = 40.0;
-    cfg.collar_amax    = 0.8;
-    cfg.w_shoulder_limit = 60.0;
-    cfg.shoulder_amax    = 1.7;
+    cfg.w_collar_limit = 30.0;
+    cfg.collar_amax    = 1.2;     // was 0.8 — clavicle contributes to arm raise
+    cfg.w_shoulder_limit = 40.0;  // was 60 — softer to allow more range
+    cfg.shoulder_amax    = 2.8;   // was 1.7 (97°) — need ~160° for full lateral raise
 
     cfg.use_wrist_limits = true;
-    cfg.w_wrist_limit = 80.0;
-    cfg.wrist_amax    = 0.6;
+    cfg.w_wrist_limit = 50.0;     // was 80 — softer
+    cfg.wrist_amax    = 1.0;      // was 0.6 — allow more wrist articulation
 
     cfg.use_spine_limits = true;
     cfg.w_spine     = 10.0;
@@ -63,11 +63,16 @@ OptimizerConfig MakeCfgForOpenPose(const GMMPosePrior* gmm_prior) {
     cfg.arm_torso_w_elbow = 20.0;
     cfg.arm_torso_w_wrist = 35.0;
 
-    cfg.lock_wrists = true;
+    // Unlock wrists for arm articulation
+    cfg.lock_wrists = false;
     cfg.lock_hands  = true;
     cfg.lock_feet   = true;
 
-    // foot constraints: enable in sequence after ground_y known
+    // Camera-space Z prior (first frame init)
+    cfg.use_trans_z_prior = true;
+    cfg.w_trans_z_prior = 80.0;
+
+    // foot constraints: disabled by default, enable in sequence after ground_y known
     cfg.use_foot_ground = false;
 
     // solver
@@ -76,6 +81,43 @@ OptimizerConfig MakeCfgForOpenPose(const GMMPosePrior* gmm_prior) {
     cfg.max_iter_stage1 = 60;
     cfg.max_iter_stage2 = 200;
     cfg.max_iter_stage3 = 200;
+
+    return cfg;
+}
+
+OptimizerConfig MakeCfgForOpenPoseSequence(const GMMPosePrior* gmm_prior) {
+    // Start from single-frame config
+    OptimizerConfig cfg = MakeCfgForOpenPose(gmm_prior);
+
+    // ---------- Temporal smoothness ----------
+    cfg.use_temporal = true;
+    cfg.w_temp_pose  = 12.0;
+    cfg.w_temp_trans = 30.0;
+    cfg.use_temporal_acc = true;
+    cfg.w_temp_acc_pose  = 2.0;
+    cfg.temporal_body_only = true;
+
+    // Arm freedom: lower temporal weight on arm chain
+    // collar(13,14), shoulder(16,17), elbow(18,19), wrist(20,21)
+    cfg.temporal_arm_scale = 0.3;
+
+    // Sequence-specific: reduce elbow hinge priors (temporal already regularizes)
+    cfg.w_hinge_perp_elbow  = 8.0;   // was 15 in single-frame
+    cfg.w_hinge_range_elbow = 4.0;   // was 8
+
+    // Reduce arm-torso separation for arm-closing motions
+    cfg.arm_torso_w_elbow = 10.0;    // was 20
+    cfg.arm_torso_w_wrist = 15.0;    // was 35
+
+    // ---------- Foot contact ----------
+    cfg.use_foot_ground = true;
+    cfg.w_foot_ground   = 140.0;
+    cfg.w_foot_flat     = 80.0;
+    cfg.ground_y        = 0.0;
+
+    // ---------- Camera-space Z prior (stronger for sequence) ----------
+    cfg.use_trans_z_prior = true;
+    cfg.w_trans_z_prior = 120.0;
 
     return cfg;
 }

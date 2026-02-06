@@ -207,8 +207,12 @@ struct OptimizerConfig {
     double w_temp_acc_pose = 2.0;
     bool temporal_body_only = true;
 
+    // Per-joint temporal scaling: reduce for arms so they can move faster.
+    // Applies to collar(13,14), shoulder(16,17), elbow(18,19), wrist(20,21).
+    double temporal_arm_scale = 1.0;    // set to 0.2~0.4 for arm freedom
+
     // ---------- Extremity locks ----------
-    bool lock_wrists = true;
+    bool lock_wrists = false;   // NOTE: was true, unlock for arm articulation
     bool lock_hands  = true;
     bool lock_feet   = true;
     int hand_L = 22, hand_R = 23;
@@ -547,6 +551,29 @@ struct TemporalPoseResidual {
     const double* prev; double w; bool body_only;
 };
 
+// Weighted temporal: per-joint weight array for differentiated smoothing
+// (lower weight on arms → faster response to 2D evidence)
+struct TemporalPoseWeightedResidual {
+    TemporalPoseWeightedResidual(const double* prev_, const double* jw24_, bool body_only_)
+        : prev(prev_), body_only(body_only_) {
+        for (int j = 0; j < 24; ++j) jw[j] = jw24_[j];
+    }
+    template <typename T>
+    bool operator()(const T* const theta, T* residuals) const {
+        int k = 0;
+        int start_j = body_only ? 1 : 0;
+        for (int j = start_j; j < 24; ++j) {
+            T w = T(jw[j]);
+            for (int a = 0; a < 3; ++a) {
+                int i = 3*j + a;
+                residuals[k++] = w * (theta[i] - T(prev[i]));
+            }
+        }
+        return true;
+    }
+    const double* prev; double jw[24]; bool body_only;
+};
+
 struct TemporalTransResidual {
     TemporalTransResidual(const double* prev_, double w_) : prev(prev_), w(w_) {}
     template <typename T>
@@ -588,6 +615,28 @@ struct TemporalAccelPoseResidual {
         return true;
     }
     const double* p1; const double* p2; double w; bool body_only;
+};
+
+struct TemporalAccelPoseWeightedResidual {
+    TemporalAccelPoseWeightedResidual(const double* p1_, const double* p2_,
+                                      const double* jw24_, bool body_only_)
+        : p1(p1_), p2(p2_), body_only(body_only_) {
+        for (int j = 0; j < 24; ++j) jw[j] = jw24_[j];
+    }
+    template <typename T>
+    bool operator()(const T* const theta, T* residuals) const {
+        int k = 0;
+        int start_j = body_only ? 1 : 0;
+        for (int j = start_j; j < 24; ++j) {
+            T w = T(jw[j]);
+            for (int a = 0; a < 3; ++a) {
+                int i = 3*j + a;
+                residuals[k++] = w * (theta[i] - T(2)*T(p1[i]) + T(p2[i]));
+            }
+        }
+        return true;
+    }
+    const double* p1; const double* p2; double jw[24]; bool body_only;
 };
 
 struct TemporalDepthAffineResidual {

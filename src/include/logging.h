@@ -195,6 +195,7 @@ inline void DumpOptimizerConfig(std::ostream& os,
     os << "  use_temporal_acc=" << cfg.use_temporal_acc << "\n";
     os << "  w_temp_acc_pose=" << cfg.w_temp_acc_pose << "\n";
     os << "  temporal_body_only=" << cfg.temporal_body_only << "\n";
+    os << "  temporal_arm_scale=" << cfg.temporal_arm_scale << "\n";
 
     os << "\n[Foot Ground]\n";
     os << "  use_foot_ground=" << cfg.use_foot_ground << "\n";

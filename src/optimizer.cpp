@@ -5,6 +5,7 @@
 #include <thread>
 #include <fstream>
 #include <sstream>
+#include <cmath>
 #include <ceres/ceres.h>
 #include <ceres/manifold.h>
 #include <cnpy.h>
@@ -403,6 +404,15 @@ static void AddPosePriorsUnified(ceres::Problem& problem,
     }
 }
 
+// Helper: build per-joint temporal weight array with arm scaling
+static void BuildJointWeights(const OptimizerConfig& cfg, double* jw24) {
+    for (int j = 0; j < 24; ++j) jw24[j] = cfg.w_temp_pose;
+    // Scale arm chain: collar(13,14), shoulder(16,17), elbow(18,19), wrist(20,21)
+    const double s = cfg.temporal_arm_scale;
+    for (int j : {13, 14, 16, 17, 18, 19, 20, 21})
+        jw24[j] = cfg.w_temp_pose * s;
+}
+
 static void AddTemporalPriors(ceres::Problem& problem,
                               const OptimizerConfig& cfg,
                               double* theta, double* trans,
@@ -414,11 +424,22 @@ static void AddTemporalPriors(ceres::Problem& problem,
     if (!cfg.use_temporal) return;
 
     if (theta_prev) {
-        const int dim = cfg.temporal_body_only ? 69 : 72;
-        problem.AddResidualBlock(
-            new ceres::AutoDiffCostFunction<TemporalPoseResidual, ceres::DYNAMIC, 72>(
-                new TemporalPoseResidual(theta_prev, cfg.w_temp_pose, cfg.temporal_body_only), dim),
-            nullptr, theta);
+        // Use per-joint weighted temporal if arm_scale != 1.0
+        if (std::abs(cfg.temporal_arm_scale - 1.0) > 1e-6) {
+            double jw[24];
+            BuildJointWeights(cfg, jw);
+            const int dim = cfg.temporal_body_only ? 69 : 72;
+            problem.AddResidualBlock(
+                new ceres::AutoDiffCostFunction<TemporalPoseWeightedResidual, ceres::DYNAMIC, 72>(
+                    new TemporalPoseWeightedResidual(theta_prev, jw, cfg.temporal_body_only), dim),
+                nullptr, theta);
+        } else {
+            const int dim = cfg.temporal_body_only ? 69 : 72;
+            problem.AddResidualBlock(
+                new ceres::AutoDiffCostFunction<TemporalPoseResidual, ceres::DYNAMIC, 72>(
+                    new TemporalPoseResidual(theta_prev, cfg.w_temp_pose, cfg.temporal_body_only), dim),
+                nullptr, theta);
+        }
 
         problem.AddResidualBlock(
             new ceres::AutoDiffCostFunction<TemporalRootResidual, 3, 72>(
@@ -440,12 +461,26 @@ static void AddTemporalPriors(ceres::Problem& problem,
     }
 
     if (cfg.use_temporal_acc && theta_prev && theta_prev2) {
-        const int dim = cfg.temporal_body_only ? 69 : 72;
-        problem.AddResidualBlock(
-            new ceres::AutoDiffCostFunction<TemporalAccelPoseResidual, ceres::DYNAMIC, 72>(
-                new TemporalAccelPoseResidual(theta_prev, theta_prev2,
-                                             cfg.w_temp_acc_pose, cfg.temporal_body_only), dim),
-            nullptr, theta);
+        if (std::abs(cfg.temporal_arm_scale - 1.0) > 1e-6) {
+            double jw[24];
+            BuildJointWeights(cfg, jw);
+            // Scale acceleration weights too (use sqrt to be slightly less aggressive)
+            for (int j = 0; j < 24; ++j) jw[j] = cfg.w_temp_acc_pose *
+                (jw[j] / std::max(1e-6, cfg.w_temp_pose));
+            const int dim = cfg.temporal_body_only ? 69 : 72;
+            problem.AddResidualBlock(
+                new ceres::AutoDiffCostFunction<TemporalAccelPoseWeightedResidual, ceres::DYNAMIC, 72>(
+                    new TemporalAccelPoseWeightedResidual(theta_prev, theta_prev2,
+                                                          jw, cfg.temporal_body_only), dim),
+                nullptr, theta);
+        } else {
+            const int dim = cfg.temporal_body_only ? 69 : 72;
+            problem.AddResidualBlock(
+                new ceres::AutoDiffCostFunction<TemporalAccelPoseResidual, ceres::DYNAMIC, 72>(
+                    new TemporalAccelPoseResidual(theta_prev, theta_prev2,
+                                                 cfg.w_temp_acc_pose, cfg.temporal_body_only), dim),
+                nullptr, theta);
+        }
     }
 }
 

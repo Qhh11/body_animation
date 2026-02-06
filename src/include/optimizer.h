@@ -245,14 +245,39 @@ extern const int OPENPOSE_TO_SMPL[25];
 
 // Relative camera transform from frame (t-1) to frame (t).
 // P_cam_t = R_rel * P_cam_{t-1} + t_rel
+// Compute relative camera transform from prev to curr frame.
+// Extrinsics are OpenCV convention (Y-down): P_cam = R * P_world + t
+// Our optimizer uses SMPL convention (Y-up):  P_smpl = F * P_cam, F=diag(1,-1,1)
+// So the relative transform in SMPL space is:
+//   R_rel_smpl = F * R_rel_opencv * F
+//   t_rel_smpl = F * t_rel_opencv
+// where F = diag(1,-1,1), F*F = I.
 inline void ComputeRelativeCameraTransform(
     const CameraExtrinsics& ext_prev,
     const CameraExtrinsics& ext_curr,
     Eigen::Matrix3d& R_rel,
-    Eigen::Vector3d& t_rel)
+    Eigen::Vector3d& t_rel,
+    bool smpl_convention = true)
 {
-    R_rel = ext_curr.R * ext_prev.R.transpose();
-    t_rel = ext_curr.t - R_rel * ext_prev.t;
+    // OpenCV-convention relative transform
+    Eigen::Matrix3d R_rel_cv = ext_curr.R * ext_prev.R.transpose();
+    Eigen::Vector3d t_rel_cv = ext_curr.t - R_rel_cv * ext_prev.t;
+
+    if (smpl_convention) {
+        // Conjugate by F = diag(1,-1,1): flip row/col 1 of R, flip Y of t
+        // F * M * F  flips signs of row1 and col1 of M
+        R_rel = R_rel_cv;
+        R_rel.row(1) = -R_rel.row(1);
+        R_rel.col(1) = -R_rel.col(1);
+        // Note: row then col flip = negate (0,1),(1,0),(1,2),(2,1) entries,
+        // keep (1,1) positive (double negation).
+
+        t_rel = t_rel_cv;
+        t_rel(1) = -t_rel(1);
+    } else {
+        R_rel = R_rel_cv;
+        t_rel = t_rel_cv;
+    }
 }
 
 // Transform previous frame's camera-space SMPL params to current camera space.
@@ -297,16 +322,18 @@ inline void TransformPrevParamsToCurrCam(
     trans_out[2] = tc(2);
 }
 
-// Transform camera-space joints to world space for evaluation
 inline void TransformJointsCamToWorld(
     const MatX3dRM& J_cam,
     const CameraExtrinsics& ext,
-    MatX3dRM& J_world)
+    MatX3dRM& J_world,
+    bool flip_y = false)
 {
     const int N = J_cam.rows();
     J_world.resize(N, 3);
     for (int i = 0; i < N; ++i) {
-        Eigen::Vector3d p_cam(J_cam(i,0), J_cam(i,1), J_cam(i,2));
+        Eigen::Vector3d p_cam(J_cam(i,0),
+                              flip_y ? -J_cam(i,1) : J_cam(i,1),
+                              J_cam(i,2));
         Eigen::Vector3d p_world = ext.R.transpose() * (p_cam - ext.t);
         J_world(i,0) = p_world(0);
         J_world(i,1) = p_world(1);
@@ -318,12 +345,15 @@ inline void TransformJointsCamToWorld(
 inline void TransformVerticesCamToWorld(
     const Eigen::Matrix<double, Eigen::Dynamic, 3, Eigen::RowMajor>& V_cam,
     const CameraExtrinsics& ext,
-    Eigen::Matrix<double, Eigen::Dynamic, 3, Eigen::RowMajor>& V_world)
+    Eigen::Matrix<double, Eigen::Dynamic, 3, Eigen::RowMajor>& V_world,
+    bool flip_y = false)
 {
     const int N = V_cam.rows();
     V_world.resize(N, 3);
     for (int i = 0; i < N; ++i) {
-        Eigen::Vector3d p_cam(V_cam(i,0), V_cam(i,1), V_cam(i,2));
+        Eigen::Vector3d p_cam(V_cam(i,0),
+                              flip_y ? -V_cam(i,1) : V_cam(i,1),
+                              V_cam(i,2));
         Eigen::Vector3d p_world = ext.R.transpose() * (p_cam - ext.t);
         V_world(i,0) = p_world(0);
         V_world(i,1) = p_world(1);

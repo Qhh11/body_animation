@@ -297,12 +297,11 @@ void RunOpenPoseSequenceInference(const SmplModel& model,
     };
 
     auto InitFirstFrameYawByMultiStart = [&](const std::vector<Landmark2D>& lms,
-                                         double beta_[10],
-                                         double theta_[72],
-                                         double trans_[3],
-                                         OptimizerConfig cfg_base)
+                                            double beta_[10],
+                                            double theta_[72],
+                                            double trans_[3],
+                                            OptimizerConfig cfg_base)
     {
-        // 只跑很少迭代，快速选 yaw basin
         cfg_base.use_temporal = false;
         cfg_base.use_temporal_acc = false;
         cfg_base.max_iter_stage1 = 25;
@@ -310,48 +309,75 @@ void RunOpenPoseSequenceInference(const SmplModel& model,
         cfg_base.max_iter_stage3 = 0;
         cfg_base.print_progress = false;
 
-        // 第一帧：建议先弱化 arm-torso sep，避免把手推到身后
         if (cfg_base.use_arm_torso_sep) {
             cfg_base.arm_torso_w_elbow = 6.0;
             cfg_base.arm_torso_w_wrist = 10.0;
         }
+        cfg_base.lock_hands = false;
 
-        // 可选：第一帧先别锁死手（否则更容易走奇怪解）
-         cfg_base.lock_hands = false; // 你现在 lock_hands=true，可以先注释试试
-
-        const double degs[] = {-120,-90,-60,-30,0,30,60,90,120};
-        double best_score = 1e18;
-        double best_theta[72];
-        double best_trans[3];
-
-        for (double d : degs) {
+        auto try_one = [&](double yaw_deg,
+                        double& out_score,
+                        double out_theta[72],
+                        double out_trans[3])
+        {
             double theta_try[72]; std::memcpy(theta_try, theta_, sizeof(theta_try));
             double trans_try[3];  std::memcpy(trans_try, trans_, sizeof(trans_try));
             double beta_try[10];  std::memcpy(beta_try,  beta_,  sizeof(beta_try));
 
-            theta_try[1] = d * M_PI / 180.0;
+            theta_try[1] = yaw_deg * M_PI / 180.0;
 
             bool ok = OptimizeSMPL(lms, camera, model, beta_try, theta_try, trans_try, cfg_base);
-            if (!ok) continue;
+            if (!ok) { out_score = 1e18; return; }
 
-            double s = ComputeReproj2DScore(lms, beta_try, theta_try, trans_try, cfg_base);
+            out_score = ComputeReproj2DScore(lms, beta_try, theta_try, trans_try, cfg_base);
+            std::memcpy(out_theta, theta_try, sizeof(theta_try));
+            std::memcpy(out_trans, trans_try, sizeof(trans_try));
+        };
+
+        double best_score = 1e18;
+        double best_theta[72];
+        double best_trans[3];
+        double best_yaw = 0.0;
+
+        // ---- (1) coarse search: step 30° in [-90,90] ----
+        for (double yaw = -90; yaw <= 90; yaw += 30) {
+            double s; double th[72]; double tr[3];
+            try_one(yaw, s, th, tr);
             if (s < best_score) {
-                best_score = s;
-                std::memcpy(best_theta, theta_try, sizeof(best_theta));
-                std::memcpy(best_trans, trans_try, sizeof(best_trans));
+                best_score = s; best_yaw = yaw;
+                std::memcpy(best_theta, th, sizeof(th));
+                std::memcpy(best_trans, tr, sizeof(tr));
             }
         }
 
-        if (best_score < 1e17) {
-            std::memcpy(theta_, best_theta, sizeof(best_theta));
-            std::memcpy(trans_, best_trans, sizeof(best_trans));
+        // ---- (2) fine search around best: ±20° step 5° ----
+        double fine_best_score = best_score;
+        double fine_best_theta[72]; std::memcpy(fine_best_theta, best_theta, sizeof(best_theta));
+        double fine_best_trans[3];  std::memcpy(fine_best_trans, best_trans, sizeof(best_trans));
+        double fine_best_yaw = best_yaw;
+
+        for (double yaw = best_yaw - 20; yaw <= best_yaw + 20; yaw += 5) {
+            double s; double th[72]; double tr[3];
+            try_one(yaw, s, th, tr);
+            if (s < fine_best_score) {
+                fine_best_score = s; fine_best_yaw = yaw;
+                std::memcpy(fine_best_theta, th, sizeof(th));
+                std::memcpy(fine_best_trans, tr, sizeof(tr));
+            }
+        }
+
+        if (fine_best_score < 1e17) {
+            std::memcpy(theta_, fine_best_theta, sizeof(fine_best_theta));
+            std::memcpy(trans_, fine_best_trans, sizeof(fine_best_trans));
             cfg.trans_z_prior_target = trans_[2];
-            std::cout << "[InitYaw] best reproj=" << best_score
-                    << " px, yaw(rad)=" << theta_[1] << "\n";
+            std::cout << "[InitYaw] best reproj=" << fine_best_score
+                    << " px, yaw_deg=" << fine_best_yaw
+                    << " (rad=" << theta_[1] << ")\n";
         } else {
             std::cout << "[InitYaw] failed, keep default yaw\n";
         }
     };
+
 
     int success_count = 0, fail_count = 0;
 
@@ -420,26 +446,6 @@ void RunOpenPoseSequenceInference(const SmplModel& model,
                 std::memcpy(trans_prev_curr, trans_prev_raw, sizeof(trans_prev_curr));
                 std::memcpy(theta_prev2_curr, theta_prev2_raw, sizeof(theta_prev2_curr));
                 std::memcpy(trans_prev2_curr, trans_prev2_raw, sizeof(trans_prev2_curr));
-                 
-                //init beta for first frame
-                EstimateGlobalTranslationXY(lms, camera, 3.0, trans);
-                cfg.trans_z_prior_target = trans[2];
-
-                InitFirstFrameYawByMultiStart(lms, beta, theta, trans, cfg);
-
-                OptimizerConfig cfg_first = cfg;
-                cfg_first.use_temporal = false;
-                cfg_first.use_temporal_acc = false;
-
-                cfg_first.max_iter_stage1 = 80;
-                cfg_first.max_iter_stage2 = 200;
-                cfg_first.max_iter_stage3 = 120;     
-                cfg_first.lock_hands  = false;
-                cfg_first.lock_wrists = false;
-                cfg_first.use_arm_torso_sep = false; 
-
-                bool ok0 = OptimizeSMPL(lms, camera, model, beta, theta, trans, cfg_first);
-                if (!ok0) { std::cout << "not ok init beta\n";}
             }
 
             // Initialize current frame from transformed previous
@@ -461,15 +467,6 @@ void RunOpenPoseSequenceInference(const SmplModel& model,
         depth_affine[1] = trans[2];
     }
 
-
-        // Damp hands
-        {
-            auto damp = [&](int j, double s) {
-                theta[3*j] *= s; theta[3*j+1] *= s; theta[3*j+2] *= s;
-            };
-            damp(20, 0.10);
-            damp(21, 0.10);
-        }
 
         // Load Sapiens depth (stable torso keypoints only)
         std::vector<JointRelDepthData> depth_pts;
@@ -617,7 +614,7 @@ void RunOpenPoseSequenceInference(const SmplModel& model,
 
             MatX3dRM J_eval;
             if (eval_in_world) {
-                TransformJointsCamToWorld(J_cam, cam_poses[f], J_eval);
+                TransformJointsCamToWorld(J_cam, cam_poses[f], J_eval, cfg.flip_y_in_projection);
             } else {
                 J_eval = J_cam;
             }

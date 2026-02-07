@@ -13,6 +13,8 @@
 #include <cstring>
 #include <chrono>
 #include <filesystem>
+#include <unordered_map>
+#include <unordered_set>
 
 #include "smpl_math.h"
 #include "evaluation.h"
@@ -22,7 +24,9 @@
 #include "init_utils.h"
 #include "config_builders.h"
 #include "threedpw_gt.h"
-
+#include "camera_utils.h" 
+#include "multi_hypothesis.h"
+#include "init_utils.h"
 namespace fs = std::filesystem;
 
 namespace app {
@@ -57,36 +61,31 @@ void RunOpenPoseInference(const SmplModel& model,
     SaveOBJ("mesh_before_opt.obj", V_init, model.faces);
 
     OptimizerConfig cfg = MakeCfgForOpenPose(gmm_prior);
-    cfg.trans_z_prior_target = trans[2];  // anchor to initial estimate
+    cfg.trans_z_prior_target = trans[2];
 
-    // -------- Load Sapiens relative depth and create pairs --------
     std::vector<RelativeDepthPair> relative_depth_pairs;
     std::string depth_path = "../../Data/sapiens_depth/courtyard_basketball_01/image_00047_depth.txt";
     std::ifstream depth_file(depth_path);
     if (depth_file.is_open()) {
         std::vector<std::pair<int, double>> kp_depths;
-        int op_idx;
-        double depth_val;
+        int op_idx; double depth_val;
         while (depth_file >> op_idx >> depth_val) {
             int smpl_idx = OPENPOSE_TO_SMPL[op_idx];
             if (smpl_idx >= 0) kp_depths.push_back({smpl_idx, depth_val});
         }
         depth_file.close();
-
         for (size_t i = 0; i < kp_depths.size(); ++i)
             for (size_t j = i + 1; j < kp_depths.size(); ++j)
                 relative_depth_pairs.push_back({kp_depths[i].first, kp_depths[j].first,
                                                 kp_depths[i].second, kp_depths[j].second});
         std::cout << "[Depth] Created " << relative_depth_pairs.size() << " relative depth pairs\n";
     }
-
     if (!relative_depth_pairs.empty()) {
         cfg.use_relative_depth = true;
         cfg.w_relative_depth = 20.0;
         cfg.relative_depth_pairs = &relative_depth_pairs;
     }
 
-    // All optimization in CAMERA SPACE — no extrinsics
     const bool ok = OptimizeSMPL(lms, camera, model, beta, theta, trans, cfg);
     if (!ok) { std::cerr << "OptimizeSMPL failed.\n"; return; }
 
@@ -98,17 +97,28 @@ void RunOpenPoseInference(const SmplModel& model,
 
 
 void RunOpenPoseSequenceInference(const SmplModel& model,
-                                  const GMMPosePrior* gmm_prior) {
+                                  const GMMPosePrior* gmm_prior,
+                                  const std::string& seq_name,
+                                  const std::string& out_dir,
+                                  int start_frame,
+                                  int end_frame) {
     std::cout << "\n=== MODE 3: OpenPose SEQUENCE (Camera-Space) ===\n";
 
-    const std::string seq_dir   = "../../Data/openpose_output/courtyard_bodyScannerMotions_00";
-    const std::string depth_dir = "../../Data/sapiens_depth/courtyard_bodyScannerMotions_00";
-    const std::string gt_dir    = "../../Data/3dpw_gt/courtyard_bodyScannerMotions_00";
-    const std::string out_dir   = "./seq_out_zhengmian3";
+    const std::string seq_dir   = "../../Data/openpose_output/" + seq_name;
+    const std::string depth_dir = "../../Data/sapiens_depth/"    + seq_name;
+    const std::string gt_dir    = "../../Data/3dpw_gt/"          + seq_name;
     fs::create_directories(out_dir);
 
+    const int start = start_frame;
+    const int end   = end_frame;
+
+    if (end < start) {
+        std::cerr << "[Args] invalid range: end < start (" << start << "," << end << ")\n";
+        return;
+    }
+
     // ---------------------------
-    // Load ground truth for evaluation
+    // Load ground truth
     // ---------------------------
     ThreeDPW_GT gt_data;
     bool has_gt = gt_data.LoadFromDir(gt_dir);
@@ -124,10 +134,7 @@ void RunOpenPoseSequenceInference(const SmplModel& model,
     std::vector<CameraExtrinsics> cam_poses = LoadCameraPoses(gt_dir + "/cam_poses.txt");
     const bool has_cam_poses = !cam_poses.empty();
     if (has_cam_poses)
-        std::cout << "[Camera] Loaded " << cam_poses.size()
-                  << " poses (warm-start transform & evaluation only)\n";
-    else
-        std::cout << "[Camera] No camera poses (fixed camera)\n";
+        std::cout << "[Camera] Loaded " << cam_poses.size() << " poses\n";
 
     // ---------------------------
     // Evaluation accumulators
@@ -136,13 +143,12 @@ void RunOpenPoseSequenceInference(const SmplModel& model,
     std::vector<double> all_mpjpe_rootrel;
     std::vector<double> all_cam_rootrel, all_cam_pa;
 
-    const int start = 0;
-    const int end   = 140;
     const int img_w = 1080;
     const int img_h = 1920;
     CameraIntrinsics camera(1962.0f, 1969.0f, 540.0f, 960.0f, img_w, img_h);
 
     OptimizerConfig cfg = MakeCfgForOpenPoseSequence(gmm_prior);
+
     // ---------------------------
     // Logger
     // ---------------------------
@@ -173,7 +179,6 @@ void RunOpenPoseSequenceInference(const SmplModel& model,
     double beta[10]  = {0.0};
     double theta[72] = {0.0};
     double trans[3]  = {0.0, 0.0, 3.0};
-    //theta[1] = M_PI * -0.5;   ENABLE ONLY IF SIDE INIT  
 
     double theta_prev_raw[72]  = {0.0};
     double trans_prev_raw[3]   = {0.0, 0.0, 3.0};
@@ -202,11 +207,19 @@ void RunOpenPoseSequenceInference(const SmplModel& model,
             for (int i=0;i<25;++i){ kp_x[i]=0; kp_y[i]=0; kp_seen[i]=0; }
             kp_ema_init = true;
         }
+        static const std::unordered_set<int> arm_ids = {2,3,4,5,6,7};
+
         for (auto& lm : lms) {
             int id = lm.joint_id;
             if (id < 0 || id >= 25) continue;
             if (lm.confidence < 0.20f) continue;
-            double a = 0.45 + 0.45 * std::min(1.0, std::max(0.0, (double)lm.confidence));
+
+            if (arm_ids.count(id)) {
+                kp_x[id] = lm.x; kp_y[id] = lm.y; kp_seen[id] = 1.0;
+                continue;
+            }
+
+            double a = 0.65 + 0.30 * std::min(1.0, std::max(0.0, (double)lm.confidence));
             if (kp_seen[id] < 0.5) {
                 kp_x[id] = lm.x; kp_y[id] = lm.y; kp_seen[id] = 1.0;
             } else {
@@ -228,8 +241,8 @@ void RunOpenPoseSequenceInference(const SmplModel& model,
         return false;
     };
 
-    auto is_stable_op = [&](int op_id)->bool{
-        // Torso + arm chain: include wrists (4,7) for depth signal on arms
+    // Stable joints for depth: all upper body
+    auto is_stable_op = [&](int op_id) -> bool {
         for (int x : {1, 2, 3, 4, 5, 6, 7, 8}) if (x == op_id) return true;
         return false;
     };
@@ -270,32 +283,27 @@ void RunOpenPoseSequenceInference(const SmplModel& model,
     {
         MatX3dRM J;
         SMPLJointsForward<double>(beta_, theta_, trans_, model, J);
-
-        double err = 0.0;
-        int cnt = 0;
+        double err = 0.0; int cnt = 0;
         for (const auto& lm : lms) {
             if (lm.confidence < cfg_.min_confidence) continue;
             int op_idx = lm.joint_id;
             if (op_idx < 0 || op_idx >= 25) continue;
             int smpl_idx = OPENPOSE_TO_SMPL[op_idx];
             if (smpl_idx < 0 || smpl_idx >= J.rows()) continue;
-
-            double X = J(smpl_idx, 0);
-            double Y = J(smpl_idx, 1);
-            double Z = J(smpl_idx, 2);
+            double X = J(smpl_idx, 0), Y = J(smpl_idx, 1), Z = J(smpl_idx, 2);
             if (Z <= 1e-6) continue;
-
             double u = camera.fx * X / Z + camera.cx;
             double v = camera.fy * (cfg_.flip_y_in_projection ? -Y : Y) / Z + camera.cy;
-
-            double du = u - lm.x;
-            double dv = v - lm.y;
+            double du = u - lm.x, dv = v - lm.y;
             err += std::sqrt(du*du + dv*dv);
             cnt++;
         }
         return (cnt > 0) ? (err / cnt) : 1e18;
     };
 
+    // =====================================================
+    // FIRST-FRAME YAW MULTI-START
+    // =====================================================
     auto InitFirstFrameYawByMultiStart = [&](const std::vector<Landmark2D>& lms,
                                             double beta_[10],
                                             double theta_[72],
@@ -308,38 +316,25 @@ void RunOpenPoseSequenceInference(const SmplModel& model,
         cfg_base.max_iter_stage2 = 0;
         cfg_base.max_iter_stage3 = 0;
         cfg_base.print_progress = false;
-
-        if (cfg_base.use_arm_torso_sep) {
-            cfg_base.arm_torso_w_elbow = 6.0;
-            cfg_base.arm_torso_w_wrist = 10.0;
-        }
         cfg_base.lock_hands = false;
 
-        auto try_one = [&](double yaw_deg,
-                        double& out_score,
-                        double out_theta[72],
-                        double out_trans[3])
+        auto try_one = [&](double yaw_deg, double& out_score,
+                        double out_theta[72], double out_trans[3])
         {
             double theta_try[72]; std::memcpy(theta_try, theta_, sizeof(theta_try));
             double trans_try[3];  std::memcpy(trans_try, trans_, sizeof(trans_try));
             double beta_try[10];  std::memcpy(beta_try,  beta_,  sizeof(beta_try));
-
             theta_try[1] = yaw_deg * M_PI / 180.0;
-
             bool ok = OptimizeSMPL(lms, camera, model, beta_try, theta_try, trans_try, cfg_base);
             if (!ok) { out_score = 1e18; return; }
-
             out_score = ComputeReproj2DScore(lms, beta_try, theta_try, trans_try, cfg_base);
             std::memcpy(out_theta, theta_try, sizeof(theta_try));
             std::memcpy(out_trans, trans_try, sizeof(trans_try));
         };
 
-        double best_score = 1e18;
-        double best_theta[72];
-        double best_trans[3];
-        double best_yaw = 0.0;
+        double best_score = 1e18, best_yaw = 0.0;
+        double best_theta[72], best_trans[3];
 
-        // ---- (1) coarse search: step 30° in [-90,90] ----
         for (double yaw = -90; yaw <= 90; yaw += 30) {
             double s; double th[72]; double tr[3];
             try_one(yaw, s, th, tr);
@@ -349,8 +344,6 @@ void RunOpenPoseSequenceInference(const SmplModel& model,
                 std::memcpy(best_trans, tr, sizeof(tr));
             }
         }
-
-        // ---- (2) fine search around best: ±20° step 5° ----
         double fine_best_score = best_score;
         double fine_best_theta[72]; std::memcpy(fine_best_theta, best_theta, sizeof(best_theta));
         double fine_best_trans[3];  std::memcpy(fine_best_trans, best_trans, sizeof(best_trans));
@@ -373,8 +366,6 @@ void RunOpenPoseSequenceInference(const SmplModel& model,
             std::cout << "[InitYaw] best reproj=" << fine_best_score
                     << " px, yaw_deg=" << fine_best_yaw
                     << " (rad=" << theta_[1] << ")\n";
-        } else {
-            std::cout << "[InitYaw] failed, keep default yaw\n";
         }
     };
 
@@ -394,6 +385,8 @@ void RunOpenPoseSequenceInference(const SmplModel& model,
         cfg.depth_affine_data    = nullptr;
         cfg.depth_affine_params  = nullptr;
         cfg.depth_affine_prev    = nullptr;
+        cfg.use_cross_limb_depth = false;
+        cfg.cross_limb_pairs     = nullptr;
 
         if (!LoadLandmarksFromJSON(json_path, lms)) {
             std::cerr << "[Frame " << f << "] failed to load: " << json_path << "\n";
@@ -401,39 +394,25 @@ void RunOpenPoseSequenceInference(const SmplModel& model,
             continue;
         }
 
-        double sep_scale = 0.0;
-        if (f == start) sep_scale = 0.0;
-        else if (f < start + 10) sep_scale = (f - start) / 10.0;   // 0→1
-        else sep_scale = 1.0;
-
-        cfg.use_arm_torso_sep = (sep_scale > 1e-6);
-        cfg.arm_torso_w_elbow = 10.0 * sep_scale;   
-        cfg.arm_torso_w_wrist = 15.0 * sep_scale;
-
         smooth_landmarks_inplace(lms);
 
         // =====================================================
-        // WARM START — transform prev results to current cam space
+        // WARM START
         // =====================================================
         if (has_prev) {
             if (has_cam_poses &&
                 prev_frame_idx >= 0 && prev_frame_idx < (int)cam_poses.size() &&
                 f < (int)cam_poses.size())
             {
-                // Moving camera: compute relative transform and apply
-                Eigen::Matrix3d R_rel;
-                Eigen::Vector3d t_rel;
+                Eigen::Matrix3d R_rel; Eigen::Vector3d t_rel;
                 ComputeRelativeCameraTransform(cam_poses[prev_frame_idx],
                                                cam_poses[f], R_rel, t_rel);
                 TransformPrevParamsToCurrCam(theta_prev_raw, trans_prev_raw,
                                             R_rel, t_rel,
                                             theta_prev_curr, trans_prev_curr);
-
                 if (has_prev2 && prev2_frame_idx >= 0 &&
-                    prev2_frame_idx < (int)cam_poses.size())
-                {
-                    Eigen::Matrix3d R_rel2;
-                    Eigen::Vector3d t_rel2;
+                    prev2_frame_idx < (int)cam_poses.size()) {
+                    Eigen::Matrix3d R_rel2; Eigen::Vector3d t_rel2;
                     ComputeRelativeCameraTransform(cam_poses[prev2_frame_idx],
                                                    cam_poses[f], R_rel2, t_rel2);
                     TransformPrevParamsToCurrCam(theta_prev2_raw, trans_prev2_raw,
@@ -441,67 +420,113 @@ void RunOpenPoseSequenceInference(const SmplModel& model,
                                                 theta_prev2_curr, trans_prev2_curr);
                 }
             } else {
-                // Fixed camera: straight copy
                 std::memcpy(theta_prev_curr, theta_prev_raw, sizeof(theta_prev_curr));
                 std::memcpy(trans_prev_curr, trans_prev_raw, sizeof(trans_prev_curr));
                 std::memcpy(theta_prev2_curr, theta_prev2_raw, sizeof(theta_prev2_curr));
                 std::memcpy(trans_prev2_curr, trans_prev2_raw, sizeof(trans_prev2_curr));
             }
 
-            // Initialize current frame from transformed previous
             std::memcpy(theta, theta_prev_curr, sizeof(theta));
             std::memcpy(trans, trans_prev_curr, sizeof(trans));
             depth_affine[0] = depth_affine_prev[0];
             depth_affine[1] = depth_affine_prev[1];
-
-            // Z prior target = prev frame's Z in current cam space
             cfg.trans_z_prior_target = trans_prev_curr[2];
-    } else {
-        // First frame: 2D init
-        EstimateGlobalTranslationXY(lms, camera, 3.0, trans);
-        cfg.trans_z_prior_target = trans[2];
+        } else {
+            EstimateGlobalTranslationXY(lms, camera, 3.0, trans);
+            cfg.trans_z_prior_target = trans[2];
+            InitFirstFrameYawByMultiStart(lms, beta, theta, trans, cfg);
+            depth_affine[0] = 3.0;
+            depth_affine[1] = trans[2];
+        }
 
-        InitFirstFrameYawByMultiStart(lms, beta, theta, trans, cfg);
-
-        depth_affine[0] = 3.0;
-        depth_affine[1] = trans[2];
-    }
-
-
-        // Load Sapiens depth (stable torso keypoints only)
+        // =====================================================
+        // LOAD DEPTH with confidence weighting & outlier rejection
+        // =====================================================
         std::vector<JointRelDepthData> depth_pts;
         {
             std::string depth_path = MakeOpenPoseDepthPath(depth_dir, f);
             std::ifstream df(depth_path);
             if (df.is_open()) {
                 int op_idx; double depth_val;
+                std::vector<std::pair<int, double>> all_depths;
+
                 while (df >> op_idx >> depth_val) {
                     if (op_idx < 0 || op_idx >= 25) continue;
                     if (!is_stable_op(op_idx)) continue;
-                    double conf_thr = (f == start) ? 0.20 : 0.35; 
                     double c2d = get_conf(lms, op_idx);
-                    if (c2d < conf_thr) continue;
                     if (c2d < 0.35) continue;
-                    int smpl_idx = OPENPOSE_TO_SMPL[op_idx];
+                    all_depths.push_back({op_idx, depth_val});
+                }
+
+                // Compute median torso depth for outlier detection
+                std::vector<double> torso_depths;
+                for (auto& [oid, dv] : all_depths) {
+                    if (oid == 1 || oid == 8 || oid == 2 || oid == 5)
+                        torso_depths.push_back(dv);
+                }
+                double median_d = 0;
+                if (!torso_depths.empty()) {
+                    std::sort(torso_depths.begin(), torso_depths.end());
+                    median_d = torso_depths[torso_depths.size()/2];
+                }
+
+                for (auto& [oid, dv] : all_depths) {
+                    int smpl_idx = OPENPOSE_TO_SMPL[oid];
                     if (smpl_idx < 0) continue;
-                    depth_pts.push_back({smpl_idx, depth_val, c2d});
+
+                    double c2d = get_conf(lms, oid);
+
+                    // Per-joint depth confidence
+                    bool is_arm = (oid == 3 || oid == 4 || oid == 6 || oid == 7);
+                    double depth_conf = c2d;
+                    if (is_arm) depth_conf *= 0.3;  // Arms: depth unreliable
+
+                    // Outlier rejection
+                    if (median_d > 0 && std::abs(dv - median_d) > 3.0 * std::abs(median_d) + 0.1) {
+                        depth_conf *= 0.1;
+                    }
+
+                    depth_pts.push_back({smpl_idx, dv, depth_conf});
                 }
             }
         }
 
+        // Cross-limb depth pairs
+        std::vector<RelativeDepthPair> cross_limb_pairs;
+        {
+            std::unordered_map<int, double> jdepth;
+            for (auto& dp : depth_pts) jdepth[dp.smpl_joint_idx] = dp.rel_depth;
+            int cross_pairs[][2] = {{20, 21}, {18, 19}, {16, 17}};
+            for (auto& cp : cross_pairs) {
+                if (jdepth.count(cp[0]) && jdepth.count(cp[1]))
+                    cross_limb_pairs.push_back({cp[0], cp[1], jdepth[cp[0]], jdepth[cp[1]]});
+            }
+            int chain_pairs[][2] = {{17, 19}, {19, 21}, {16, 18}, {18, 20}};
+            for (auto& cp : chain_pairs) {
+                if (jdepth.count(cp[0]) && jdepth.count(cp[1]))
+                    cross_limb_pairs.push_back({cp[0], cp[1], jdepth[cp[0]], jdepth[cp[1]]});
+            }
+        }
+
+        // Setup depth affine
         if ((int)depth_pts.size() >= 6) {
             cfg.use_depth_affine    = true;
-            if (f == start) cfg.w_depth_affine = 90.0;  
-            cfg.w_depth_affine      = 60.0;
+            if (f == start) cfg.w_depth_affine = 120.0;
+            else            cfg.w_depth_affine = 90.0;
             cfg.depth_affine_sign   = 1.0;
             cfg.depth_affine_data   = &depth_pts;
             cfg.depth_affine_params = depth_affine;
-
             cfg.use_temporal_depth_affine = has_prev;
             cfg.depth_affine_prev   = has_prev ? depth_affine_prev : nullptr;
-            cfg.w_temp_depth_scale  = 20.0;
-            cfg.w_temp_depth_bias   = 50.0;
+            cfg.w_temp_depth_scale  = 10.0;
+            cfg.w_temp_depth_bias   = 20.0;
             cfg.fix_depth_affine_bias = has_prev;
+        }
+
+        if (!cross_limb_pairs.empty()) {
+            cfg.use_cross_limb_depth = true;
+            cfg.w_cross_limb_depth = 40.0;
+            cfg.cross_limb_pairs = &cross_limb_pairs;
         }
 
         // Foot contact
@@ -514,30 +539,38 @@ void RunOpenPoseSequenceInference(const SmplModel& model,
             if (hasLA) { prev_LA_x=LAx; prev_LA_y=LAy; ankle_prev_valid=true; }
             if (hasRA) { prev_RA_x=RAx; prev_RA_y=RAy; ankle_prev_valid=true; }
         }
-
-        // Iteration counts
-        if (has_prev) {
-            cfg.max_iter_stage1 = 30;
-            cfg.max_iter_stage2 = 100;   // was 40 — arms need more iters to move
-            cfg.max_iter_stage3 = 0;
-        } else {
-            cfg.max_iter_stage1 = 60;
-            cfg.max_iter_stage2 = 120;
-            cfg.max_iter_stage3 = 80;
-        }
+        
 
         // =====================================================
-        // OPTIMIZE — pure camera space, no extrinsics
+        // OPTIMIZE
         // =====================================================
         bool ok = false;
         if (!has_prev) {
+            //initutil::EstimateRootFromKeypoints(lms, camera, theta);
+            initutil::EstimateTransZFromKeypoints(lms, camera, trans);
             ok = OptimizeSMPL(lms, camera, model, beta, theta, trans, cfg);
+            cfg.max_iter_stage3 = 200;
+        } else if (cfg.use_multi_hypothesis) {
+            cfg.max_iter_stage3 = 0;
+            ok = multihyp::RunMultiHypothesisOptimization(
+                lms, camera, model, beta, theta, trans, cfg,
+                theta_prev_curr, trans_prev_curr,
+                has_prev2 ? theta_prev2_curr : nullptr,
+                has_prev2 ? trans_prev2_curr : nullptr,
+                has_prev2,
+                cfg.depth_affine_data ? *cfg.depth_affine_data : std::vector<JointRelDepthData>{},
+                cfg.depth_affine_params);
         } else {
-            // theta_prev_curr / trans_prev_curr are already in current cam space
+            cfg.max_iter_stage3 = 0;
+            multihyp::DepthGuidedZCorrection(
+                model, beta, theta, trans,
+                cfg.depth_affine_data ? *cfg.depth_affine_data : std::vector<JointRelDepthData>{},
+                cfg.depth_affine_params,
+                cfg.multi_hyp_max_z_shift);
             ok = OptimizeSMPLTracked(lms, camera, model, beta, theta, trans, cfg,
-                                     theta_prev_curr, trans_prev_curr,
-                                     has_prev2 ? theta_prev2_curr : nullptr,
-                                     has_prev2 ? trans_prev2_curr : nullptr);
+                                    theta_prev_curr, trans_prev_curr,
+                                    has_prev2 ? theta_prev2_curr : nullptr,
+                                    has_prev2 ? trans_prev2_curr : nullptr);
         }
 
         if (!ok) {
@@ -552,26 +585,24 @@ void RunOpenPoseSequenceInference(const SmplModel& model,
         double pose_err_frame = -1.0;
         double reproj2d_frame = -1.0;
 
-        // Update ground plane estimate (camera space)
+        // Ground plane estimate
         {
             MatX3dRM Jcam;
             SMPLJointsForward<double>(beta, theta, trans, model, Jcam);
             double y_min = 1e9;
             for (int id : {7, 8, 10, 11})
                 if (id < Jcam.rows()) y_min = std::min(y_min, Jcam(id, 1));
-
             if (!ground_init) {
                 ground_y_est = y_min;
                 ground_init = true;
             } else {
-                // Camera-space ground can shift with camera motion; use conservative EMA
                 double alpha = (y_min < ground_y_est) ? 0.5 : 0.02;
                 ground_y_est = alpha * y_min + (1.0 - alpha) * ground_y_est;
             }
             cfg.ground_y = ground_y_est;
         }
 
-        // Save mesh (camera space)
+        // Save mesh
         {
             Eigen::Matrix<double, Eigen::Dynamic, 3, Eigen::RowMajor> V;
             SMPLForward<double>(beta, theta, trans, model, V);
@@ -579,7 +610,7 @@ void RunOpenPoseSequenceInference(const SmplModel& model,
         }
 
         // =====================================================
-        // STORE PREV — keep in this frame's own camera space
+        // STORE PREV
         // =====================================================
         if (has_prev) {
             std::memcpy(theta_prev2_raw, theta_prev_raw, sizeof(theta_prev2_raw));
@@ -595,7 +626,7 @@ void RunOpenPoseSequenceInference(const SmplModel& model,
         depth_affine_prev[0] = depth_affine[0];
         depth_affine_prev[1] = depth_affine[1];
 
-        // Z drift monitor (camera-space Z = trans[2], trivially observable)
+        // Z drift monitor
         static double Z_cam_first = 0.0;
         if (f == start) Z_cam_first = trans[2];
         std::cout << "[F" << f << "] Z_cam=" << std::fixed << std::setprecision(3) << trans[2]
@@ -603,7 +634,7 @@ void RunOpenPoseSequenceInference(const SmplModel& model,
                   << " | scale=" << depth_affine[0] << "\n";
 
         // =====================================================
-        // EVALUATION — transform cam-space → world for GT comparison
+        // EVALUATION
         // =====================================================
         if (has_gt && f < gt_data.num_frames) {
             MatX3dRM J_cam;
@@ -613,13 +644,11 @@ void RunOpenPoseSequenceInference(const SmplModel& model,
                                  && gt_data.has_world_data;
 
             MatX3dRM J_eval;
-            if (eval_in_world) {
+            if (eval_in_world)
                 TransformJointsCamToWorld(J_cam, cam_poses[f], J_eval, cfg.flip_y_in_projection);
-            } else {
+            else
                 J_eval = J_cam;
-            }
 
-            // MPJPE / PA-MPJPE
             MatX3dRM J_gt;
             bool got_gt = eval_in_world ? gt_data.GetJointsWorld(f, J_gt)
                                         : gt_data.GetJoints(f, J_gt);
@@ -629,47 +658,25 @@ void RunOpenPoseSequenceInference(const SmplModel& model,
                 all_mpjpe.push_back(mpjpe_frame);
                 all_pa_mpjpe.push_back(pa_mpjpe_frame);
 
-                // Root-relative MPJPE in world space
                 MatX3dRM J_eval_rr = J_eval, J_gt_rr = J_gt;
-                for (int i = 0; i < J_eval_rr.rows(); ++i)
-                    J_eval_rr.row(i) -= J_eval.row(0);
-                for (int i = 0; i < J_gt_rr.rows(); ++i)
-                    J_gt_rr.row(i) -= J_gt.row(0);
-                double mpjpe_rr = ComputeMPJPE(J_eval_rr, J_gt_rr);
-                all_mpjpe_rootrel.push_back(mpjpe_rr);
+                for (int i = 0; i < J_eval_rr.rows(); ++i) J_eval_rr.row(i) -= J_eval.row(0);
+                for (int i = 0; i < J_gt_rr.rows(); ++i)   J_gt_rr.row(i) -= J_gt.row(0);
+                all_mpjpe_rootrel.push_back(ComputeMPJPE(J_eval_rr, J_gt_rr));
 
-                // ---------- First-frame diagnostic ----------
                 if (f == start) {
-                    std::cout << "\n===== FIRST FRAME DIAGNOSTIC =====\n";
-                    std::cout << "eval_in_world=" << eval_in_world << "\n";
-                    std::cout << "Pred pelvis: " << J_eval.row(0) << "\n";
-                    std::cout << "GT   pelvis: " << J_gt.row(0) << "\n";
-                    std::cout << "Offset:      " << (J_eval.row(0)-J_gt.row(0)) << "\n";
-                    std::cout << "Offset norm: " << (J_eval.row(0)-J_gt.row(0)).norm()*1000.0 << " mm\n";
-                    // Bone length check: left hip (1) to left knee (4)
-                    if (J_eval.rows() > 5 && J_gt.rows() > 5) {
-                        double bone_pred = (J_eval.row(1) - J_eval.row(4)).norm();
-                        double bone_gt   = (J_gt.row(1) - J_gt.row(4)).norm();
-                        std::cout << "Pred L-thigh: " << bone_pred*1000.0 << " mm\n";
-                        std::cout << "GT   L-thigh: " << bone_gt*1000.0 << " mm\n";
-                        std::cout << "Scale ratio:  " << bone_pred / std::max(bone_gt, 1e-6) << "\n";
-                    }
-                    // Cam-space pred pelvis
-                    std::cout << "Cam  pelvis: " << J_cam.row(0) << "\n";
-                    std::cout << "trans[2] (depth): " << trans[2] << "\n";
-                    std::cout << "J_eval rows=" << J_eval.rows() << " J_gt rows=" << J_gt.rows() << "\n";
-                    std::cout << "===================================\n\n";
+                    std::cout << "\n===== FIRST FRAME DIAGNOSTIC =====\n"
+                              << "eval_in_world=" << eval_in_world << "\n"
+                              << "Pred pelvis: " << J_eval.row(0) << "\n"
+                              << "GT   pelvis: " << J_gt.row(0) << "\n"
+                              << "Offset norm: " << (J_eval.row(0)-J_gt.row(0)).norm()*1000.0 << " mm\n"
+                              << "===================================\n\n";
                 }
             }
 
-            // Camera-space diagnostic: compare J_cam directly with cam-space GT
-            // This bypasses the world transform entirely — if these are much better,
-            // the world transform is wrong.
             {
                 MatX3dRM J_gt_cam;
                 bool got_cam_gt = gt_data.GetJoints(f, J_gt_cam);
                 if (got_cam_gt && J_gt_cam.rows() == J_cam.rows()) {
-                    // Root-relative in camera space
                     MatX3dRM Jc_rr = J_cam, Jg_rr = J_gt_cam;
                     for (int i = 0; i < Jc_rr.rows(); ++i) Jc_rr.row(i) -= J_cam.row(0);
                     for (int i = 0; i < Jg_rr.rows(); ++i) Jg_rr.row(i) -= J_gt_cam.row(0);
@@ -678,7 +685,6 @@ void RunOpenPoseSequenceInference(const SmplModel& model,
                 }
             }
 
-            // Pose error
             double theta_gt[72];
             bool got_pose = (eval_in_world && !gt_data.poses_world.empty())
                             ? gt_data.GetPoseWorld(f, theta_gt)
@@ -688,23 +694,16 @@ void RunOpenPoseSequenceInference(const SmplModel& model,
                 all_pose_error.push_back(pose_err_frame);
             }
 
-            // 2D reprojection (camera-space, must match optimizer's flip_y)
-            double reproj_err = 0.0;
-            int reproj_count = 0;
+            double reproj_err = 0.0; int reproj_count = 0;
             for (const auto& lm : lms) {
                 if (lm.confidence < 0.3f) continue;
                 int op_idx = lm.joint_id;
                 if (op_idx < 0 || op_idx >= 25) continue;
                 int smpl_idx = OPENPOSE_TO_SMPL[op_idx];
                 if (smpl_idx < 0 || smpl_idx >= J_cam.rows()) continue;
-
-                double px = J_cam(smpl_idx, 0);
-                double py = J_cam(smpl_idx, 1);
-                double pz = J_cam(smpl_idx, 2);
+                double px = J_cam(smpl_idx, 0), py = J_cam(smpl_idx, 1), pz = J_cam(smpl_idx, 2);
                 if (pz <= 0) continue;
-
                 double u = camera.fx * px / pz + camera.cx;
-                // flip_y: optimizer uses -Y for projection, must match here
                 double v = camera.fy * (cfg.flip_y_in_projection ? -py : py) / pz + camera.cy;
                 double err = std::sqrt((u-lm.x)*(u-lm.x) + (v-lm.y)*(v-lm.y));
                 reproj_err += err;
@@ -716,7 +715,6 @@ void RunOpenPoseSequenceInference(const SmplModel& model,
             }
         }
 
-        // Log
         if (logger_ok) {
             logutil::FrameMetrics fm;
             fm.frame      = f;

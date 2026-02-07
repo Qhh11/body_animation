@@ -180,9 +180,9 @@ inline void DumpOptimizerConfig(std::ostream& os,
     os << "  use_relative_depth=" << cfg.use_relative_depth << " w_relative_depth=" << cfg.w_relative_depth << "\n";
     os << "  use_depth_affine=" << cfg.use_depth_affine << " w_depth_affine=" << cfg.w_depth_affine << "\n";
     os << "  depth_affine_sign=" << cfg.depth_affine_sign << "\n";
+    os << "  fix_depth_affine_bias=" << cfg.fix_depth_affine_bias << "\n";
     os << "  use_temporal_depth_affine=" << cfg.use_temporal_depth_affine << "\n";
     os << "  w_temp_depth_scale=" << cfg.w_temp_depth_scale << " w_temp_depth_bias=" << cfg.w_temp_depth_bias << "\n";
-    os << "  fix_depth_affine_bias=" << cfg.fix_depth_affine_bias << "\n";
 
     os << "\n[Camera-Space Z Prior]\n";
     os << "  use_trans_z_prior=" << cfg.use_trans_z_prior << "\n";
@@ -203,10 +203,31 @@ inline void DumpOptimizerConfig(std::ostream& os,
     os << "  ground_y=" << cfg.ground_y << "\n";
     os << "  foot_contact_L=" << cfg.foot_contact_L << " foot_contact_R=" << cfg.foot_contact_R << "\n";
 
+    os << "\n[Capsule/CrossLimb]\n";
+    os << "  use_capsule_collision=" << cfg.use_capsule_collision << " w=" << cfg.w_capsule_collision << "\n";
+    os << "  use_cross_limb_depth=" << cfg.use_cross_limb_depth << " w=" << cfg.w_cross_limb_depth << "\n";
+
     os << "\n[Solver Iters]\n";
     os << "  max_iter_stage1=" << cfg.max_iter_stage1 << "\n";
     os << "  max_iter_stage2=" << cfg.max_iter_stage2 << "\n";
     os << "  max_iter_stage3=" << cfg.max_iter_stage3 << "\n";
+
+    os << "\n[Graduated Energy]\n";
+    os << "  use_graduated_energy=" << cfg.use_graduated_energy << "\n";
+    os << "  grad_stage1_depth_scale=" << cfg.grad_stage1_depth_scale << "\n";
+    os << "  grad_stage1_prior_scale=" << cfg.grad_stage1_prior_scale << "\n";
+    os << "  grad_stage2_depth_scale=" << cfg.grad_stage2_depth_scale << "\n";
+    os << "  grad_stage2_prior_scale=" << cfg.grad_stage2_prior_scale << "\n";
+
+    os << "\n[Multi-Hypothesis]\n";
+    os << "  use_multi_hypothesis=" << cfg.use_multi_hypothesis << "\n";
+    os << "  multi_hyp_quick_iter_s1=" << cfg.multi_hyp_quick_iter_s1 << "\n";
+    os << "  multi_hyp_quick_iter_s2=" << cfg.multi_hyp_quick_iter_s2 << "\n";
+    os << "  multi_hyp_z_perturb=" << cfg.multi_hyp_z_perturb << "\n";
+    os << "  multi_hyp_max_z_shift=" << cfg.multi_hyp_max_z_shift << "\n";
+    os << "  multi_hyp_w_reproj=" << cfg.multi_hyp_w_reproj << "\n";
+    os << "  multi_hyp_w_depth=" << cfg.multi_hyp_w_depth << "\n";
+    os << "  multi_hyp_w_temporal=" << cfg.multi_hyp_w_temporal << "\n";
 
     os << "====================================================\n";
 }

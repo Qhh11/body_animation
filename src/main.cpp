@@ -2,9 +2,34 @@
 #include <string>
 
 #include "smpl_model.h"
-#include "logging.h"          
+#include "logging.h"
 #include "amass_runners.h"
 #include "openpose_runners.h"
+
+static bool HasFlag(int argc, char** argv, const std::string& flag) {
+    for (int i = 1; i < argc; ++i) if (flag == argv[i]) return true;
+    return false;
+}
+
+static std::string GetArgValue(int argc, char** argv,
+                               const std::string& key,
+                               const std::string& def) {
+    for (int i = 1; i + 1 < argc; ++i) {
+        if (key == argv[i]) return std::string(argv[i + 1]);
+    }
+    return def;
+}
+static int GetArgInt(int argc, char** argv,
+                     const std::string& key,
+                     int def) {
+    for (int i = 1; i + 1 < argc; ++i) {
+        if (key == argv[i]) {
+            try { return std::stoi(argv[i + 1]); }
+            catch (...) { return def; }
+        }
+    }
+    return def;
+}
 
 int main(int argc, char** argv) {
     google::InitGoogleLogging("SMPL_Optimizer");
@@ -15,6 +40,19 @@ int main(int argc, char** argv) {
 
     GMMPosePrior gmm_prior;
     gmm_prior.LoadFromNPZ("../../Data/models/gmm_08.npz");
+
+    if (HasFlag(argc, argv, "--openpose-seq")) {
+        const std::string seq_name = GetArgValue(argc, argv, "--input_seq",
+                                "courtyard_bodyScannerMotions_00");
+        const std::string out_dir  = GetArgValue(argc, argv, "--output_dir",
+                                "./seq_out_motion_2");
+        const int start = GetArgInt(argc, argv, "--start", 70);
+        const int end   = GetArgInt(argc, argv, "--end",   140);
+
+        app::RunOpenPoseSequenceInference(model, &gmm_prior, seq_name, out_dir, start, end);
+        return 0;
+    }
+
 
     if (argc > 1) {
         std::string arg1 = argv[1];
@@ -42,8 +80,5 @@ int main(int argc, char** argv) {
         app::RunAMASSValidation(model, &gmm_prior, arg1, 100, true);
         return 0;
     }
-
-    // default: run OpenPose sequence
-    app::RunOpenPoseSequenceInference(model, &gmm_prior);
     return 0;
 }

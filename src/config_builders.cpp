@@ -26,7 +26,7 @@ OptimizerConfig MakeCfgForOpenPose(const GMMPosePrior* gmm_prior) {
     cfg.use_depth = true;
     cfg.use_depth_affine=true;
     // Hinge/bend
-    cfg.use_hinge_priors = true;
+    cfg.use_hinge_priors = false;
     cfg.use_bend_limits  = true;
     cfg.w_bend           = 0.005;
 
@@ -43,7 +43,7 @@ OptimizerConfig MakeCfgForOpenPose(const GMMPosePrior* gmm_prior) {
     cfg.root_upright_w_stage3 = 10.0;
 
     // Shoulder/collar — wider range for arm movement
-    cfg.use_shoulder_collar_limits = true;
+    cfg.use_shoulder_collar_limits = false;
     cfg.w_collar_limit = 20.0;
     cfg.collar_amax    = 1.4;
     cfg.w_shoulder_limit = 20.0;
@@ -74,16 +74,16 @@ OptimizerConfig MakeCfgForOpenPose(const GMMPosePrior* gmm_prior) {
 
     // Capsule collision: ON
     cfg.use_capsule_collision = true;
-    cfg.w_capsule_collision = 15.0;
+    cfg.w_capsule_collision = 60.0;
 
     // Extremity locks
     cfg.lock_wrists = false;
-    cfg.lock_hands  = false;
+    cfg.lock_hands  = true;
     cfg.lock_feet   = true;
 
     // Camera-space Z prior
     cfg.use_trans_z_prior = true;
-    cfg.w_trans_z_prior = 15.0;
+    cfg.w_trans_z_prior = 60.0;
 
     // Foot: disabled by default, enable per-frame in sequence
     cfg.use_foot_ground = false;
@@ -104,14 +104,14 @@ OptimizerConfig MakeCfgForOpenPoseSequence(const GMMPosePrior* gmm_prior) {
     cfg.use_multi_hypothesis = false;
     // Temporal smoothness
     cfg.use_temporal = true;
-    cfg.w_temp_pose  = 5.0;
-    cfg.w_temp_trans = 8.0;
+    cfg.w_temp_pose  = 8.0;
+    cfg.w_temp_trans = 15.0;
     cfg.use_temporal_acc = true;
     cfg.w_temp_acc_pose = 1.5;
     cfg.temporal_body_only = true;
 
-    cfg.w_hinge_perp_elbow  = 40.0;   
-    cfg.w_hinge_range_elbow = 30.0;  
+    cfg.w_hinge_perp_elbow  = 30.0;   
+    cfg.w_hinge_range_elbow = 10.0;  
 
     cfg.use_neck_head_limits = true;
     cfg.w_neck_limit = 100.0;
@@ -125,10 +125,10 @@ OptimizerConfig MakeCfgForOpenPoseSequence(const GMMPosePrior* gmm_prior) {
     cfg.wrist_amax = 0.8;   
 
     // Arm freedom: much lower temporal weight on arm chain
-    cfg.temporal_arm_scale = 0.01;
+    cfg.temporal_arm_scale = 0.1;
 
     // Cross-limb depth: weight set here, pairs set per-frame in runner
-    cfg.w_cross_limb_depth = 40.0;
+    cfg.w_cross_limb_depth = 160.0;
 
     // Foot contact
     cfg.use_foot_ground = true;
@@ -173,7 +173,7 @@ OptimizerConfig MakeCfgForAMASS(const std::vector<JointDepthData>* depth_gt,
     cfg.root_upright_w_stage2 = 0.5;
     cfg.root_upright_w_stage3 = 0.0;
 
-    cfg.use_shoulder_collar_limits = true;
+    cfg.use_shoulder_collar_limits = false;
     cfg.w_collar_limit = 20.0;
     cfg.collar_amax    = 1.0;
     cfg.w_shoulder_limit = 30.0;

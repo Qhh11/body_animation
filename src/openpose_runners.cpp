@@ -511,8 +511,8 @@ void RunOpenPoseSequenceInference(const SmplModel& model,
         // Setup depth affine
         if ((int)depth_pts.size() >= 6) {
             cfg.use_depth_affine    = true;
-            if (f == start) cfg.w_depth_affine = 120.0;
-            else            cfg.w_depth_affine = 90.0;
+            if (f == start) cfg.w_depth_affine = 400.0;
+            else            cfg.w_depth_affine = 360.0;
             cfg.depth_affine_sign   = 1.0;
             cfg.depth_affine_data   = &depth_pts;
             cfg.depth_affine_params = depth_affine;
@@ -525,7 +525,6 @@ void RunOpenPoseSequenceInference(const SmplModel& model,
 
         if (!cross_limb_pairs.empty()) {
             cfg.use_cross_limb_depth = true;
-            cfg.w_cross_limb_depth = 40.0;
             cfg.cross_limb_pairs = &cross_limb_pairs;
         }
 
@@ -540,7 +539,6 @@ void RunOpenPoseSequenceInference(const SmplModel& model,
             if (hasRA) { prev_RA_x=RAx; prev_RA_y=RAy; ankle_prev_valid=true; }
         }
         
-
         // =====================================================
         // OPTIMIZE
         // =====================================================

@@ -305,8 +305,8 @@ static void AddCapsuleCollisions(
     CapsuleDef R_upper_arm = {17, 19, 0.045};
     CapsuleDef L_forearm   = {18, 20, 0.035};
     CapsuleDef R_forearm   = {19, 21, 0.035};
-    CapsuleDef L_thigh     = {1,  4,  0.065};
-    CapsuleDef R_thigh     = {2,  5,  0.065};
+    CapsuleDef L_thigh = {1, 4, 0.10};  
+    CapsuleDef R_thigh = {2, 5, 0.10};  
     CapsuleDef L_shin      = {4,  7,  0.045};
     CapsuleDef R_shin      = {5,  8,  0.045};
     CapsuleDef Torso_low  = {0,  9,  0.11};
@@ -315,34 +315,31 @@ static void AddCapsuleCollisions(
 
     double w = cfg.w_capsule_collision;
 
-    auto add = [&](const CapsuleDef& a, const CapsuleDef& b) {
+    auto add = [&](const CapsuleDef& a, const CapsuleDef& b, double w_override = 0.0) {
+        double w_use = (w_override > 0.0) ? w_override : w;
         problem.AddResidualBlock(
             new ceres::AutoDiffCostFunction<CapsuleCollisionResidual, 1, 10, 72, 3>(
                 new CapsuleCollisionResidual(a.j1, a.j2, a.radius,
-                                             b.j1, b.j2, b.radius, w, model)),
+                                            b.j1, b.j2, b.radius, w_use, model)),
             nullptr, beta, theta, trans);
     };
+
+    double w_leg = w * 10.0;  // heavy for leg
 
     // Arm vs leg
     add(L_forearm, R_thigh); add(L_forearm, L_thigh);
     add(R_forearm, R_thigh); add(R_forearm, L_thigh);
     add(L_upper_arm, R_thigh); add(R_upper_arm, L_thigh);
 
-    // Leg vs leg
-    add(L_shin, R_shin); add(L_shin, R_thigh);
-    add(R_shin, L_thigh); add(L_thigh, R_thigh);
+    // Leg vs leg 
+    add(L_shin, R_shin, w_leg); add(L_shin, R_thigh, w_leg);
+    add(R_shin, L_thigh, w_leg); add(L_thigh, R_thigh, w_leg);
 
-    // Arm vs torso
-    add(L_forearm, Torso_low);
-    add(R_forearm, Torso_low);
-    add(L_upper_arm, Torso_low);
-    add(R_upper_arm, Torso_low);
-
-    add(L_forearm, Torso_high);
-    add(R_forearm, Torso_high);
-    add(L_upper_arm, Torso_high);
-    add(R_upper_arm, Torso_high);
-
+    // Arm vs torso 
+    add(L_forearm, Torso_low);  add(R_forearm, Torso_low);
+    add(L_upper_arm, Torso_low); add(R_upper_arm, Torso_low);
+    add(L_forearm, Torso_high);  add(R_forearm, Torso_high);
+    add(L_upper_arm, Torso_high); add(R_upper_arm, Torso_high);
 }
 
 // -----------------------------------------

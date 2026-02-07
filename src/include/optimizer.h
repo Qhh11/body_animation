@@ -257,18 +257,6 @@ struct OptimizerConfig {
     double grad_stage2_prior_scale = 0.5;
     // stage 3 = 1.0 (full)
 
-    // ---------- Multi-hypothesis optimization ----------
-    bool use_multi_hypothesis = false;
-    int multi_hyp_quick_iter_s1 = 15;
-    int multi_hyp_quick_iter_s2 = 40;
-    double multi_hyp_z_perturb = 0.3;       // Z perturbation amount (meters)
-    double multi_hyp_max_z_shift = 0.5;     // max depth-guided Z correction
-
-    // Combined score weights for hypothesis selection
-    double multi_hyp_w_reproj  = 1.0;
-    double multi_hyp_w_depth   = 30.0;
-    double multi_hyp_w_temporal = 5.0;
-
     // ---------- speed / solver ----------
     int threads = -1;
     bool print_progress = false;

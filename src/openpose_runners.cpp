@@ -548,16 +548,6 @@ void RunOpenPoseSequenceInference(const SmplModel& model,
             initutil::EstimateTransZFromKeypoints(lms, camera, trans);
             ok = OptimizeSMPL(lms, camera, model, beta, theta, trans, cfg);
             cfg.max_iter_stage3 = 200;
-        } else if (cfg.use_multi_hypothesis) {
-            cfg.max_iter_stage3 = 0;
-            ok = multihyp::RunMultiHypothesisOptimization(
-                lms, camera, model, beta, theta, trans, cfg,
-                theta_prev_curr, trans_prev_curr,
-                has_prev2 ? theta_prev2_curr : nullptr,
-                has_prev2 ? trans_prev2_curr : nullptr,
-                has_prev2,
-                cfg.depth_affine_data ? *cfg.depth_affine_data : std::vector<JointRelDepthData>{},
-                cfg.depth_affine_params);
         } else {
             cfg.max_iter_stage3 = 0;
             multihyp::DepthGuidedZCorrection(

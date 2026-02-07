@@ -39,8 +39,8 @@ OptimizerConfig MakeCfgForOpenPose(const GMMPosePrior* gmm_prior) {
 
     // Root upright
     cfg.use_root_upright = true;
-    cfg.root_upright_w_stage2 = 80.0;
-    cfg.root_upright_w_stage3 = 40.0;
+    cfg.root_upright_w_stage2 = 30.0;
+    cfg.root_upright_w_stage3 = 10.0;
 
     // Shoulder/collar — wider range for arm movement
     cfg.use_shoulder_collar_limits = true;
@@ -83,7 +83,7 @@ OptimizerConfig MakeCfgForOpenPose(const GMMPosePrior* gmm_prior) {
 
     // Camera-space Z prior
     cfg.use_trans_z_prior = true;
-    cfg.w_trans_z_prior = 60.0;
+    cfg.w_trans_z_prior = 30.0;
 
     // Foot: disabled by default, enable per-frame in sequence
     cfg.use_foot_ground = false;
@@ -101,7 +101,6 @@ OptimizerConfig MakeCfgForOpenPoseSequence(const GMMPosePrior* gmm_prior) {
     OptimizerConfig cfg = MakeCfgForOpenPose(gmm_prior);
 
     cfg.use_graduated_energy = true;
-    cfg.use_multi_hypothesis = false;
     // Temporal smoothness
     cfg.use_temporal = true;
     cfg.w_temp_pose  = 8.0;

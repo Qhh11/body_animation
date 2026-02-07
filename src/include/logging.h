@@ -219,16 +219,6 @@ inline void DumpOptimizerConfig(std::ostream& os,
     os << "  grad_stage2_depth_scale=" << cfg.grad_stage2_depth_scale << "\n";
     os << "  grad_stage2_prior_scale=" << cfg.grad_stage2_prior_scale << "\n";
 
-    os << "\n[Multi-Hypothesis]\n";
-    os << "  use_multi_hypothesis=" << cfg.use_multi_hypothesis << "\n";
-    os << "  multi_hyp_quick_iter_s1=" << cfg.multi_hyp_quick_iter_s1 << "\n";
-    os << "  multi_hyp_quick_iter_s2=" << cfg.multi_hyp_quick_iter_s2 << "\n";
-    os << "  multi_hyp_z_perturb=" << cfg.multi_hyp_z_perturb << "\n";
-    os << "  multi_hyp_max_z_shift=" << cfg.multi_hyp_max_z_shift << "\n";
-    os << "  multi_hyp_w_reproj=" << cfg.multi_hyp_w_reproj << "\n";
-    os << "  multi_hyp_w_depth=" << cfg.multi_hyp_w_depth << "\n";
-    os << "  multi_hyp_w_temporal=" << cfg.multi_hyp_w_temporal << "\n";
-
     os << "====================================================\n";
 }
 

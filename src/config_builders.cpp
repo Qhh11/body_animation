@@ -26,7 +26,7 @@ OptimizerConfig MakeCfgForOpenPose(const GMMPosePrior* gmm_prior) {
     cfg.use_depth = true;
     cfg.use_depth_affine=true;
     // Hinge/bend
-    cfg.use_hinge_priors = false;
+    cfg.use_hinge_priors = true;
     cfg.use_bend_limits  = true;
     cfg.w_bend           = 0.005;
 
@@ -39,8 +39,8 @@ OptimizerConfig MakeCfgForOpenPose(const GMMPosePrior* gmm_prior) {
 
     // Root upright
     cfg.use_root_upright = true;
-    cfg.root_upright_w_stage2 = 40.0;
-    cfg.root_upright_w_stage3 = 10.0;
+    cfg.root_upright_w_stage2 = 80.0;
+    cfg.root_upright_w_stage3 = 40.0;
 
     // Shoulder/collar — wider range for arm movement
     cfg.use_shoulder_collar_limits = false;
@@ -50,11 +50,11 @@ OptimizerConfig MakeCfgForOpenPose(const GMMPosePrior* gmm_prior) {
     cfg.shoulder_amax    = 3.0;
 
     cfg.use_wrist_limits = true;
-    cfg.w_wrist_limit = 50.0;
-    cfg.wrist_amax    = 1.0;
+    cfg.w_wrist_limit = 90.0;
+    cfg.wrist_amax    = 0.8;
 
     cfg.use_spine_limits = true;
-    cfg.w_spine     = 10.0;
+    cfg.w_spine     = 20.0;
     cfg.spine_amax  = 1.2;
 
     cfg.use_pelvis_over_ankles = false;

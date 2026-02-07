@@ -155,7 +155,7 @@ struct OptimizerConfig {
 
     // pelvis-over-ankles
     bool use_pelvis_over_ankles = false;
-    double w_pelvis_over_ankles = 10.0;
+    double w_pelvis_over_ankles = 20.0;
 
     // ------------- Arm-torso separation -----------
     bool use_arm_torso_sep = false;

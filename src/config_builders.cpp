@@ -43,10 +43,10 @@ OptimizerConfig MakeCfgForOpenPose(const GMMPosePrior* gmm_prior) {
     cfg.root_upright_w_stage3 = 40.0;
 
     // Shoulder/collar — wider range for arm movement
-    cfg.use_shoulder_collar_limits = false;
-    cfg.w_collar_limit = 20.0;
+    cfg.use_shoulder_collar_limits = true;
+    cfg.w_collar_limit = 30.0;
     cfg.collar_amax    = 1.4;
-    cfg.w_shoulder_limit = 20.0;
+    cfg.w_shoulder_limit = 30.0;
     cfg.shoulder_amax    = 3.0;
 
     cfg.use_wrist_limits = true;
@@ -57,7 +57,7 @@ OptimizerConfig MakeCfgForOpenPose(const GMMPosePrior* gmm_prior) {
     cfg.w_spine     = 20.0;
     cfg.spine_amax  = 1.2;
 
-    cfg.use_pelvis_over_ankles = false;
+    cfg.use_pelvis_over_ankles = true;
 
     // Arm-torso separation: OFF (replaced by capsule collision)
     cfg.use_arm_torso_sep = false;

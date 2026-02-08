@@ -324,7 +324,7 @@ static void AddCapsuleCollisions(
             nullptr, beta, theta, trans);
     };
 
-    double w_leg = w * 10.0;  // heavy for leg
+    double w_leg = w * 6.0;  // heavy for leg
 
     // Arm vs leg
     add(L_forearm, R_thigh); add(L_forearm, L_thigh);

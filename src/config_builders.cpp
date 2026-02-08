@@ -26,7 +26,7 @@ OptimizerConfig MakeCfgForOpenPose(const GMMPosePrior* gmm_prior) {
     cfg.use_depth = true;
     cfg.use_depth_affine=true;
     // Hinge/bend
-    cfg.use_hinge_priors = true;
+    cfg.use_hinge_priors = false;
     cfg.use_bend_limits  = true;
     cfg.w_bend           = 0.005;
 
@@ -43,7 +43,7 @@ OptimizerConfig MakeCfgForOpenPose(const GMMPosePrior* gmm_prior) {
     cfg.root_upright_w_stage3 = 10.0;
 
     // Shoulder/collar — wider range for arm movement
-    cfg.use_shoulder_collar_limits = true;
+    cfg.use_shoulder_collar_limits = false;
     cfg.w_collar_limit = 30.0;
     cfg.collar_amax    = 1.4;
     cfg.w_shoulder_limit = 30.0;
@@ -57,24 +57,11 @@ OptimizerConfig MakeCfgForOpenPose(const GMMPosePrior* gmm_prior) {
     cfg.w_spine     = 20.0;
     cfg.spine_amax  = 1.2;
 
-    cfg.use_pelvis_over_ankles = true;
-
-    // Arm-torso separation: OFF (replaced by capsule collision)
-    cfg.use_arm_torso_sep = false;
-    cfg.arm_torso_seg_a = 0;    // Pelvis
-    cfg.arm_torso_seg_b = 9;    // Spine3
-    cfg.arm_torso_d_elbow = 0.035;
-    cfg.arm_torso_d_wrist = 0.045;
-    cfg.arm_torso_w_elbow = 20.0;
-    cfg.arm_torso_w_wrist = 35.0;
-
-    // Legacy point-to-segment: OFF (replaced by capsule collision)
-    cfg.use_arm_leg_sep = false;
-    cfg.use_leg_leg_sep = false;
+    cfg.use_pelvis_over_ankles = false;
 
     // Capsule collision: ON
     cfg.use_capsule_collision = true;
-    cfg.w_capsule_collision = 60.0;
+    cfg.w_capsule_collision = 80.0;
 
     // Extremity locks
     cfg.lock_wrists = false;

@@ -257,6 +257,8 @@ struct OptimizerConfig {
     double grad_stage2_prior_scale = 0.5;
     // stage 3 = 1.0 (full)
 
+    double multi_hyp_max_z_shift = 0.5;     // max depth-guided Z correction
+
     // ---------- speed / solver ----------
     int threads = -1;
     bool print_progress = false;

@@ -1,19 +1,4 @@
 // multi_hypothesis.h
-// Solves the warm-start local-minimum problem in monocular 2D→3D fitting.
-//
-// Three mechanisms:
-//   1. DepthGuidedZCorrection — cheap pre-optimization Z shift using depth cues
-//   2. ComputeCombinedScore   — multi-term scoring (reproj + depth + temporal)
-//   3. RunMultiHypothesisOptimization — run 2-3 warm-start hypotheses,
-//      quick-evaluate, pick best, then full optimize
-//
-// Usage in openpose_runners.cpp:
-//   #include "multi_hypothesis.h"
-//   ...
-//   // For tracked frames, replace direct OptimizeSMPLTracked call with:
-//   multihyp::RunMultiHypothesisOptimization(lms, camera, model, beta, theta, trans,
-//       cfg, theta_prev_curr, trans_prev_curr, ...);
-//
 #pragma once
 
 #include "optimizer.h"

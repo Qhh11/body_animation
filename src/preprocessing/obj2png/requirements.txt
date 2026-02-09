@@ -1,4 +1,0 @@
-matplotlib
-pyinstaller
-numpy
-ipython

@@ -19,11 +19,10 @@ namespace initutil {
 inline void EstimateRootFromKeypoints(
     const std::vector<Landmark2D>& lms,
     const CameraIntrinsics& camera,
-    double* theta,       // modifies theta[0], theta[1], theta[2]
+    double* theta,      
     float min_conf = 0.3f)
 {
-    // --- Extract key 2D positions ---
-    // OpenPose IDs: 2=RShoulder, 5=LShoulder, 9=RHip, 12=LHip, 1=Neck, 8=MidHip
+   
     struct KP { float x, y, c; bool valid; };
     auto find = [&](int op_id) -> KP {
         for (const auto& lm : lms) {
@@ -33,20 +32,18 @@ inline void EstimateRootFromKeypoints(
         return {0, 0, 0, false};
     };
 
-    KP rsh = find(2);   // Right shoulder
-    KP lsh = find(5);   // Left shoulder
-    KP rhip = find(9);  // Right hip
-    KP lhip = find(12); // Left hip
-    KP neck = find(1);  // Neck
-    KP mhip = find(8);  // Mid hip
+    KP rsh = find(2);   
+    KP lsh = find(5);   
+    KP rhip = find(9);  
+    KP lhip = find(12); 
+    KP neck = find(1);  
+    KP mhip = find(8);  
 
-    // Need at least shoulders
     if (!rsh.valid || !lsh.valid) {
         std::cout << "[InitRoot] Insufficient keypoints, using default orientation\n";
         return;
     }
 
-    // --- Estimate Y rotation (facing direction) ---
     float shoulder_dx = std::abs(rsh.x - lsh.x);
     float shoulder_dy = std::abs(rsh.y - lsh.y);
     float shoulder_width = std::sqrt(shoulder_dx * shoulder_dx + shoulder_dy * shoulder_dy);
@@ -62,16 +59,12 @@ inline void EstimateRootFromKeypoints(
         torso_height = std::sqrt(dx * dx + dy * dy);
     }
 
-    // Ratio: shoulder_width / torso_height
-    // Frontal: ~0.7-1.0, Profile: ~0.1-0.3
     float ratio = 0.5f;
     if (torso_height > 10.0f) {
         ratio = shoulder_width / torso_height;
     }
 
-    // Map ratio to Y rotation angle
-    // ratio ~0.8 → facing camera → angle ~0
-    // ratio ~0.15 → side view → angle ~±π/2
+
     float y_angle = 0.0f;
 
     const float frontal_ratio = 0.65f;  
@@ -80,11 +73,10 @@ inline void EstimateRootFromKeypoints(
     if (ratio < profile_ratio) {
         y_angle = (float)(M_PI * 0.45);
     } else if (ratio < frontal_ratio) {
-        // Linear interpolation
         float t = (ratio - profile_ratio) / (frontal_ratio - profile_ratio);
         y_angle = (float)(M_PI * 0.45) * (1.0f - t);
     } else {
-        y_angle = 0.0f;  // frontal
+        y_angle = 0.0f;  
     }
 
     float sh_mid_x = (rsh.x + lsh.x) * 0.5f;
@@ -99,16 +91,12 @@ inline void EstimateRootFromKeypoints(
     bool shoulders_reversed = (rsh.x > lsh.x);
 
     if (ratio < frontal_ratio) {
-        // Side-ish view: determine direction
         if (shoulders_reversed) {
-            // Person's right shoulder is to the right in image → facing right
             y_angle = -y_angle;
         } else {
-            // Check the offset
             if (offset > 5.0f) {
-                y_angle = -y_angle;  // facing left in image → positive Y rotation
+                y_angle = -y_angle; 
             }
-            // else: default positive (facing right in image)
         }
     }
 

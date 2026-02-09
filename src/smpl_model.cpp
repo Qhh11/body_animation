@@ -10,7 +10,6 @@ static void Require(bool cond, const std::string& msg) {
     if (!cond) throw std::runtime_error(msg);
 }
 
-// cnpy loads C-order contiguous data.
 template <typename T>
 static Eigen::Matrix<T, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>
 LoadMatRowMajor(const cnpy::NpyArray& arr, int rows, int cols) {
@@ -20,10 +19,8 @@ LoadMatRowMajor(const cnpy::NpyArray& arr, int rows, int cols) {
 
     const T* p = arr.data<T>();
 
-    // IMPORTANT: cnpy does NOT reorder. Respect fortran_order in the file.
     if (arr.fortran_order) {
         Eigen::Map<const Eigen::Matrix<T, Eigen::Dynamic, Eigen::Dynamic, Eigen::ColMajor>> M(p, rows, cols);
-        // Return type is RowMajor, so this copies into correct layout.
         return Eigen::Matrix<T, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>(M);
     } else {
         Eigen::Map<const Eigen::Matrix<T, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>> M(p, rows, cols);
@@ -142,7 +139,6 @@ LoadKintreeInt(const cnpy::NpyArray& arr) {
 }
 
 
-// sanity check: pick which row is "parent row"
 static int DetectParentRow(const Eigen::Matrix<int,2,Eigen::Dynamic,Eigen::RowMajor>& kt) {
     int J = (int)kt.cols();
 
@@ -150,7 +146,6 @@ static int DetectParentRow(const Eigen::Matrix<int,2,Eigen::Dynamic,Eigen::RowMa
         int ok = 0;
         for (int i = 1; i < J; ++i) {
             int p = kt(r,i);
-            // parent should be in [-1, J-1], usually < i in a tree
             if (p >= -1 && p < J) ok++;
         }
         return ok;
@@ -193,12 +188,10 @@ void SmplModel::BuildJointShapeCache(int num_beta) {
             const int v = vw.first;
             const double w = vw.second;
 
-            // J_template = sum_v w * v_template[v]
             J_template_3d(j,0) += w * v_template(v,0);
             J_template_3d(j,1) += w * v_template(v,1);
             J_template_3d(j,2) += w * v_template(v,2);
 
-            // J_shapedirs = sum_v w * shapedirs[v]
             for (int k = 0; k < num_beta; ++k) {
                 J_shapedirs_3d(j*3 + 0, k) += w * shapedirs(v*3 + 0, k);
                 J_shapedirs_3d(j*3 + 1, k) += w * shapedirs(v*3 + 1, k);
@@ -233,7 +226,7 @@ bool SmplModel::LoadFromNPZ(const std::string& npz_path) {
             faces = LoadFacesInt(a);
         }
 
-        // J_regressor: J x N  (some npz store as sparse; yours print 24x6890 so dense OK)
+        // J_regressor: J x N  (
         {
             auto& a = npz.at("J_regressor");
             Require(a.shape.size() == 2, "J_regressor must be 2D");
@@ -260,8 +253,7 @@ bool SmplModel::LoadFromNPZ(const std::string& npz_path) {
             shapedirs = LoadMatRowMajor<double>(a, N*3, B);
         }
 
-        // posedirs: (N*3) x ((J-1)*9)  (yours shows 20670x93, if J=24 then (23*9)=207; BUT STAR posedirs may be 93)
-        // We load whatever it provides; forward will gate usage if dimensions don't match.
+        // posedirs: (N*3) x ((J-1)*9)  
         {
             auto& a = npz.at("posedirs");
             Require(a.shape.size() == 2, "posedirs must be 2D");
@@ -274,16 +266,14 @@ bool SmplModel::LoadFromNPZ(const std::string& npz_path) {
         {
             auto& a = npz.at("kintree_table");
             kintree_table = LoadKintreeInt(a);
-
             int prow = DetectParentRow(kintree_table);
-            // normalize: ensure parent row is row0
             if (prow == 1) {
                 auto tmp = kintree_table;
                 kintree_table.row(0) = tmp.row(1);
                 kintree_table.row(1) = tmp.row(0);
             }
 
-            // strict validation
+            // validation
             for (int i = 1; i < J; ++i) {
                 int p = kintree_table(0,i);
                 if (!(p >= -1 && p < J)) {
@@ -293,17 +283,6 @@ bool SmplModel::LoadFromNPZ(const std::string& npz_path) {
                 }
             }
         }
-
-        /*for (int j = 0; j < J_regressor.rows(); ++j) {  //only for debug
-            int nnz = 0;
-            double sum = 0.0;
-            for (int v = 0; v < J_regressor.cols(); ++v) {
-                double w = J_regressor(j, v);
-                sum += w;
-                if (std::abs(w) > 1e-12) nnz++;
-            }
-            std::cout << "J_reg row " << j << ": nnz=" << nnz << " sum=" << sum << "\n";
-        }*/
 
         std::cout << "  - Faces: " << faces.rows() << "\n";
         std::cout << "[SMPL] Load Success!\n";

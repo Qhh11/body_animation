@@ -17,9 +17,9 @@ inline void DepthGuidedZCorrection(
     const SmplModel& model,
     const double* beta,
     const double* theta,
-    double* trans,                               // modified in-place
+    double* trans,                               
     const std::vector<JointRelDepthData>& depth_pts,
-    const double* depth_affine,                  // [scale, bias]
+    const double* depth_affine,                 
     double max_z_shift = 0.5,
     double min_confidence = 0.3)
 {

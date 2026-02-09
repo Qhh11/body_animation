@@ -45,11 +45,10 @@ struct JointDepthData {
     double depth_z;
 };
 
-// Relative depth observation (arbitrary scale)
 struct JointRelDepthData {
     int smpl_joint_idx;
     double rel_depth;
-    double weight; // usually confidence (0..1)
+    double weight; 
 };
 
 // Forward declaration
@@ -59,11 +58,11 @@ struct RelativeDepthPair;
 // GMM Pose Prior (from SMPLify)
 // ------------------------------
 struct GMMPosePrior {
-    static constexpr int K = 8;    // number of Gaussian components
-    static constexpr int D = 69;   // pose dimension (excluding root)
+    static constexpr int K = 8;    
+    static constexpr int D = 69;   
 
-    Eigen::Matrix<double, K, 1> weights;                    // (K,)
-    Eigen::Matrix<double, K, D, Eigen::RowMajor> means;     // (K, D)
+    Eigen::Matrix<double, K, 1> weights;                   
+    Eigen::Matrix<double, K, D, Eigen::RowMajor> means;    
     std::array<Eigen::Matrix<double, D, D, Eigen::RowMajor>, K> prec_choleskys;
 
     bool loaded = false;
@@ -105,7 +104,6 @@ struct OptimizerConfig {
     double w_temp_depth_bias  = 200.0;
     const double* depth_affine_prev = nullptr;
 
-    // If true, fix the bias parameter (don't optimize it after first frame)
     bool fix_depth_affine_bias = false;
 
     // ---------- Root upright regularizer ----------
@@ -134,7 +132,7 @@ struct OptimizerConfig {
     // ---------- Shoulder / Collar / Wrist / Spine soft limits ----------
     bool use_spine_limits = true;
     double w_spine = 10.0;
-    double spine_amax = 1.2;        // symmetric overall angle limit
+    double spine_amax = 1.2;      
     int spine_j1 = 3;
     int spine_j2 = 6;
     int spine_j3 = 9;
@@ -183,7 +181,7 @@ struct OptimizerConfig {
     double w_temp_acc_pose = 1.5;
     bool temporal_body_only = true;
 
-    // independent root-orientation temporal weight (stronger than w_temp_pose)
+    // independent root-orientation temporal weight 
     double w_temp_root_orient = 0.0;
 
     // root flip clamp threshold (degrees)
@@ -226,6 +224,7 @@ struct OptimizerConfig {
     // ---------- Capsule collision / separation ----------
     bool use_capsule_collision = false;
     double w_capsule_collision = 200.0;
+    double capsule_unit_scale = 0.0; // 0 = auto
     bool use_arm_leg_sep = false;
     bool use_leg_leg_sep = false;
 
@@ -237,7 +236,7 @@ struct OptimizerConfig {
     // ---------- Translation Z prior ----------
     bool use_trans_z_prior = false;
     double w_trans_z_prior = 80.0;
-    double trans_z_prior_target = 3.0;   // target Z value for the prior
+    double trans_z_prior_target = 3.0;   
 
     // ---------- Neck / Head soft limits ----------
     bool use_neck_head_limits = false;
@@ -249,14 +248,9 @@ struct OptimizerConfig {
     // ---------- Temporal arm scale ----------
     double temporal_arm_scale = 0.2;
 
-    // ---------- Graduated energy schedule ----------
-    // Scale factors for depth/prior weights per stage (1.0 = full weight)
-    // Stage 1: mostly reproj, light depth → avoids fighting bad Z init
-    // Stage 2: balanced → depth starts pulling
-    // Stage 3: full weights → final 3D refinement
     bool use_graduated_energy = false;
-    double grad_stage1_depth_scale = 0.1;   // scale for w_depth_affine, w_depth, w_relative_depth
-    double grad_stage1_prior_scale = 0.2;   // scale for w_trans_z_prior, w_cross_limb_depth
+    double grad_stage1_depth_scale = 0.1;  
+    double grad_stage1_prior_scale = 0.2;  
     double grad_stage2_depth_scale = 0.5;
     double grad_stage2_prior_scale = 0.5;
     // stage 3 = 1.0 (full)
@@ -272,10 +266,6 @@ struct OptimizerConfig {
     int max_iter_stage3 = 200;
 };
 
-// ------------------------------
-// OpenPose -> SMPL mapping
-// declare here, define ONCE in optimizer.cpp
-// ------------------------------
 extern const int OPENPOSE_TO_SMPL[25];
 
 // ============================================================
@@ -497,7 +487,7 @@ struct ShoulderBackwardPenalty {
 
         auto backward_pen = [&](T val) -> T {
           
-            T back_amount = -val;  // positive when arm is behind
+            T back_amount = -val; 
             T over = back_amount - T(max_backward_);
             T pos = (over + ceres::abs(over)) * T(0.5);  
             return T(w_) * pos;
@@ -907,10 +897,6 @@ struct ArmInFrontOfTorsoResidual {
     double w;
     const SmplModel& model;
 
-    // Use body-local forward direction, not camera Z
-    // forward = cross(L_shoulder - R_shoulder, neck - pelvis), normalized
-    // penalize: dot(arm - torso_center, forward) < -margin
-
     ArmInFrontOfTorsoResidual(int aj, double margin_, double w_,
                                const SmplModel& m)
         : arm_joint(aj), margin(margin_), w(w_), model(m) {}
@@ -1020,7 +1006,7 @@ struct CapsuleCollisionResidual {
         T penetration = sum_r - dist;
 
         if (penetration > T(0)) {
-            residuals[0] = T(w) * penetration * penetration;
+            residuals[0] = ceres::sqrt(T(w)) * penetration; 
         } else {
             residuals[0] = T(0);
         }

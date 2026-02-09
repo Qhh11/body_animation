@@ -31,14 +31,14 @@ struct FrameResult {
     double depth_affine[2] = {3.0, 3.0};
 
     // Quality metrics
-    double reproj_px      = 1e18;   // mean 2D reprojection error (pixels)
-    double pose_delta_rad = 0.0;    // total angular change from previous frame
-    double trans_delta_m  = 0.0;    // translation change from previous (meters)
-    double root_delta_rad = 0.0;    // root orientation change from previous
+    double reproj_px      = 1e18;   
+    double pose_delta_rad = 0.0;    
+    double trans_delta_m  = 0.0;   
+    double root_delta_rad = 0.0;   
 
     bool solver_ok   = false;
-    bool rejected    = false;       // set by quality filter
-    bool interpolated = false;      // set by gap-fill pass
+    bool rejected    = false;     
+    bool interpolated = false;     
 
     // 2D observation quality
     double mean_confidence = 0.0;
@@ -78,15 +78,12 @@ inline void ComputeFrameDeltas(std::vector<FrameResult>& results) {
     }
 }
 
-// ============================================================
-// Mark bad frames based on physically implausible motion
-// ============================================================
 struct QualityThresholds {
-    double max_pose_delta   = 1.0;   // rad total body change per frame
-    double max_root_delta   = 0.8;   // rad root orientation change per frame
-    double max_trans_delta  = 0.4;   // meters translation per frame
-    double max_reproj_px    = 32.0;  // pixels mean reprojection error
-    int    min_visible_kps  = 8;     // minimum visible keypoints
+    double max_pose_delta   = 1.0; 
+    double max_root_delta   = 0.8;  
+    double max_trans_delta  = 0.4;  
+    double max_reproj_px    = 35.0; 
+    int    min_visible_kps  = 8;   
 };
 
 inline int MarkBadFrames(std::vector<FrameResult>& results,
@@ -110,24 +107,18 @@ inline int MarkBadFrames(std::vector<FrameResult>& results,
             continue;
         }
 
-        // Skip delta checks for first frame
         if (i == 0) continue;
 
-        // Physics-based rejection: jumps too large for one frame
         bool jumped = false;
         if (fr.pose_delta_rad > thres.max_pose_delta) jumped = true;
         if (fr.root_delta_rad > thres.max_root_delta) jumped = true;
         if (fr.trans_delta_m  > thres.max_trans_delta) jumped = true;
 
-        // Additional heuristic: if reprojection is bad AND there's a jump,
-        // almost certainly a bad local minimum
         if (jumped && fr.reproj_px > thres.max_reproj_px * 0.5) {
             fr.rejected = true;
             bad_count++;
             continue;
         }
-
-        // Pure jump rejection (even if reproj is ok, physics says no)
         if (fr.pose_delta_rad > thres.max_pose_delta * 1.5 ||
             fr.root_delta_rad > thres.max_root_delta * 1.5 ||
             fr.trans_delta_m  > thres.max_trans_delta * 1.5) {
@@ -138,9 +129,6 @@ inline int MarkBadFrames(std::vector<FrameResult>& results,
     return bad_count;
 }
 
-// ============================================================
-// SLERP for axis-angle root orientation
-// ============================================================
 inline void SlerpAxisAngle(const double aa_a[3], const double aa_b[3],
                            double t, double out[3])
 {
@@ -177,53 +165,40 @@ inline void SlerpAxisAngle(const double aa_a[3], const double aa_b[3],
     out[2] = result(2);
 }
 
-// ============================================================
-// Bidirectional gap-fill: interpolate rejected frames
-// from nearest good neighbors
-// ============================================================
+
 inline int InterpolateBadFrames(std::vector<FrameResult>& results) {
     int filled = 0;
 
     for (size_t i = 0; i < results.size(); ++i) {
         if (!results[i].rejected) continue;
 
-        // Find nearest good frame before
         int prev_good = -1;
         for (int j = (int)i - 1; j >= 0; --j) {
             if (!results[j].rejected) { prev_good = j; break; }
         }
-
-        // Find nearest good frame after
         int next_good = -1;
         for (int j = (int)i + 1; j < (int)results.size(); ++j) {
             if (!results[j].rejected) { next_good = j; break; }
         }
 
         if (prev_good >= 0 && next_good >= 0) {
-            // Bidirectional interpolation
             double t = (double)(i - prev_good) / (double)(next_good - prev_good);
 
-            // SLERP for root orientation (theta[0:3])
             SlerpAxisAngle(results[prev_good].theta,
                            results[next_good].theta,
                            t, results[i].theta);
 
-            // LERP for body pose (theta[3:72])
             for (int k = 3; k < 72; ++k) {
                 results[i].theta[k] = (1.0 - t) * results[prev_good].theta[k]
                                      + t * results[next_good].theta[k];
             }
-
-            // LERP for translation
             for (int k = 0; k < 3; ++k) {
                 results[i].trans[k] = (1.0 - t) * results[prev_good].trans[k]
                                      + t * results[next_good].trans[k];
             }
 
-            // Copy beta from previous good frame
             std::memcpy(results[i].beta, results[prev_good].beta, sizeof(double) * 10);
 
-            // Interpolate depth affine
             for (int k = 0; k < 2; ++k) {
                 results[i].depth_affine[k] = (1.0 - t) * results[prev_good].depth_affine[k]
                                             + t * results[next_good].depth_affine[k];
@@ -233,7 +208,6 @@ inline int InterpolateBadFrames(std::vector<FrameResult>& results) {
             filled++;
 
         } else if (prev_good >= 0) {
-            // Only have past — copy forward
             std::memcpy(results[i].theta, results[prev_good].theta, 72 * sizeof(double));
             std::memcpy(results[i].trans, results[prev_good].trans, 3 * sizeof(double));
             std::memcpy(results[i].beta,  results[prev_good].beta,  10 * sizeof(double));
@@ -242,7 +216,6 @@ inline int InterpolateBadFrames(std::vector<FrameResult>& results) {
             filled++;
 
         } else if (next_good >= 0) {
-            // Only have future — copy backward
             std::memcpy(results[i].theta, results[next_good].theta, 72 * sizeof(double));
             std::memcpy(results[i].trans, results[next_good].trans, 3 * sizeof(double));
             std::memcpy(results[i].beta,  results[next_good].beta,  10 * sizeof(double));
@@ -250,14 +223,12 @@ inline int InterpolateBadFrames(std::vector<FrameResult>& results) {
             results[i].interpolated = true;
             filled++;
         }
-        // else: no good neighbors at all, leave as-is
+       
     }
     return filled;
 }
 
-// ============================================================
-// 1D Gaussian smoothing kernel
-// ============================================================
+
 inline void GaussianSmooth1D(std::vector<double>& signal, double sigma,
                              const std::vector<bool>* mask = nullptr)
 {
@@ -288,10 +259,7 @@ inline void GaussianSmooth1D(std::vector<double>& signal, double sigma,
     signal = out;
 }
 
-// ============================================================
-// Smooth root orientation in rotation-matrix space
-// (averaging axis-angle directly is wrong for large angles)
-// ============================================================
+
 inline void SmoothRootOrientation(std::vector<FrameResult>& results, double sigma) {
     if (results.size() < 3 || sigma < 0.3) return;
 
@@ -304,11 +272,9 @@ inline void SmoothRootOrientation(std::vector<FrameResult>& results, double sigm
     }
     for (auto& v : kernel) v /= sum;
 
-    // Store smoothed roots
     std::vector<std::array<double,3>> smoothed(results.size());
 
     for (size_t i = 0; i < results.size(); ++i) {
-        // Weighted average in tangent space around frame i's rotation
         Eigen::Vector3d aa_i(results[i].theta[0], results[i].theta[1], results[i].theta[2]);
         double ang_i = aa_i.norm();
         Eigen::Matrix3d R_i = (ang_i > 1e-8)
@@ -329,7 +295,6 @@ inline void SmoothRootOrientation(std::vector<FrameResult>& results, double sigm
                 ? Eigen::AngleAxisd(ang_j, aa_j / ang_j).toRotationMatrix()
                 : Eigen::Matrix3d::Identity();
 
-            // log(R_i^T * R_j) — tangent vector at R_i
             Eigen::Matrix3d R_diff = R_i_inv * R_j;
             Eigen::AngleAxisd aa_diff(R_diff);
             Eigen::Vector3d log_diff = aa_diff.axis() * aa_diff.angle();
@@ -340,7 +305,6 @@ inline void SmoothRootOrientation(std::vector<FrameResult>& results, double sigm
 
         if (wsum > 1e-12) log_sum /= wsum;
 
-        // Reconstruct: R_smooth = R_i * exp(log_mean)
         double log_ang = log_sum.norm();
         Eigen::Matrix3d R_smooth;
         if (log_ang < 1e-10) {
@@ -362,15 +326,13 @@ inline void SmoothRootOrientation(std::vector<FrameResult>& results, double sigm
     }
 }
 
-// ============================================================
-// Per-DOF Gaussian smoothing with arm-aware sigma
-// ============================================================
+
 struct SmoothConfig {
-    double sigma_body = 2.0;       // body joints
-    double sigma_arms = 1.0;       // arm joints (faster motion)
-    double sigma_root = 1.5;       // root orientation (special SLERP)
-    double sigma_trans = 1.5;      // translation
-    bool   smooth_root_special = true;  // use rotation-space smoothing for root
+    double sigma_body = 2.0;     
+    double sigma_arms = 1.0;      
+    double sigma_root = 1.5;     
+    double sigma_trans = 1.5;    
+    bool   smooth_root_special = true; 
 };
 
 inline void SmoothAllParameters(std::vector<FrameResult>& results,
@@ -380,8 +342,6 @@ inline void SmoothAllParameters(std::vector<FrameResult>& results,
 
     const int N = (int)results.size();
 
-    // Build mask: only smooth through non-rejected OR interpolated frames
-    // (all frames at this point should be valid after interpolation)
     std::vector<bool> valid(N, true);
 
     auto is_arm_joint = [](int j) -> bool {
@@ -390,12 +350,10 @@ inline void SmoothAllParameters(std::vector<FrameResult>& results,
                j == 22 || j == 23;
     };
 
-    // 1. Smooth root orientation in SO(3) space
     if (scfg.smooth_root_special) {
         SmoothRootOrientation(results, scfg.sigma_root);
     }
 
-    // 2. Smooth body pose per-DOF
     for (int dof = 3; dof < 72; ++dof) {
         int joint = dof / 3;
         double sigma = is_arm_joint(joint) ? scfg.sigma_arms : scfg.sigma_body;
@@ -408,7 +366,6 @@ inline void SmoothAllParameters(std::vector<FrameResult>& results,
         for (int i = 0; i < N; ++i) results[i].theta[dof] = traj[i];
     }
 
-    // 3. Smooth translation
     for (int dim = 0; dim < 3; ++dim) {
         std::vector<double> traj(N);
         for (int i = 0; i < N; ++i) traj[i] = results[i].trans[dim];
@@ -419,9 +376,7 @@ inline void SmoothAllParameters(std::vector<FrameResult>& results,
     }
 }
 
-// ============================================================
-// Full post-processing pipeline
-// ============================================================
+
 struct PostProcessStats {
     int total_frames    = 0;
     int solver_failed   = 0;
@@ -437,28 +392,22 @@ inline PostProcessStats RunPostProcessing(
     PostProcessStats stats;
     stats.total_frames = (int)results.size();
 
-    // Count solver failures
     for (auto& fr : results) {
         if (!fr.solver_ok) stats.solver_failed++;
     }
 
-    // Step 1: Compute inter-frame deltas
     ComputeFrameDeltas(results);
 
-    // Step 2: Mark bad frames
     stats.quality_rejected = MarkBadFrames(results, qthres);
 
     std::cout << "\n[PostProcess] === Quality Filter ===\n"
               << "  Total frames:     " << stats.total_frames << "\n"
               << "  Solver failures:  " << stats.solver_failed << "\n"
               << "  Quality rejected: " << stats.quality_rejected << "\n";
-
-    // Step 3: Bidirectional interpolation of bad frames
     stats.interpolated = InterpolateBadFrames(results);
 
     std::cout << "  Interpolated:     " << stats.interpolated << "\n";
 
-    // Step 4: Gaussian smoothing
     SmoothAllParameters(results, scfg);
 
     std::cout << "  Smoothing applied (body_sigma=" << scfg.sigma_body
@@ -469,9 +418,7 @@ inline PostProcessStats RunPostProcessing(
     return stats;
 }
 
-// ============================================================
-// Re-export meshes from smoothed results
-// ============================================================
+
 inline void ReExportMeshes(const std::vector<FrameResult>& results,
                            const SmplModel& model,
                            const std::string& out_dir)

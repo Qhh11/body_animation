@@ -28,14 +28,11 @@ bool ThreeDPW_GT::LoadFromTxt(const std::string& txt_path) {
 }
 
 bool ThreeDPW_GT::LoadFromDir(const std::string& gt_dir) {
-    // Load joints (required)
     std::string joints_path = gt_dir + "/gt_joints.txt";
     if (!LoadFromTxt(joints_path)) {
-        // Fallback to single file path
         if (!LoadFromTxt(gt_dir)) return false;
     }
 
-    // Load world-space joints (optional)
     {
         std::string joints_world_path = gt_dir + "/gt_joints_world.txt";
         std::ifstream jwf(joints_world_path);
@@ -57,7 +54,7 @@ bool ThreeDPW_GT::LoadFromDir(const std::string& gt_dir) {
         }
     }
 
-    // Load poses (optional)
+    // Load poses 
     {
         std::string poses_path = gt_dir + "/gt_poses.txt";
         std::ifstream pf(poses_path);
@@ -75,7 +72,7 @@ bool ThreeDPW_GT::LoadFromDir(const std::string& gt_dir) {
         }
     }
 
-    // Load world-space poses (optional)
+    // Load world-space poses
     {
         std::string poses_world_path = gt_dir + "/gt_poses_world.txt";
         std::ifstream pwf(poses_world_path);
@@ -94,7 +91,7 @@ bool ThreeDPW_GT::LoadFromDir(const std::string& gt_dir) {
         }
     }
 
-    // Load world-space translation (optional)
+    // Load world-space translation 
     {
         std::string trans_world_path = gt_dir + "/gt_trans_world.txt";
         std::ifstream twf(trans_world_path);
@@ -113,7 +110,7 @@ bool ThreeDPW_GT::LoadFromDir(const std::string& gt_dir) {
         }
     }
 
-    // Load betas (optional)
+    // Load betas 
     {
         std::string betas_path = gt_dir + "/gt_betas.txt";
         std::ifstream bf(betas_path);
@@ -124,7 +121,7 @@ bool ThreeDPW_GT::LoadFromDir(const std::string& gt_dir) {
         }
     }
 
-    // Load vertices (optional)
+    // Load vertices
     {
         std::string verts_path = gt_dir + "/gt_vertices.txt";
         std::ifstream vf(verts_path);

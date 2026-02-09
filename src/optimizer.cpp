@@ -294,46 +294,80 @@ static void AddCapsuleCollisions(
     if (!cfg.use_capsule_collision) return;
 
     struct CapsuleDef { int j1, j2; double radius; };
-    CapsuleDef L_upper_arm = {16, 18, 0.045};
-    CapsuleDef R_upper_arm = {17, 19, 0.045};
-    CapsuleDef L_forearm   = {18, 20, 0.035};
-    CapsuleDef R_forearm   = {19, 21, 0.035};
-    CapsuleDef L_thigh = {1, 4, 0.10};  
-    CapsuleDef R_thigh = {2, 5, 0.10};  
-    CapsuleDef L_shin      = {4,  7,  0.045};
-    CapsuleDef R_shin      = {5,  8,  0.045};
-    CapsuleDef Torso_low  = {0,  9,  0.11};
-    CapsuleDef Torso_high = {9, 12,  0.10};
 
+    // ---- Arms  ----
+    CapsuleDef L_upper_arm = {16, 18, 0.050};
+    CapsuleDef R_upper_arm = {17, 19, 0.050};
+    CapsuleDef L_forearm   = {18, 20, 0.040};
+    CapsuleDef R_forearm   = {19, 21, 0.040};
+    CapsuleDef L_hand      = {20, 22, 0.035};
+    CapsuleDef R_hand      = {21, 23, 0.035};
 
-    double w = cfg.w_capsule_collision;
+    // ---- Legs ----
+    CapsuleDef L_thigh     = { 1,  4, 0.115};
+    CapsuleDef R_thigh     = { 2,  5, 0.115};
+    CapsuleDef L_shin      = { 4,  7, 0.050};
+    CapsuleDef R_shin      = { 5,  8, 0.050};
 
-    auto add = [&](const CapsuleDef& a, const CapsuleDef& b, double w_override = 0.0) {
-        double w_use = (w_override > 0.0) ? w_override : w;
+    // ---- Torso / Pelvis ----
+    CapsuleDef Torso_low   = { 0,  9, 0.135};  
+    CapsuleDef Torso_high  = { 9, 12, 0.110};  
+    CapsuleDef Pelvis_belt = { 1,  2, 0.160};  
+
+    // Global scalar
+    const double w = cfg.w_capsule_collision;
+
+    double zref = (cfg.use_trans_z_prior ? cfg.trans_z_prior_target : 3.0);
+    double unit = cfg.capsule_unit_scale;
+    if (unit <= 0.0) {
+        unit = 1962.0 / std::max(0.5, zref);
+    }
+    const double unit2 = unit * unit;
+
+    auto add = [&](const CapsuleDef& a, const CapsuleDef& b, double w_override = -1.0) {
+        const double w_use = (w_override > 0.0) ? w_override : w;
+        const double w_scaled = w_use * unit2;
+
         problem.AddResidualBlock(
             new ceres::AutoDiffCostFunction<CapsuleCollisionResidual, 1, 10, 72, 3>(
-                new CapsuleCollisionResidual(a.j1, a.j2, a.radius,
-                                            b.j1, b.j2, b.radius, w_use, model)),
+                new CapsuleCollisionResidual(
+                    a.j1, a.j2, a.radius,
+                    b.j1, b.j2, b.radius,
+                    w_scaled, model)),
             nullptr, beta, theta, trans);
     };
 
-    double w_leg = w * 6.0;  // heavy for leg
+    const double w_pelvis = w * 4.0;   
+    const double w_thigh  = w * 2.5;   
+    const double w_torsoL = w * 1.5;   
+    const double w_torsoH = w * 0.7;  
+    const double w_uparm  = w * 0.8;  
+    const double w_legleg = w * 3.0;   
 
-    // Arm vs leg
-    add(L_forearm, R_thigh); add(L_forearm, L_thigh);
-    add(R_forearm, R_thigh); add(R_forearm, L_thigh);
-    add(L_upper_arm, R_thigh); add(R_upper_arm, L_thigh);
 
-    // Leg vs leg 
-    add(L_shin, R_shin, w_leg); add(L_shin, R_thigh, w_leg);
-    add(R_shin, L_thigh, w_leg); add(L_thigh, R_thigh, w_leg);
+    for (const auto& arm : {L_forearm, R_forearm, L_hand, R_hand}) {
+        add(arm, Pelvis_belt, w_pelvis);
+        add(arm, L_thigh,     w_thigh);
+        add(arm, R_thigh,     w_thigh);
 
-    // Arm vs torso 
-    add(L_forearm, Torso_low);  add(R_forearm, Torso_low);
-    add(L_upper_arm, Torso_low); add(R_upper_arm, Torso_low);
-    add(L_forearm, Torso_high);  add(R_forearm, Torso_high);
-    add(L_upper_arm, Torso_high); add(R_upper_arm, Torso_high);
+        add(arm, Torso_low,   w_torsoL);
+        add(arm, Torso_high,  w_torsoH);
+    }
+
+
+    for (const auto& up : {L_upper_arm, R_upper_arm}) {
+        add(up, Torso_low, w_uparm);
+        add(up, L_thigh,   w_uparm * 0.8);
+        add(up, R_thigh,   w_uparm * 0.8);
+    }
+
+    
+    add(L_thigh, R_thigh, w_legleg);
+    add(L_shin,  R_shin,  w_legleg);
+    add(L_shin,  R_thigh, w_legleg);
+    add(R_shin,  L_thigh, w_legleg);
 }
+
 
 // -----------------------------------------
 // Priors helpers
@@ -654,7 +688,9 @@ static void AddPosePriorsUnified(ceres::Problem& problem,
     AddArmTorsoSeparation(problem, cfg, model, beta, theta, trans);
 
     // Capsule-based self-collision
-    AddCapsuleCollisions(problem, cfg, model, beta, theta, trans);
+    if (stage != PriorStage::Stage3) {
+        AddCapsuleCollisions(problem, cfg, model, beta, theta, trans);
+    }
 
     // Cross-limb depth
     AddCrossLimbDepthBlock(problem, cfg, model, beta, theta, trans);
@@ -788,7 +824,6 @@ bool OptimizeSMPL(
         AddRelativeDepthBlock(problem, cfg, model, beta, theta, trans);
         AddDepthAffineBlock(problem, cfg, model, beta, theta, trans);
 
-        // [FIX] Z prior was missing in first-frame optimization
         AddTransZPriorBlock(problem, cfg, trans);
 
         problem.SetParameterBlockConstant(beta);
@@ -826,8 +861,6 @@ bool OptimizeSMPL(
         AddDepthBlock(problem, cfg, model, beta, theta, trans);
         AddRelativeDepthBlock(problem, cfg, model, beta, theta, trans);
         AddDepthAffineBlock(problem, cfg, model, beta, theta, trans);
-
-        // [FIX] Z prior
         AddTransZPriorBlock(problem, cfg, trans);
 
         AddPosePriorsUnified(problem, cfg, model, beta, theta, trans, PriorStage::Stage2);
@@ -856,8 +889,6 @@ bool OptimizeSMPL(
         AddDepthBlock(problem, cfg, model, beta, theta, trans);
         AddRelativeDepthBlock(problem, cfg, model, beta, theta, trans);
         AddDepthAffineBlock(problem, cfg, model, beta, theta, trans);
-
-        // [FIX] Z prior
         AddTransZPriorBlock(problem, cfg, trans);
 
         const double shape_reg_weight = 25.0;
@@ -886,12 +917,6 @@ bool OptimizeSMPL(
     return true;
 }
 
-// -----------------------------------------
-// Graduated energy: create a scaled config for a given stage
-// Stage 1: light depth → reproj finds rough position
-// Stage 2: balanced → depth starts correcting Z
-// Stage 3: full → final 3D refinement
-// -----------------------------------------
 static OptimizerConfig ScaleDepthWeights(const OptimizerConfig& cfg,
                                           double depth_scale,
                                           double prior_scale)
@@ -970,7 +995,6 @@ bool OptimizeSMPLTracked(
         if (cfg.verbose) std::cout << "\n>>> Stage 2: full pose (beta fixed)\n";
         ceres::Problem problem;
 
-        // Graduated energy: scale depth/prior weights for stage 2
         const OptimizerConfig cfg_s2 = cfg.use_graduated_energy
             ? ScaleDepthWeights(cfg, cfg.grad_stage2_depth_scale, cfg.grad_stage2_prior_scale)
             : cfg;
@@ -991,7 +1015,6 @@ bool OptimizeSMPLTracked(
         AddPosePriorsUnified(problem, cfg, model, beta, theta, trans, PriorStage::Stage2);
         AddTemporalPriors(problem, cfg, theta, trans, theta_prev, trans_prev, theta_prev2);
 
-        // Graduated energy scaled Z prior
         AddTransZPriorBlock(problem, cfg_s2, trans);
 
         problem.SetParameterLowerBound(trans, 2, 0.5);
@@ -1023,8 +1046,6 @@ bool OptimizeSMPLTracked(
         AddRelativeDepthBlock(problem, cfg, model, beta, theta, trans);
         AddDepthAffineBlock(problem, cfg, model, beta, theta, trans);
         AddTemporalDepthAffinePrior(problem, cfg);
-
-        // [FIX] Use config Z prior
         AddTransZPriorBlock(problem, cfg, trans);
 
         const double shape_reg_weight = 25.0;

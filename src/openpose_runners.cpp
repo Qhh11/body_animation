@@ -434,18 +434,13 @@ void RunOpenPoseSequenceInference(const SmplModel& model,
 
         smooth_landmarks_inplace(lms);
 
-        // Compute 2D observation quality for this frame
+       
         int num_visible = 0;
         double mean_conf = ComputeMeanConfidence(lms, num_visible);
 
-        // =====================================================
-        // ADAPTIVE TEMPORAL WEIGHTING
-        // Low confidence → trust temporal more, trust 2D less
-        // =====================================================
-        OptimizerConfig cfg_frame = cfg;  // per-frame copy for adaptive weights
+        OptimizerConfig cfg_frame = cfg;  
         if (has_prev) {
             double conf_factor = std::clamp(mean_conf, 0.3, 1.0);
-            // Scale temporal up when confidence is low (factor 1.0 to 1.7)
             double temporal_boost = 2.0 - conf_factor;
             cfg_frame.w_temp_pose  = cfg.w_temp_pose * temporal_boost;
             cfg_frame.w_temp_trans = cfg.w_temp_trans * temporal_boost;
@@ -633,9 +628,6 @@ void RunOpenPoseSequenceInference(const SmplModel& model,
                                     has_prev2 ? trans_prev2_curr : nullptr);
         }
 
-        // =====================================================
-        // STORE FRAME RESULT (always, even if failed)
-        // =====================================================
         {
             postsmooth::FrameResult fr;
             fr.frame_idx = f;
@@ -663,7 +655,6 @@ void RunOpenPoseSequenceInference(const SmplModel& model,
         }
         success_count++;
 
-        // [Pass1] Save raw mesh immediately (will be overwritten by Pass2)
         {
             Eigen::Matrix<double, Eigen::Dynamic, 3, Eigen::RowMajor> V;
             SMPLForward<double>(beta, theta, trans, model, V);
@@ -683,9 +674,6 @@ void RunOpenPoseSequenceInference(const SmplModel& model,
             cfg.ground_y = ground_y_est;
         }
 
-        // =====================================================
-        // STORE PREV (for temporal warm start)
-        // =====================================================
         if (has_prev) {
             std::memcpy(theta_prev2_raw, theta_prev_raw, sizeof(theta_prev2_raw));
             std::memcpy(trans_prev2_raw, trans_prev_raw, sizeof(trans_prev2_raw));
@@ -717,10 +705,7 @@ void RunOpenPoseSequenceInference(const SmplModel& model,
               << "  Failed:  " << fail_count << "\n"
               << "=====================================\n\n";
 
-    // =====================================================
-    // PASS 2: POST-PROCESSING
-    // Quality filter → interpolation → Gaussian smoothing
-    // =====================================================
+
     {
         postsmooth::QualityThresholds qthres;
         qthres.max_pose_delta  = 2.0;   
@@ -738,13 +723,12 @@ void RunOpenPoseSequenceInference(const SmplModel& model,
 
         auto pp_stats = postsmooth::RunPostProcessing(all_results, qthres, scfg);
 
-        // Re-export all meshes from smoothed results
         std::cout << "[Pass2] Re-exporting smoothed meshes...\n";
         postsmooth::ReExportMeshes(all_results, model, out_dir);
     }
 
     // =====================================================
-    // EVALUATION (on smoothed results)
+    // EVALUATION 
     // =====================================================
     for (size_t ri = 0; ri < all_results.size(); ++ri) {
         const auto& fr = all_results[ri];
@@ -816,7 +800,6 @@ void RunOpenPoseSequenceInference(const SmplModel& model,
                 all_pose_error.push_back(pose_err_frame);
             }
 
-            // 2D reprojection on smoothed params
             if (!lms.empty()) {
                 double reproj_err = 0.0; int reproj_count = 0;
                 for (const auto& lm : lms) {

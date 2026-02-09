@@ -209,6 +209,8 @@ inline void DumpOptimizerConfig(std::ostream& os,
     os << "\n[Capsule/CrossLimb]\n";
     os << "  use_capsule_collision=" << cfg.use_capsule_collision << " w=" << cfg.w_capsule_collision << "\n";
     os << "  use_cross_limb_depth=" << cfg.use_cross_limb_depth << " w=" << cfg.w_cross_limb_depth << "\n";
+    os << "  capsule_unit_scale=" <<     cfg.capsule_unit_scale << "\n";
+
 
     os << "\n[Solver Iters]\n";
     os << "  max_iter_stage1=" << cfg.max_iter_stage1 << "\n";

@@ -1,6 +1,6 @@
-# SMPL Body Fitting - Monocular 2D-to-3D Optimization Pipeline
+# Group2_Body Animation
 
-
+The environment used in the project is the same docker container used in 3dScanning exercise.
 
 ## Build
 
@@ -10,7 +10,6 @@ cmake ..
 make
 ```
 
-Dependencies: Eigen3, Ceres Solver, zlib, C++17.
 
 ## Data Layout
 
@@ -22,11 +21,6 @@ Data/
   openpose_output/{seq}/       # OpenPose BODY_25 JSON detections per frame
   sapiens_depth/{seq}/         # Sapiens relative depth estimates per frame
   3dpw_gt/{seq}/               # 3DPW ground truth
-    cam_intrinsics.txt         #   fx fy cx cy (auto-loaded per sequence)
-    cam_poses.txt              #   per-frame 3x4 camera extrinsics
-    gt_joints.txt              #   24 joints per frame (camera space)
-    gt_poses.txt               #   72-dim SMPL pose per frame
-    gt_betas.txt               #   10-dim shape parameters
 ```
 
 ## Running Sequences (OpenPose Pipeline)
@@ -45,11 +39,11 @@ All commands run from `body_animation/src/build/`.
 
 ### Available Sequences
 
-| Sequence | Frames | Notes |
-|----------|--------|-------|
-| `courtyard_basketball_01` | 0 - 957 | |
-| `courtyard_bodyScannerMotions_00` | 0 - 1256 | |
-| `outdoors_fencing_01` | 0 - 941 | **Must disable foot_ground** (see below) |
+| Sequence | Frames |
+|----------|--------|
+| `courtyard_basketball_01` | 0 - 957 | 
+| `courtyard_bodyScannerMotions_00` | 0 - 1256 | 
+| `outdoors_fencing_01` | 0 - 941 | 
 
 ### Run Commands
 
@@ -66,7 +60,7 @@ All commands run from `body_animation/src/build/`.
   --output_dir ./seq_out_bodyscanner \
   --start 0 --end 200
 
-# outdoors_fencing_01 (foot_ground must be disabled first!)
+# outdoors_fencing_01 
 ./main --openpose-seq \
   --input_seq outdoors_fencing_01 \
   --output_dir ./seq_out_fencing \
@@ -74,23 +68,10 @@ All commands run from `body_animation/src/build/`.
 
 ```
 
-### Disabling foot_ground for fencing
+### Note on Regularization Parameters
 
-The `outdoors_fencing_01` sequence contains jumping and airborne poses. The foot-ground contact constraint must be disabled, otherwise it will force feet to stay on the ground plane and produce incorrect results.
-
-In `src/config_builders.cpp`, function `MakeCfgForOpenPoseSequence()`, change:
-
-```cpp
-cfg.use_foot_ground = false;   // disable for fencing (default: true)
-```
-
-Then rebuild:
-
-```bash
-make
-```
-
-Remember to set it back to `true` for other sequences that involve walking/standing.
+The SMPL body model has high-dimensional parameters (72-DoF pose + 10-DoF shape), and different motion types require different regularization settings for optimal results. The reproduction quality is highly sensitive to these configuration parameters (e.g., temporal smoothness weights, foot-ground contact, depth affine weights). Reference configuration parameters and example outputs for each sequence are available at [Dropbox](https://www.dropbox.com/scl/fo/n0kmyas3oq4d13muemlf0/AFIvtXufj9d1GaUFIwmvpm8?rlkey=ovyuznxd9jdb1a0jjm856v5eb&st=62fbx3vi&dl=0).
+All parameters can be tuned in script config_builders.cpp.
 
 ## Output
 
@@ -105,16 +86,6 @@ Each run produces a directory containing:
   evaluation.txt       # per-frame metrics + summary (requires GT)
 ```
 
-
-### Evaluation Metrics (printed in evaluation.txt)
-
-| Metric | Unit | Description |
-|--------|------|-------------|
-| MPJPE | mm | Mean Per-Joint Position Error |
-| PA-MPJPE | mm | Procrustes-Aligned MPJPE (scale/rotation invariant) |
-| MPJPE (root-rel) | mm | MPJPE centered at pelvis |
-| Pose Error | rad | RMS of pose parameter difference |
-| 2D Reproj | px | Mean 2D reprojection error |
 
 ## AMASS Validation Pipeline
 

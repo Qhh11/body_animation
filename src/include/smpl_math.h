@@ -3,8 +3,7 @@
 #include <ceres/rotation.h>
 #include "smpl_model.h"
 
-// FAST joints-only SMPL forward for optimization.
-// Assumes SMPL has 24 joints (standard SMPL). If your model.J != 24, it falls back.
+
 template <typename T>
 void SMPLJointsForward(
     const T* beta,
@@ -23,21 +22,16 @@ void SMPLJointsForward(
         (model.J_shapedirs_3d.rows() == J * 3 && model.J_shapedirs_3d.cols() >= 10);
 
     if (J == 24 && has_joint_cache) {
-        // joints_shaped: (24 x 3) on stack (fixed size)
         Eigen::Matrix<T, 24, 3, Eigen::RowMajor> joints;
-        // global rotations/positions on stack
-        Eigen::Matrix<T, 24, 3, Eigen::RowMajor> global_p; // positions
-        // store rotation matrices
+        Eigen::Matrix<T, 24, 3, Eigen::RowMajor> global_p; 
         std::array<Eigen::Matrix<T,3,3>, 24> global_R;
 
-        // 1) joints = J_template_3d + J_shapedirs_3d * beta
         for (int j = 0; j < 24; ++j) {
             joints(j,0) = T(model.J_template_3d(j,0));
             joints(j,1) = T(model.J_template_3d(j,1));
             joints(j,2) = T(model.J_template_3d(j,2));
 
             const int base = j * 3;
-            // add 10 betas
             for (int c = 0; c < 3; ++c) {
                 T off = T(0);
                 for (int k = 0; k < 10; ++k) {
@@ -47,7 +41,6 @@ void SMPLJointsForward(
             }
         }
 
-        // 2) FK recursion (R,p)
         for (int i = 0; i < 24; ++i) {
             T aa[3] = { theta[i*3+0], theta[i*3+1], theta[i*3+2] };
             T Rcolmaj[9];
@@ -86,7 +79,6 @@ void SMPLJointsForward(
             }
         }
 
-        // 3) output + trans  (FIXED: global_p(i,*) not global_p)
         for (int i = 0; i < 24; ++i) {
             out_joints_world(i,0) = global_p(i,0) + trans[0];
             out_joints_world(i,1) = global_p(i,1) + trans[1];
@@ -95,8 +87,6 @@ void SMPLJointsForward(
         return;
     }
 
-    // --------- Fallback path (generic J): your original method (slow) ----------
-    // Keep this so code still runs if you load a non-24-joint model.
     const int N = model.N;
 
     Eigen::Matrix<T, Eigen::Dynamic, 3, Eigen::RowMajor> v_shaped(N, 3);
@@ -124,7 +114,7 @@ void SMPLJointsForward(
         }
     }
 
-    // Generic FK using 4x4 (slow but safe)
+    // Generic FK using 4x4 
     std::vector<int> parents(J, -1);
     parents[0] = -1;
     for (int i = 1; i < J; ++i) {
@@ -184,7 +174,6 @@ void SMPLForward(
     const int J = model.J;
     const T eps = T(1e-12);
 
-    // v_shaped = v_template + shapedirs * beta
     Eigen::Matrix<T, Eigen::Dynamic, 3, Eigen::RowMajor> v_shaped(N, 3);
     for (int i = 0; i < N; ++i) {
         v_shaped(i,0) = T(model.v_template(i,0));
@@ -200,7 +189,6 @@ void SMPLForward(
     }
     if (out_v_shaped) *out_v_shaped = v_shaped;
 
-    // joints = J_regressor * v_shaped  (using cached nonzeros)
     Eigen::Matrix<T, Eigen::Dynamic, 3, Eigen::RowMajor> joints(J, 3);
     joints.setZero();
     for (int j = 0; j < J; ++j) {
@@ -214,7 +202,6 @@ void SMPLForward(
         }
     }
 
-    // parents from kintree_table (assume row 0 contains parents for standard SMPL pkl->npz conversion)
     std::vector<int> parents(J, -1);
     parents[0] = -1;
     for (int i = 1; i < J; ++i) {
@@ -223,7 +210,6 @@ void SMPLForward(
         parents[i] = p;
     }
 
-    // FK transforms
     std::vector<Eigen::Matrix<T,4,4>> local_T(J), global_T(J);
     for (int i = 0; i < J; ++i) {
         T aa[3] = { theta[i*3+0], theta[i*3+1], theta[i*3+2] };
@@ -249,7 +235,6 @@ void SMPLForward(
         }
     }
 
-    // posedirs (pose blendshapes)
     Eigen::Matrix<T, Eigen::Dynamic, 3, Eigen::RowMajor> v_posed = v_shaped;
 
     if (use_pose_blendshapes && J == 24 &&
@@ -268,13 +253,11 @@ void SMPLForward(
 
         }
 
-        // write pose_feat out
         if (out_pose_feat) {
             out_pose_feat->resize(207);
             *out_pose_feat = pose_feat;
         }
 
-        // v_posed = v_shaped + posedirs * pose_feat
         for (int i = 0; i < N; ++i) {
             for (int c = 0; c < 3; ++c) {
                 T off = T(0);
@@ -286,11 +269,9 @@ void SMPLForward(
         }
     }
 
-    // NOW v_posed is final
     if (out_v_posed) *out_v_posed = v_posed;
 
 
-    // skinning transforms Tskin = global_T * inv_bind
     std::vector<Eigen::Matrix<T,4,4>> Tskin(J);
     for (int i = 0; i < J; ++i) {
         Eigen::Matrix<T,4,4> inv_bind; inv_bind.setIdentity();
@@ -300,7 +281,7 @@ void SMPLForward(
         Tskin[i] = global_T[i] * inv_bind;
     }
 
-    // LBS
+
     out_vertices.resize(N,3);
     out_vertices.setZero();
     for (int i = 0; i < N; ++i) {
@@ -317,7 +298,6 @@ void SMPLForward(
         }
     }
 
-    // global translation
     for (int i = 0; i < N; ++i) {
         out_vertices(i,0) += trans[0];
         out_vertices(i,1) += trans[1];

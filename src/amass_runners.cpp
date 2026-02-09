@@ -19,7 +19,6 @@ namespace fs = std::filesystem;
 
 namespace app {
 
-// Synthetic landmarks for AMASS validation
 static std::vector<Landmark2D> GenerateSyntheticLandmarks(
     const SmplModel& model,
     const CameraIntrinsics& camera,

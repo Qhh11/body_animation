@@ -51,21 +51,18 @@ struct ReprojectionResidual {
         Eigen::Matrix<T, Eigen::Dynamic, 3, Eigen::RowMajor> vertices;
         SMPLForward<T>(beta, theta, trans, model_, vertices);
         
-        // Step 2: 计算3D关节位置 (J_regressor × vertices)
+        
         T joint_3d[3] = {T(0.0), T(0.0), T(0.0)};
         
         for (int v = 0; v < model_.N; ++v) {
             T weight = T(model_.J_regressor(smpl_joint_id_, v));
-            if (weight > T(1e-5)) {  // 稀疏优化
+            if (weight > T(1e-5)) { 
                 joint_3d[0] += weight * vertices(v, 0);
                 joint_3d[1] += weight * vertices(v, 1);
                 joint_3d[2] += weight * vertices(v, 2);
             }
         }
         
-        // Step 3: 3D → 2D 投影 
-        // 公式: u = fx * (X/Z) + cx
-        //       v = fy * (Y/Z) + cy
         T X = joint_3d[0];
         T Y = joint_3d[1];
         T Z = joint_3d[2];
@@ -77,11 +74,9 @@ struct ReprojectionResidual {
         T projected_x = T(camera_.fx) * (X / Z) + T(camera_.cx);
         T projected_y = T(camera_.fy) * (Y / Z) + T(camera_.cy);
         
-        // Step 4: 计算残差 = 预测 - 观测
         residual[0] = projected_x - T(observed_landmark_.x);
         residual[1] = projected_y - T(observed_landmark_.y);
         
-        // Ceres会自动计算 residual[0]² + residual[1]²
         return true;
     }
     
@@ -92,31 +87,27 @@ private:
     const SmplModel& model_;
 };
 
-// Cost Function 2: Shape正则化 (L2范数)
 struct ShapeRegularizer {
     ShapeRegularizer(int index, double lambda) 
         : index_(index), lambda_(lambda) {}
     
     template <typename T>
     bool operator()(const T* beta, T* residual) const {
-        // 惩罚项: λ * β[index]
         residual[0] = T(lambda_) * beta[index_];
         return true;
     }
     
 private:
     int index_;
-    double lambda_;  // 正则化权重
+    double lambda_;  
 };
 
-// Cost Function 3: Pose正则化 (L2范数)
 struct PoseRegularizer {
     PoseRegularizer(int index, double lambda) 
         : index_(index), lambda_(lambda) {}
     
     template <typename T>
     bool operator()(const T* theta, T* residual) const {
-        // 惩罚项: λ * θ[index]
         residual[0] = T(lambda_) * theta[index_];
         return true;
     }
@@ -126,14 +117,12 @@ private:
     double lambda_;
 };
 
-// Cost Function 4: 深度先验 (可选)
 struct DepthPrior {
     DepthPrior(double expected_depth, double sigma) 
         : expected_depth_(expected_depth), sigma_(sigma) {}
     
     template <typename T>
     bool operator()(const T* trans, T* residual) const {
-        // 希望深度接近expected_depth
         residual[0] = (trans[2] - T(expected_depth_)) / T(sigma_);
         return true;
     }
@@ -150,13 +139,10 @@ struct AnatomicalLimitResidual {
 
     template <typename T>
     bool operator()(const T* const theta, T* residual) const {
-        // theta is 72-dim. Joint i starts at 3*i.
-        // We focus on the specific axis (0=x, 1=y, 2=z).
         const T& angle = theta[joint_idx_ * 3 + axis_]; 
 
         residual[0] = T(0.0);
 
-        // Barrier Function
         if (angle < T(min_a_)) {
             residual[0] = T(weight_) * (T(min_a_) - angle);
         } else if (angle > T(max_a_)) {

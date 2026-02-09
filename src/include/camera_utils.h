@@ -10,28 +10,19 @@
 
 #include <Eigen/Dense>
 
-#include "optimizer.h"   // MatX3dRM
+#include "optimizer.h"   
 
-// ============================================================
-// Camera extrinsics: R (3x3) + t (3x1)
-// Convention: world-to-camera  =>  X_cam = R * X_world + t
-// ============================================================
+
 struct CameraExtrinsics {
     Eigen::Matrix3d R = Eigen::Matrix3d::Identity();
     Eigen::Vector3d t = Eigen::Vector3d::Zero();
 };
 
-// ============================================================
-// Load per-frame camera poses from a text file.
-//
-// Supported format: flat list of numbers, 16 per frame (4x4)
-// or 12 per frame (3x4).  No blank-line separator needed.
-// ============================================================
+
 inline std::vector<CameraExtrinsics> LoadCameraPoses(const std::string& path) {
     std::vector<CameraExtrinsics> poses;
     std::ifstream f(path);
     if (!f.is_open()) {
-        // Silently return empty — caller checks .empty()
         return poses;
     }
 
@@ -39,7 +30,6 @@ inline std::vector<CameraExtrinsics> LoadCameraPoses(const std::string& path) {
     double v;
     while (f >> v) nums.push_back(v);
 
-    // 4x4 matrices (16 numbers each)
     if (nums.size() >= 16 && nums.size() % 16 == 0) {
         int n = (int)nums.size() / 16;
         for (int i = 0; i < n; ++i) {
@@ -51,7 +41,6 @@ inline std::vector<CameraExtrinsics> LoadCameraPoses(const std::string& path) {
             poses.push_back(ce);
         }
     }
-    // 3x4 matrices (12 numbers each)
     else if (nums.size() >= 12 && nums.size() % 12 == 0) {
         int n = (int)nums.size() / 12;
         for (int i = 0; i < n; ++i) {
@@ -70,12 +59,6 @@ inline std::vector<CameraExtrinsics> LoadCameraPoses(const std::string& path) {
     return poses;
 }
 
-// ============================================================
-// Relative camera transform:  X_camB = R_rel * X_camA + t_rel
-//
-//   R_rel = R_b * R_a^T
-//   t_rel = t_b - R_rel * t_a
-// ============================================================
 inline void ComputeRelativeCameraTransform(
     const CameraExtrinsics& cam_a,
     const CameraExtrinsics& cam_b,
@@ -86,33 +69,23 @@ inline void ComputeRelativeCameraTransform(
     t_rel = cam_b.t - R_rel * cam_a.t;
 }
 
-// ============================================================
-// Transform previous-frame SMPL params into the current camera
-// frame using relative camera motion.
-//
-//   trans_curr = R_rel * trans_prev + t_rel
-//   root_curr  = R_rel * root_prev   (axis-angle composed)
-//   body pose is copied unchanged.
-// ============================================================
+
 inline void TransformPrevParamsToCurrCam(
-    const double* theta_prev,   // [72]
-    const double* trans_prev,   // [3]
+    const double* theta_prev,   
+    const double* trans_prev,   
     const Eigen::Matrix3d& R_rel,
     const Eigen::Vector3d& t_rel,
-    double* theta_curr,         // [72] output
-    double* trans_curr)         // [3]  output
+    double* theta_curr,        
+    double* trans_curr)        
 {
-    // Copy full pose first
     std::memcpy(theta_curr, theta_prev, 72 * sizeof(double));
 
-    // --- Transform translation ---
     Eigen::Vector3d tp(trans_prev[0], trans_prev[1], trans_prev[2]);
     Eigen::Vector3d tc = R_rel * tp + t_rel;
     trans_curr[0] = tc(0);
     trans_curr[1] = tc(1);
     trans_curr[2] = tc(2);
 
-    // --- Transform root orientation (axis-angle, first 3 params) ---
     Eigen::Vector3d aa_prev(theta_prev[0], theta_prev[1], theta_prev[2]);
     double angle = aa_prev.norm();
     Eigen::Matrix3d R_root;
@@ -131,12 +104,6 @@ inline void TransformPrevParamsToCurrCam(
     theta_curr[2] = aa_vec(2);
 }
 
-// ============================================================
-// Transform joints from camera space to world space.
-//   X_world = R^T * (X_cam - t)
-//
-// If flip_y: negate Y before transforming (undo SMPL Y-flip).
-// ============================================================
 inline void TransformJointsCamToWorld(
     const MatX3dRM& J_cam,
     const CameraExtrinsics& cam,

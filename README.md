@@ -88,15 +88,21 @@ Each run produces a directory containing:
 
 
 ## AMASS Validation Pipeline
+### AMASS CMU
+Please refer to https://amass.is.tue.mpg.de/ to download the dataset.
+Run the following command to convert amass npz to txt:
+```bash
+python3 convert_amass.py --batch --input_dir ../Data/CMU/XX --output_dir ../Data/path/to/txt
+```
 
 For controlled validation using synthetic 2D observations from motion capture data:
 
 ```bash
 # Single-frame validation
-./main ../../Data/sampled/CMU_01.txt
+./main ../../Data/path/to/txt/XX_XX_poses.txt
 
 # Sequence validation (frames 0-50)
-./main --seq-val ../../Data/sampled/CMU_01.txt
+./main --seq-val ../../Data/path/to/txt/XX_XX_poses.txt
 
 # Batch validation (predefined test set)
 ./main --batch

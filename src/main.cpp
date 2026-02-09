@@ -34,6 +34,7 @@ static int GetArgInt(int argc, char** argv,
 int main(int argc, char** argv) {
     google::InitGoogleLogging("SMPL_Optimizer");
     std::cout << ">>> Start SMPL Project...\n";
+    std::cout << ">>> Start SMPL Project...\n";
 
     SmplModel model;
     model.LoadFromNPZ("../../Data/models/smpl_neutral.npz");

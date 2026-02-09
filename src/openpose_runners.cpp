@@ -27,6 +27,8 @@
 #include "camera_utils.h" 
 #include "multi_hypothesis.h"
 #include "init_utils.h"
+#include "post_smoothing.h"
+
 namespace fs = std::filesystem;
 
 namespace app {
@@ -102,7 +104,7 @@ void RunOpenPoseSequenceInference(const SmplModel& model,
                                   const std::string& out_dir,
                                   int start_frame,
                                   int end_frame) {
-    std::cout << "\n=== MODE 3: OpenPose SEQUENCE (Camera-Space) ===\n";
+    std::cout << "\n=== MODE 3: OpenPose SEQUENCE (Camera-Space) + Two-Pass Smoothing ===\n";
 
     const std::string seq_dir   = "../../Data/openpose_output/" + seq_name;
     const std::string depth_dir = "../../Data/sapiens_depth/"    + seq_name;
@@ -153,7 +155,7 @@ void RunOpenPoseSequenceInference(const SmplModel& model,
     // Logger
     // ---------------------------
     logutil::RunMeta meta;
-    meta.mode = "OPENPOSE_SEQ_CAMSPACE";
+    meta.mode = "OPENPOSE_SEQ_CAMSPACE_2PASS";
     meta.seq_dir = seq_dir;
     meta.depth_dir = depth_dir;
     meta.gt_dir = gt_dir;
@@ -249,7 +251,7 @@ void RunOpenPoseSequenceInference(const SmplModel& model,
 
     bool ground_init = false;
     double ground_y_est = 0.0;
-
+    double z_anchor = 3.0;
     bool ankle_prev_valid = false;
     double prev_LA_x=0, prev_LA_y=0, prev_RA_x=0, prev_RA_y=0;
 
@@ -301,6 +303,21 @@ void RunOpenPoseSequenceInference(const SmplModel& model,
         return (cnt > 0) ? (err / cnt) : 1e18;
     };
 
+    // Helper: compute mean 2D confidence of landmarks
+    auto ComputeMeanConfidence = [&](const std::vector<Landmark2D>& lms,
+                                     int& num_visible) -> double
+    {
+        double sum_conf = 0.0;
+        num_visible = 0;
+        for (const auto& lm : lms) {
+            if (lm.confidence > 0.1f) {
+                sum_conf += lm.confidence;
+                num_visible++;
+            }
+        }
+        return (num_visible > 0) ? sum_conf / num_visible : 0.0;
+    };
+
     // =====================================================
     // FIRST-FRAME YAW MULTI-START
     // =====================================================
@@ -312,7 +329,7 @@ void RunOpenPoseSequenceInference(const SmplModel& model,
     {
         cfg_base.use_temporal = false;
         cfg_base.use_temporal_acc = false;
-        cfg_base.max_iter_stage1 = 25;
+        cfg_base.max_iter_stage1 = 60;
         cfg_base.max_iter_stage2 = 0;
         cfg_base.max_iter_stage3 = 0;
         cfg_base.print_progress = false;
@@ -360,15 +377,29 @@ void RunOpenPoseSequenceInference(const SmplModel& model,
         }
 
         if (fine_best_score < 1e17) {
-            std::memcpy(theta_, fine_best_theta, sizeof(fine_best_theta));
+            double best_yaw_rad = fine_best_theta[1];
+            std::memset(theta_, 0, 72 * sizeof(double));
+            theta_[1] = best_yaw_rad;
             std::memcpy(trans_, fine_best_trans, sizeof(fine_best_trans));
             cfg.trans_z_prior_target = trans_[2];
+
             std::cout << "[InitYaw] best reproj=" << fine_best_score
                     << " px, yaw_deg=" << fine_best_yaw
                     << " (rad=" << theta_[1] << ")\n";
         }
     };
 
+
+    // =====================================================
+    // PASS 1: FORWARD CAUSAL OPTIMIZATION
+    // Store all results for post-processing
+    // =====================================================
+    std::vector<postsmooth::FrameResult> all_results;
+    all_results.reserve(end - start + 1);
+
+    // Also store per-frame landmarks for evaluation later
+    std::vector<std::vector<Landmark2D>> all_landmarks;
+    all_landmarks.reserve(end - start + 1);
 
     int success_count = 0, fail_count = 0;
 
@@ -391,10 +422,35 @@ void RunOpenPoseSequenceInference(const SmplModel& model,
         if (!LoadLandmarksFromJSON(json_path, lms)) {
             std::cerr << "[Frame " << f << "] failed to load: " << json_path << "\n";
             fail_count++;
+
+            // Store failed frame result
+            postsmooth::FrameResult fr;
+            fr.frame_idx = f;
+            fr.solver_ok = false;
+            all_results.push_back(fr);
+            all_landmarks.push_back({});
             continue;
         }
 
         smooth_landmarks_inplace(lms);
+
+        // Compute 2D observation quality for this frame
+        int num_visible = 0;
+        double mean_conf = ComputeMeanConfidence(lms, num_visible);
+
+        // =====================================================
+        // ADAPTIVE TEMPORAL WEIGHTING
+        // Low confidence → trust temporal more, trust 2D less
+        // =====================================================
+        OptimizerConfig cfg_frame = cfg;  // per-frame copy for adaptive weights
+        if (has_prev) {
+            double conf_factor = std::clamp(mean_conf, 0.3, 1.0);
+            // Scale temporal up when confidence is low (factor 1.0 to 1.7)
+            double temporal_boost = 2.0 - conf_factor;
+            cfg_frame.w_temp_pose  = cfg.w_temp_pose * temporal_boost;
+            cfg_frame.w_temp_trans = cfg.w_temp_trans * temporal_boost;
+            cfg_frame.w_temp_root_orient = cfg.w_temp_root_orient * temporal_boost;
+        }
 
         // =====================================================
         // WARM START
@@ -430,13 +486,12 @@ void RunOpenPoseSequenceInference(const SmplModel& model,
             std::memcpy(trans, trans_prev_curr, sizeof(trans));
             depth_affine[0] = depth_affine_prev[0];
             depth_affine[1] = depth_affine_prev[1];
-            cfg.trans_z_prior_target = trans_prev_curr[2];
+            cfg_frame.trans_z_prior_target = z_anchor;
         } else {
             EstimateGlobalTranslationXY(lms, camera, 3.0, trans);
-            cfg.trans_z_prior_target = trans[2];
-            InitFirstFrameYawByMultiStart(lms, beta, theta, trans, cfg);
+            InitFirstFrameYawByMultiStart(lms, beta, theta, trans, cfg_frame); 
             depth_affine[0] = 3.0;
-            depth_affine[1] = trans[2];
+            depth_affine[1] = 3.0;
         }
 
         // =====================================================
@@ -475,11 +530,12 @@ void RunOpenPoseSequenceInference(const SmplModel& model,
                     if (smpl_idx < 0) continue;
 
                     double c2d = get_conf(lms, oid);
-
-                    // Per-joint depth confidence
-                    bool is_arm = (oid == 3 || oid == 4 || oid == 6 || oid == 7);
                     double depth_conf = c2d;
-                    if (is_arm) depth_conf *= 0.3;  // Arms: depth unreliable
+                    // Per-joint depth confidence
+                    bool is_wrist = (oid == 4 || oid == 7);
+                    bool is_elbow = (oid == 3 || oid == 6);
+                    if (is_wrist) depth_conf *= 0.5;     
+                    else if (is_elbow) depth_conf *= 0.4;
 
                     // Outlier rejection
                     if (median_d > 0 && std::abs(dv - median_d) > 3.0 * std::abs(median_d) + 0.1) {
@@ -496,36 +552,47 @@ void RunOpenPoseSequenceInference(const SmplModel& model,
         {
             std::unordered_map<int, double> jdepth;
             for (auto& dp : depth_pts) jdepth[dp.smpl_joint_idx] = dp.rel_depth;
+
             int cross_pairs[][2] = {{20, 21}, {18, 19}, {16, 17}};
             for (auto& cp : cross_pairs) {
                 if (jdepth.count(cp[0]) && jdepth.count(cp[1]))
                     cross_limb_pairs.push_back({cp[0], cp[1], jdepth[cp[0]], jdepth[cp[1]]});
             }
+
             int chain_pairs[][2] = {{17, 19}, {19, 21}, {16, 18}, {18, 20}};
             for (auto& cp : chain_pairs) {
                 if (jdepth.count(cp[0]) && jdepth.count(cp[1]))
                     cross_limb_pairs.push_back({cp[0], cp[1], jdepth[cp[0]], jdepth[cp[1]]});
             }
+
+            int torso_joints[] = {0, 3, 6, 9};  
+            int arm_joints[]   = {16, 17, 18, 19, 20, 21};  
+            for (int tj : torso_joints) {
+                for (int aj : arm_joints) {
+                    if (jdepth.count(tj) && jdepth.count(aj)) {
+                        cross_limb_pairs.push_back({aj, tj, jdepth[aj], jdepth[tj]});
+                    }
+                }
+            }
         }
 
         // Setup depth affine
         if ((int)depth_pts.size() >= 6) {
-            cfg.use_depth_affine    = true;
-            if (f == start) cfg.w_depth_affine = 400.0;
-            else            cfg.w_depth_affine = 360.0;
-            cfg.depth_affine_sign   = 1.0;
-            cfg.depth_affine_data   = &depth_pts;
-            cfg.depth_affine_params = depth_affine;
-            cfg.use_temporal_depth_affine = has_prev;
-            cfg.depth_affine_prev   = has_prev ? depth_affine_prev : nullptr;
-            cfg.w_temp_depth_scale  = 10.0;
-            cfg.w_temp_depth_bias   = 20.0;
-            cfg.fix_depth_affine_bias = has_prev;
+            cfg_frame.use_depth_affine    = true;
+            if (f == start) cfg_frame.w_depth_affine = 400.0;
+            cfg_frame.depth_affine_sign   = 1.0;
+            cfg_frame.depth_affine_data   = &depth_pts;
+            cfg_frame.depth_affine_params = depth_affine;
+            cfg_frame.use_temporal_depth_affine = has_prev;
+            cfg_frame.depth_affine_prev   = has_prev ? depth_affine_prev : nullptr;
+            cfg_frame.w_temp_depth_scale  = 10.0;
+            cfg_frame.w_temp_depth_bias   = 20.0;
+            cfg_frame.fix_depth_affine_bias = has_prev;
         }
 
         if (!cross_limb_pairs.empty()) {
-            cfg.use_cross_limb_depth = true;
-            cfg.cross_limb_pairs = &cross_limb_pairs;
+            cfg_frame.use_cross_limb_depth = true;
+            cfg_frame.cross_limb_pairs = &cross_limb_pairs;
         }
 
         // Foot contact
@@ -533,8 +600,8 @@ void RunOpenPoseSequenceInference(const SmplModel& model,
             double LAx=0, LAy=0, RAx=0, RAy=0;
             bool hasLA = get_xy(lms, 14, LAx, LAy);
             bool hasRA = get_xy(lms, 11, RAx, RAy);
-            cfg.foot_contact_L = compute_contact(lms, true);
-            cfg.foot_contact_R = compute_contact(lms, false);
+            cfg_frame.foot_contact_L = compute_contact(lms, true);
+            cfg_frame.foot_contact_R = compute_contact(lms, false);
             if (hasLA) { prev_LA_x=LAx; prev_LA_y=LAy; ankle_prev_valid=true; }
             if (hasRA) { prev_RA_x=RAx; prev_RA_y=RAy; ankle_prev_valid=true; }
         }
@@ -544,21 +611,49 @@ void RunOpenPoseSequenceInference(const SmplModel& model,
         // =====================================================
         bool ok = false;
         if (!has_prev) {
-            //initutil::EstimateRootFromKeypoints(lms, camera, theta);
+            cfg_frame.use_foot_ground = false;
             initutil::EstimateTransZFromKeypoints(lms, camera, trans);
-            ok = OptimizeSMPL(lms, camera, model, beta, theta, trans, cfg);
-            cfg.max_iter_stage3 = 200;
+            cfg_frame.trans_z_prior_target = trans[2];
+            depth_affine[0] = 3.0;
+            depth_affine[1] = trans[2]; 
+
+            ok = OptimizeSMPL(lms, camera, model, beta, theta, trans, cfg_frame);
+            z_anchor = trans[2];
+            cfg_frame.max_iter_stage3 = 200;
         } else {
-            cfg.max_iter_stage3 = 0;
+            cfg_frame.max_iter_stage3 = 0;
             multihyp::DepthGuidedZCorrection(
                 model, beta, theta, trans,
-                cfg.depth_affine_data ? *cfg.depth_affine_data : std::vector<JointRelDepthData>{},
-                cfg.depth_affine_params,
-                cfg.multi_hyp_max_z_shift);
-            ok = OptimizeSMPLTracked(lms, camera, model, beta, theta, trans, cfg,
+                cfg_frame.depth_affine_data ? *cfg_frame.depth_affine_data : std::vector<JointRelDepthData>{},
+                cfg_frame.depth_affine_params,
+                cfg_frame.multi_hyp_max_z_shift);
+            ok = OptimizeSMPLTracked(lms, camera, model, beta, theta, trans, cfg_frame,
                                     theta_prev_curr, trans_prev_curr,
                                     has_prev2 ? theta_prev2_curr : nullptr,
                                     has_prev2 ? trans_prev2_curr : nullptr);
+        }
+
+        // =====================================================
+        // STORE FRAME RESULT (always, even if failed)
+        // =====================================================
+        {
+            postsmooth::FrameResult fr;
+            fr.frame_idx = f;
+            fr.solver_ok = ok;
+            std::memcpy(fr.theta, theta, sizeof(theta));
+            std::memcpy(fr.trans, trans, sizeof(trans));
+            std::memcpy(fr.beta,  beta,  sizeof(beta));
+            std::memcpy(fr.depth_affine, depth_affine, sizeof(depth_affine));
+
+            fr.mean_confidence = mean_conf;
+            fr.num_visible_kps = num_visible;
+
+            if (ok) {
+                fr.reproj_px = ComputeReproj2DScore(lms, beta, theta, trans, cfg_frame);
+            }
+
+            all_results.push_back(fr);
+            all_landmarks.push_back(lms);
         }
 
         if (!ok) {
@@ -568,11 +663,12 @@ void RunOpenPoseSequenceInference(const SmplModel& model,
         }
         success_count++;
 
-        double mpjpe_frame    = -1.0;
-        double pa_mpjpe_frame = -1.0;
-        double pose_err_frame = -1.0;
-        double reproj2d_frame = -1.0;
-
+        // [Pass1] Save raw mesh immediately (will be overwritten by Pass2)
+        {
+            Eigen::Matrix<double, Eigen::Dynamic, 3, Eigen::RowMajor> V;
+            SMPLForward<double>(beta, theta, trans, model, V);
+            SaveOBJ(MakeOutObj(out_dir, f), V, model.faces);
+        }
         // Ground plane estimate
         {
             MatX3dRM Jcam;
@@ -583,22 +679,12 @@ void RunOpenPoseSequenceInference(const SmplModel& model,
             if (!ground_init) {
                 ground_y_est = y_min;
                 ground_init = true;
-            } else {
-                double alpha = (y_min < ground_y_est) ? 0.5 : 0.02;
-                ground_y_est = alpha * y_min + (1.0 - alpha) * ground_y_est;
-            }
+            } 
             cfg.ground_y = ground_y_est;
         }
 
-        // Save mesh
-        {
-            Eigen::Matrix<double, Eigen::Dynamic, 3, Eigen::RowMajor> V;
-            SMPLForward<double>(beta, theta, trans, model, V);
-            SaveOBJ(MakeOutObj(out_dir, f), V, model.faces);
-        }
-
         // =====================================================
-        // STORE PREV
+        // STORE PREV (for temporal warm start)
         // =====================================================
         if (has_prev) {
             std::memcpy(theta_prev2_raw, theta_prev_raw, sizeof(theta_prev2_raw));
@@ -619,14 +705,61 @@ void RunOpenPoseSequenceInference(const SmplModel& model,
         if (f == start) Z_cam_first = trans[2];
         std::cout << "[F" << f << "] Z_cam=" << std::fixed << std::setprecision(3) << trans[2]
                   << " | drift=" << std::showpos << (trans[2] - Z_cam_first) << std::noshowpos
-                  << " | scale=" << depth_affine[0] << "\n";
+                  << " | scale=" << depth_affine[0]
+                  << " | conf=" << std::fixed << std::setprecision(2) << mean_conf
+                  << " | reproj=" << all_results.back().reproj_px << "px\n";
 
-        // =====================================================
-        // EVALUATION
-        // =====================================================
+        std::cout << "[Frame " << f << "] pass1 done\n";
+    }
+
+    std::cout << "\n========== PASS 1 COMPLETE ==========\n"
+              << "  Success: " << success_count << "\n"
+              << "  Failed:  " << fail_count << "\n"
+              << "=====================================\n\n";
+
+    // =====================================================
+    // PASS 2: POST-PROCESSING
+    // Quality filter → interpolation → Gaussian smoothing
+    // =====================================================
+    {
+        postsmooth::QualityThresholds qthres;
+        qthres.max_pose_delta  = 2.0;   
+        qthres.max_root_delta  = 1.2;   
+        qthres.max_trans_delta = 0.6;   
+        qthres.max_reproj_px   = 80.0;
+        qthres.min_visible_kps = 6;
+
+        postsmooth::SmoothConfig scfg;
+        scfg.sigma_body  = 1.8;   
+        scfg.sigma_arms  = 0.8;   
+        scfg.sigma_root  = 1.5;   
+        scfg.sigma_trans  = 1.5;
+        scfg.smooth_root_special = true;
+
+        auto pp_stats = postsmooth::RunPostProcessing(all_results, qthres, scfg);
+
+        // Re-export all meshes from smoothed results
+        std::cout << "[Pass2] Re-exporting smoothed meshes...\n";
+        postsmooth::ReExportMeshes(all_results, model, out_dir);
+    }
+
+    // =====================================================
+    // EVALUATION (on smoothed results)
+    // =====================================================
+    for (size_t ri = 0; ri < all_results.size(); ++ri) {
+        const auto& fr = all_results[ri];
+        const auto& lms = all_landmarks[ri];
+        int f = fr.frame_idx;
+        if (f < 0) continue;
+
+        double mpjpe_frame    = -1.0;
+        double pa_mpjpe_frame = -1.0;
+        double pose_err_frame = -1.0;
+        double reproj2d_frame = -1.0;
+
         if (has_gt && f < gt_data.num_frames) {
             MatX3dRM J_cam;
-            SMPLJointsForward<double>(beta, theta, trans, model, J_cam);
+            SMPLJointsForward<double>(fr.beta, fr.theta, fr.trans, model, J_cam);
 
             bool eval_in_world = has_cam_poses && f < (int)cam_poses.size()
                                  && gt_data.has_world_data;
@@ -651,12 +784,13 @@ void RunOpenPoseSequenceInference(const SmplModel& model,
                 for (int i = 0; i < J_gt_rr.rows(); ++i)   J_gt_rr.row(i) -= J_gt.row(0);
                 all_mpjpe_rootrel.push_back(ComputeMPJPE(J_eval_rr, J_gt_rr));
 
-                if (f == start) {
-                    std::cout << "\n===== FIRST FRAME DIAGNOSTIC =====\n"
+                if (ri == 0) {
+                    std::cout << "\n===== FIRST FRAME DIAGNOSTIC (SMOOTHED) =====\n"
                               << "eval_in_world=" << eval_in_world << "\n"
                               << "Pred pelvis: " << J_eval.row(0) << "\n"
                               << "GT   pelvis: " << J_gt.row(0) << "\n"
                               << "Offset norm: " << (J_eval.row(0)-J_gt.row(0)).norm()*1000.0 << " mm\n"
+                              << "Interpolated: " << fr.interpolated << "\n"
                               << "===================================\n\n";
                 }
             }
@@ -678,28 +812,31 @@ void RunOpenPoseSequenceInference(const SmplModel& model,
                             ? gt_data.GetPoseWorld(f, theta_gt)
                             : gt_data.GetPose(f, theta_gt);
             if (got_pose) {
-                pose_err_frame = ComputePoseError(theta, theta_gt, false);
+                pose_err_frame = ComputePoseError(fr.theta, theta_gt, false);
                 all_pose_error.push_back(pose_err_frame);
             }
 
-            double reproj_err = 0.0; int reproj_count = 0;
-            for (const auto& lm : lms) {
-                if (lm.confidence < 0.3f) continue;
-                int op_idx = lm.joint_id;
-                if (op_idx < 0 || op_idx >= 25) continue;
-                int smpl_idx = OPENPOSE_TO_SMPL[op_idx];
-                if (smpl_idx < 0 || smpl_idx >= J_cam.rows()) continue;
-                double px = J_cam(smpl_idx, 0), py = J_cam(smpl_idx, 1), pz = J_cam(smpl_idx, 2);
-                if (pz <= 0) continue;
-                double u = camera.fx * px / pz + camera.cx;
-                double v = camera.fy * (cfg.flip_y_in_projection ? -py : py) / pz + camera.cy;
-                double err = std::sqrt((u-lm.x)*(u-lm.x) + (v-lm.y)*(v-lm.y));
-                reproj_err += err;
-                reproj_count++;
-            }
-            if (reproj_count > 0) {
-                reproj2d_frame = reproj_err / reproj_count;
-                all_reproj_2d.push_back(reproj2d_frame);
+            // 2D reprojection on smoothed params
+            if (!lms.empty()) {
+                double reproj_err = 0.0; int reproj_count = 0;
+                for (const auto& lm : lms) {
+                    if (lm.confidence < 0.3f) continue;
+                    int op_idx = lm.joint_id;
+                    if (op_idx < 0 || op_idx >= 25) continue;
+                    int smpl_idx = OPENPOSE_TO_SMPL[op_idx];
+                    if (smpl_idx < 0 || smpl_idx >= J_cam.rows()) continue;
+                    double px = J_cam(smpl_idx, 0), py = J_cam(smpl_idx, 1), pz = J_cam(smpl_idx, 2);
+                    if (pz <= 0) continue;
+                    double u = camera.fx * px / pz + camera.cx;
+                    double v = camera.fy * (cfg.flip_y_in_projection ? -py : py) / pz + camera.cy;
+                    double err = std::sqrt((u-lm.x)*(u-lm.x) + (v-lm.y)*(v-lm.y));
+                    reproj_err += err;
+                    reproj_count++;
+                }
+                if (reproj_count > 0) {
+                    reproj2d_frame = reproj_err / reproj_count;
+                    all_reproj_2d.push_back(reproj2d_frame);
+                }
             }
         }
 
@@ -715,8 +852,6 @@ void RunOpenPoseSequenceInference(const SmplModel& model,
             elog.LogFrame(fm);
             elog.Push(fm);
         }
-
-        std::cout << "[Frame " << f << "] done\n";
     }
 
     // ---------------------------
@@ -727,7 +862,7 @@ void RunOpenPoseSequenceInference(const SmplModel& model,
             if (v.empty()) return -1.0;
             double s=0; for(double x:v) s+=x; return s/(double)v.size();
         };
-        std::cout << "\n========== EVALUATION SUMMARY ==========\n"
+        std::cout << "\n========== EVALUATION SUMMARY (SMOOTHED) ==========\n"
                   << "  Frames: "      << all_mpjpe.size() << "\n"
                   << "--- World-space metrics ---\n"
                   << "  MPJPE:          " << mean(all_mpjpe)*1000.0 << " mm\n"
@@ -738,7 +873,7 @@ void RunOpenPoseSequenceInference(const SmplModel& model,
                   << "  Cam PA-MPJPE:   " << mean(all_cam_pa)*1000.0 << " mm\n";
         if (mean(all_pose_error)>=0) std::cout << "  Pose Err: " << mean(all_pose_error) << " rad\n";
         if (mean(all_reproj_2d)>=0)  std::cout << "  2D Reproj: " << mean(all_reproj_2d) << " px\n";
-        std::cout << "========================================\n";
+        std::cout << "====================================================\n";
     }
 
     if (logger_ok) {

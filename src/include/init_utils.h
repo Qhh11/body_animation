@@ -16,15 +16,6 @@ void EstimateGlobalTranslationXY(const std::vector<Landmark2D>& landmarks,
 
 namespace initutil {
 
-// ---------------------------------------------------------
-// Estimate initial root orientation from 2D keypoints.
-//
-// Uses shoulder width / torso height ratio to estimate
-// the body's Y-axis rotation (facing direction).
-// Also uses shoulder midpoint vs hip midpoint for lean.
-//
-// Writes directly into theta[0..2] (root axis-angle).
-// ---------------------------------------------------------
 inline void EstimateRootFromKeypoints(
     const std::vector<Landmark2D>& lms,
     const CameraIntrinsics& camera,
@@ -56,12 +47,10 @@ inline void EstimateRootFromKeypoints(
     }
 
     // --- Estimate Y rotation (facing direction) ---
-    // Shoulder width in pixels
     float shoulder_dx = std::abs(rsh.x - lsh.x);
     float shoulder_dy = std::abs(rsh.y - lsh.y);
     float shoulder_width = std::sqrt(shoulder_dx * shoulder_dx + shoulder_dy * shoulder_dy);
 
-    // Torso height (neck to mid-hip) for normalization
     float torso_height = 0.0f;
     if (neck.valid && mhip.valid) {
         float dx = neck.x - mhip.x;
@@ -85,11 +74,11 @@ inline void EstimateRootFromKeypoints(
     // ratio ~0.15 → side view → angle ~±π/2
     float y_angle = 0.0f;
 
-    const float frontal_ratio = 0.65f;  // above this = mostly frontal
-    const float profile_ratio = 0.25f;  // below this = mostly side
+    const float frontal_ratio = 0.65f;  
+    const float profile_ratio = 0.25f;  
 
     if (ratio < profile_ratio) {
-        y_angle = (float)(M_PI * 0.45);  // ~81° side view
+        y_angle = (float)(M_PI * 0.45);
     } else if (ratio < frontal_ratio) {
         // Linear interpolation
         float t = (ratio - profile_ratio) / (frontal_ratio - profile_ratio);
@@ -106,13 +95,7 @@ inline void EstimateRootFromKeypoints(
         hip_mid_x = mhip.x;
     }
 
-    // If shoulder midpoint is to the right of hip midpoint → facing left
-    // (because when you turn left, your shoulders lead)
     float offset = sh_mid_x - hip_mid_x;
-
-    // Also check: in profile view, one shoulder is in front (closer in x to image center)
-    // RShoulder (OpenPose 2) is the person's right → in image it's on the LEFT when facing camera
-    // If facing right (from camera's perspective), RShoulder.x > LShoulder.x (reversed)
     bool shoulders_reversed = (rsh.x > lsh.x);
 
     if (ratio < frontal_ratio) {
@@ -129,11 +112,6 @@ inline void EstimateRootFromKeypoints(
         }
     }
 
-    // --- Apply as axis-angle ---
-    // SMPL convention: Y-axis rotation with flip_y
-    // axis-angle = angle * [0, 1, 0] for Y rotation
-    // But SMPL root is in camera space with Y pointing down,
-    // so Y rotation = rotation around the vertical axis
     theta[0] = 0.0;
     theta[1] = (double)y_angle;
     theta[2] = 0.0;

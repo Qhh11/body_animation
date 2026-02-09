@@ -187,7 +187,6 @@ static void AddRelativeDepthBlock(
 }
 
 // Depth affine block (scale can be negative)
-// [FIX] Now handles cfg.fix_depth_affine_bias
 static void AddDepthAffineBlock(
     ceres::Problem& problem,
     const OptimizerConfig& cfg,
@@ -215,7 +214,6 @@ static void AddDepthAffineBlock(
     problem.SetParameterLowerBound(cfg.depth_affine_params, 1,  0.1);
     problem.SetParameterUpperBound(cfg.depth_affine_params, 1,  50.0);
 
-    // [FIX] If fix_depth_affine_bias is set, hold bias constant (only optimize scale)
     if (cfg.fix_depth_affine_bias) {
         // SubsetManifold: index 1 (bias) is held constant
         problem.SetManifold(cfg.depth_affine_params,
@@ -241,11 +239,6 @@ static void AddTemporalDepthAffinePrior(
     );
 }
 
-// -----------------------------------------
-// [FIX] Translation Z prior using config target
-// Was never wired in before — now adds TransZPriorResidual
-// using cfg.trans_z_prior_target and cfg.w_trans_z_prior
-// -----------------------------------------
 static void AddTransZPriorBlock(
     ceres::Problem& problem,
     const OptimizerConfig& cfg,
@@ -632,6 +625,31 @@ static void AddPosePriorsUnified(ceres::Problem& problem,
         AddSoftAngleLimitGroup(problem, theta, {cfg.neck_j}, cfg.neck_amax, cfg.w_neck_limit);
         AddSoftAngleLimitGroup(problem, theta, {cfg.head_j}, cfg.head_amax, cfg.w_head_limit);
     }
+   
+    if (cfg.use_arm_in_front) {
+        double w = cfg.w_arm_in_front;
+        double m = cfg.arm_in_front_margin;
+
+        // Wrists
+        problem.AddResidualBlock(
+            new ceres::AutoDiffCostFunction<ArmInFrontOfTorsoResidual, 1, 10, 72, 3>(
+                new ArmInFrontOfTorsoResidual(20, m, w, model)),
+            nullptr, beta, theta, trans);
+        problem.AddResidualBlock(
+            new ceres::AutoDiffCostFunction<ArmInFrontOfTorsoResidual, 1, 10, 72, 3>(
+                new ArmInFrontOfTorsoResidual(21, m, w, model)),
+            nullptr, beta, theta, trans);
+
+        // Elbows
+        problem.AddResidualBlock(
+            new ceres::AutoDiffCostFunction<ArmInFrontOfTorsoResidual, 1, 10, 72, 3>(
+                new ArmInFrontOfTorsoResidual(18, m, w * 0.7, model)),
+            nullptr, beta, theta, trans);
+        problem.AddResidualBlock(
+            new ceres::AutoDiffCostFunction<ArmInFrontOfTorsoResidual, 1, 10, 72, 3>(
+                new ArmInFrontOfTorsoResidual(19, m, w * 0.7, model)),
+            nullptr, beta, theta, trans);
+    }
 
     AddArmTorsoSeparation(problem, cfg, model, beta, theta, trans);
 
@@ -650,15 +668,20 @@ static void AddPosePriorsUnified(ceres::Problem& problem,
     }
 
     if (cfg.use_root_upright) {
-        const double w = (stage == PriorStage::Stage2) ? cfg.root_upright_w_stage2 : cfg.root_upright_w_stage3;
-        if (w > 0.0) {
-            problem.AddResidualBlock(
-                new ceres::AutoDiffCostFunction<RootUprightResidual, 2, 72>(
-                    new RootUprightResidual(w)),
-                nullptr, theta
-            );
+            double wr = cfg.root_upright_w_roll;
+            double wp = cfg.root_upright_w_pitch;
+            if (stage == PriorStage::Stage3) {
+                wr *= 0.3;
+                wp *= 0.3;
+            }
+            if (wr > 0.0 || wp > 0.0) {
+                problem.AddResidualBlock(
+                    new ceres::AutoDiffCostFunction<RootUprightResidual, 2, 72>(
+                        new RootUprightResidual(wr, wp)),
+                    nullptr, theta
+                );
+            }
         }
-    }
 
     if (cfg.use_foot_ground) {
         if (cfg.foot_contact_L > 1e-6) {
@@ -918,6 +941,9 @@ bool OptimizeSMPLTracked(
         AddRelativeDepthBlock(problem, cfg_s1, model, beta, theta, trans);
         AddDepthAffineBlock(problem, cfg_s1, model, beta, theta, trans);
         AddTemporalDepthAffinePrior(problem, cfg);
+            
+        problem.SetParameterLowerBound(theta, 0, -0.6);  
+        problem.SetParameterUpperBound(theta, 0,  0.6);
 
         problem.SetParameterBlockConstant(beta);
 
@@ -928,7 +954,6 @@ bool OptimizeSMPLTracked(
 
         AddTemporalPriors(problem, cfg, theta, trans, theta_prev, trans_prev, theta_prev2);
 
-        // [FIX] Use config Z prior (graduated energy scaled)
         AddTransZPriorBlock(problem, cfg_s1, trans);
 
         ceres::Solver::Options options;
@@ -1089,6 +1114,7 @@ bool OptimizeSMPL3D(const MatX3dRM& J_obs,
 
     return true;
 }
+
 
 CameraIntrinsics CreateDefaultCamera(int image_width, int image_height) {
     float focal = image_width * 1.2f;

@@ -12,8 +12,8 @@
 
 #include <Eigen/Dense>
 
-#include "optimizer.h"    // OptimizerConfig, CameraIntrinsics, etc.
-#include "evaluation.h"   // ComputeMPJPE, ComputePAMPJPE, ComputePVE, ...
+#include "optimizer.h"    
+#include "evaluation.h"  
 
 namespace logutil {
 
@@ -131,6 +131,7 @@ inline void DumpOptimizerConfig(std::ostream& os,
     os << "  min_confidence=" << cfg.min_confidence << "\n";
     os << "  use_stable_joints_only=" << cfg.use_stable_joints_only << "\n";
     os << "  flip_y_in_projection=" << cfg.flip_y_in_projection << "\n";
+    os << "  use_joint_importance=" << cfg.use_joint_importance << "\n";
 
     os << "\n[GMM]\n";
     os << "  use_gmm_prior=" << cfg.use_gmm_prior << "\n";
@@ -148,8 +149,8 @@ inline void DumpOptimizerConfig(std::ostream& os,
 
     os << "\n[Root Upright]\n";
     os << "  use_root_upright=" << cfg.use_root_upright << "\n";
-    os << "  root_upright_w_stage2=" << cfg.root_upright_w_stage2 << "\n";
-    os << "  root_upright_w_stage3=" << cfg.root_upright_w_stage3 << "\n";
+    os << "  root_upright_w_roll=" << cfg.root_upright_w_roll << "\n";
+    os << "  root_upright_w_pitch=" << cfg.root_upright_w_pitch << "\n";
 
     os << "\n[Soft Limits]\n";
     os << "  use_shoulder_collar_limits=" << cfg.use_shoulder_collar_limits << "\n";
@@ -162,6 +163,7 @@ inline void DumpOptimizerConfig(std::ostream& os,
     os << "  use_neck_head_limits=" << cfg.use_neck_head_limits << "\n";
     os << "  w_neck_limit=" << cfg.w_neck_limit << " neck_amax=" << cfg.neck_amax << "\n";
     os << "  w_head_limit=" << cfg.w_head_limit << " head_amax=" << cfg.head_amax << "\n";
+
 
     os << "\n[Extra Priors]\n";
     os << "  use_pelvis_over_ankles=" << cfg.use_pelvis_over_ankles << "\n";
@@ -192,6 +194,7 @@ inline void DumpOptimizerConfig(std::ostream& os,
     os << "\n[Temporal]\n";
     os << "  use_temporal=" << cfg.use_temporal << "\n";
     os << "  w_temp_pose=" << cfg.w_temp_pose << " w_temp_trans=" << cfg.w_temp_trans << "\n";
+    os << "  w_temp_root_orient=" << cfg.w_temp_root_orient << "\n";
     os << "  use_temporal_acc=" << cfg.use_temporal_acc << "\n";
     os << "  w_temp_acc_pose=" << cfg.w_temp_acc_pose << "\n";
     os << "  temporal_body_only=" << cfg.temporal_body_only << "\n";
@@ -218,6 +221,9 @@ inline void DumpOptimizerConfig(std::ostream& os,
     os << "  grad_stage1_prior_scale=" << cfg.grad_stage1_prior_scale << "\n";
     os << "  grad_stage2_depth_scale=" << cfg.grad_stage2_depth_scale << "\n";
     os << "  grad_stage2_prior_scale=" << cfg.grad_stage2_prior_scale << "\n";
+
+    os << "\n[Multi-Hypothesis]\n";
+    os << "  multi_hyp_max_z_shift=" << cfg.multi_hyp_max_z_shift << "\n";
 
     os << "====================================================\n";
 }

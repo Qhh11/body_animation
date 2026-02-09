@@ -110,8 +110,8 @@ struct OptimizerConfig {
 
     // ---------- Root upright regularizer ----------
     bool use_root_upright = true;
-    double root_upright_w_stage2 = 1.0;
-    double root_upright_w_stage3 = 0.0;
+    double root_upright_w_roll  = 40.0;   
+    double root_upright_w_pitch = 5.0;    
 
     // ---------- GMM pose prior ----------
     bool use_gmm_prior = false;
@@ -152,7 +152,6 @@ struct OptimizerConfig {
     bool use_wrist_limits = true;
     double w_wrist_limit = 80.0;
     double wrist_amax = 0.6;
-
     // pelvis-over-ankles
     bool use_pelvis_over_ankles = false;
     double w_pelvis_over_ankles = 20.0;
@@ -161,10 +160,15 @@ struct OptimizerConfig {
     bool use_arm_torso_sep = false;
     double arm_torso_d_elbow = 0.08;
     double arm_torso_d_wrist = 0.10;
-    double arm_torso_w_elbow = 80.0;
-    double arm_torso_w_wrist = 120.0;
+    double arm_torso_w_elbow = 30.0;
+    double arm_torso_w_wrist = 30.0;
     int arm_torso_seg_a = 0;
     int arm_torso_seg_b = 9;
+
+    // --- Arm in front of torso (3D joint space) ---
+    bool   use_arm_in_front   = false;
+    double w_arm_in_front     = 80.0;
+    double arm_in_front_margin = 0.05;  
 
     // ---------- 3D unit test ----------
     bool amass_unit_test = false;
@@ -226,7 +230,7 @@ struct OptimizerConfig {
     bool use_leg_leg_sep = false;
 
     // ---------- Cross-limb depth disambiguation ----------
-    bool use_cross_limb_depth = false;
+    bool use_cross_limb_depth = true;
     double w_cross_limb_depth = 40.0;
     const std::vector<RelativeDepthPair>* cross_limb_pairs = nullptr;
 
@@ -256,6 +260,9 @@ struct OptimizerConfig {
     double grad_stage2_depth_scale = 0.5;
     double grad_stage2_prior_scale = 0.5;
     // stage 3 = 1.0 (full)
+
+    // ---------- Multi-hypothesis Z correction ----------
+    double multi_hyp_max_z_shift = 0.5;
 
     // ---------- speed / solver ----------
     int threads = -1;
@@ -327,18 +334,21 @@ struct GMMPosePriorResidual {
 };
 
 struct RootUprightResidual {
-    explicit RootUprightResidual(double w_) : w(w_) {}
+    double w_roll;
+    double w_pitch;
+
+    RootUprightResidual(double wr, double wp) : w_roll(wr), w_pitch(wp) {}
+
     template <typename T>
     bool operator()(const T* const theta, T* residuals) const {
         const T* aa = theta;
         const T up[3] = {T(0), T(1), T(0)};
         T up_rot[3];
         ceres::AngleAxisRotatePoint(aa, up, up_rot);
-        residuals[0] = T(w) * up_rot[0];
-        residuals[1] = T(w) * up_rot[2];
+        residuals[0] = T(w_roll)  * up_rot[0];  
+        residuals[1] = T(w_pitch) * up_rot[2];   
         return true;
     }
-    double w;
 };
 
 struct TransZPriorResidual {
@@ -474,6 +484,71 @@ struct SoftAngleLimitResidual {
     double amax_, w_;
 };
 
+
+struct ShoulderBackwardPenalty {
+    double w_;
+    double max_backward_;  
+
+    ShoulderBackwardPenalty(double w, double max_back)
+        : w_(w), max_backward_(max_back) {}
+
+    template <typename T>
+    bool operator()(const T* const theta, T* residuals) const {
+
+        auto backward_pen = [&](T val) -> T {
+          
+            T back_amount = -val;  // positive when arm is behind
+            T over = back_amount - T(max_backward_);
+            T pos = (over + ceres::abs(over)) * T(0.5);  
+            return T(w_) * pos;
+        };
+
+        auto total_mag_pen = [&](const T* aa) -> T {
+            T mag = ceres::sqrt(aa[0]*aa[0] + aa[1]*aa[1] + aa[2]*aa[2] + T(1e-8));
+            T over = mag - T(2.5); 
+            T pos = (over + ceres::abs(over)) * T(0.5);
+            return T(w_ * 0.3) * pos;
+        };
+
+        residuals[0] = backward_pen(theta[48]);     
+        residuals[1] = backward_pen(theta[51]);     
+        residuals[2] = total_mag_pen(theta + 48); 
+        residuals[3] = total_mag_pen(theta + 51);  
+        return true;
+    }
+};
+
+
+struct ElbowBackwardPenalty {
+    double w_;
+    double max_backward_;   
+
+    ElbowBackwardPenalty(double w, double max_back)
+        : w_(w), max_backward_(max_back) {}
+
+    template <typename T>
+    bool operator()(const T* const theta, T* residuals) const {
+        auto backward_pen = [&](T val) -> T {
+            T back_amount = -val;
+            T over = back_amount - T(max_backward_);
+            T pos = (over + ceres::abs(over)) * T(0.5);
+            return T(w_) * pos;
+        };
+
+        auto twist_pen = [&](const T* aa) -> T {
+            T twist = ceres::sqrt(aa[1]*aa[1] + aa[2]*aa[2] + T(1e-8));
+            T over = twist - T(0.4);  
+            T pos = (over + ceres::abs(over)) * T(0.5);
+            return T(w_ * 0.5) * pos;
+        };
+
+        residuals[0] = backward_pen(theta[54]);      
+        residuals[1] = backward_pen(theta[57]);   
+        residuals[2] = twist_pen(theta + 54);      
+        residuals[3] = twist_pen(theta + 57);       
+        return true;
+    }
+};
 
 struct BendLimitResidual {
     BendLimitResidual(int joint_idx, int axis_idx, double sign, double weight)
@@ -822,6 +897,56 @@ struct TemporalDepthAffineResidual {
     double w_s, w_b;
 };
 
+
+// ============================================================
+// Arm-in-front-of-torso: penalize arm joints being behind torso in camera Z
+// ============================================================
+struct ArmInFrontOfTorsoResidual {
+    int arm_joint;
+    double margin;
+    double w;
+    const SmplModel& model;
+
+    // Use body-local forward direction, not camera Z
+    // forward = cross(L_shoulder - R_shoulder, neck - pelvis), normalized
+    // penalize: dot(arm - torso_center, forward) < -margin
+
+    ArmInFrontOfTorsoResidual(int aj, double margin_, double w_,
+                               const SmplModel& m)
+        : arm_joint(aj), margin(margin_), w(w_), model(m) {}
+
+    template <typename T>
+    bool operator()(const T* const beta,
+                    const T* const theta,
+                    const T* const trans,
+                    T* residuals) const
+    {
+        Eigen::Matrix<T, Eigen::Dynamic, 3, Eigen::RowMajor> J;
+        SMPLJointsForward<T>(beta, theta, trans, model, J);
+
+        Eigen::Matrix<T,3,1> Ls = J.row(16).transpose();
+        Eigen::Matrix<T,3,1> Rs = J.row(17).transpose();
+        Eigen::Matrix<T,3,1> pelvis = J.row(0).transpose();
+        Eigen::Matrix<T,3,1> neck   = J.row(12).transpose();
+
+        Eigen::Matrix<T,3,1> shoulder_axis = Ls - Rs;
+        Eigen::Matrix<T,3,1> spine_axis = neck - pelvis;
+        Eigen::Matrix<T,3,1> fwd = shoulder_axis.cross(spine_axis);
+        T fwd_norm = ceres::sqrt(fwd.squaredNorm() + T(1e-12));
+        fwd = fwd / fwd_norm;
+
+        Eigen::Matrix<T,3,1> torso_center = (Ls + Rs) * T(0.5);
+
+        Eigen::Matrix<T,3,1> arm_pos = J.row(arm_joint).transpose();
+
+        T forward_dist = (arm_pos - torso_center).dot(fwd);
+
+        T violation = T(-1.0) * forward_dist - T(margin);
+        T pos = (violation + ceres::abs(violation)) * T(0.5);
+        residuals[0] = T(w) * pos;
+        return true;
+    }
+};
 // ------------------------------
 // Capsule Collision Residual
 // ------------------------------

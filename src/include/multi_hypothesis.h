@@ -13,12 +13,6 @@
 
 namespace multihyp {
 
-// ---------------------------------------------------------
-// 1. Depth-Guided Z Correction
-//    After warm-start, shift trans[2] so predicted joint Zs
-//    better match the affine-converted depth observations.
-//    Cost: one SMPL forward pass + arithmetic. ~0.1ms.
-// ---------------------------------------------------------
 inline void DepthGuidedZCorrection(
     const SmplModel& model,
     const double* beta,

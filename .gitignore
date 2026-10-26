@@ -5,3 +5,8 @@ Makefile
 
 # macOS junk
 .DS_Store
+
+# Obtain licensed body model parameters separately; do not redistribute.
+*.npz
+*.pkl
+Data/models/
